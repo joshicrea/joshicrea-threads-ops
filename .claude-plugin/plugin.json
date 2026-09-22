@@ -1,9 +1,0 @@
-{
-  "name": "joshicrea-threads-ops",
-  "version": "0.3.0",
-  "description": "Threads運用アシスタント。リサーチ→投稿生成→承認→投稿→分析→改善を承認制で回し、コメント返信はAIが判定して自動で返します。ローカルで常駐し、Claude Code のチャットからも操作できます。",
-  "author": {
-    "name": "joshicrea",
-    "email": "info@joshicrea.com"
-  }
-}
