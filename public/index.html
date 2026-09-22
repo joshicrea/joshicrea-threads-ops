@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Threads運用アシスタント</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <p class="eyebrow">Threads</p>
+          <h1>運用アシスタント</h1>
+        </div>
+        <nav class="nav">
+          <button class="nav-item active" data-view="dashboard">概要</button>
+          <button class="nav-item" data-view="research">リサーチ</button>
+          <button class="nav-item" data-view="generate">投稿生成</button>
+          <button class="nav-item" data-view="queue">投稿キュー <span class="nav-badge" id="navReviewCount"></span></button>
+          <button class="nav-item" data-view="replies">コメント返信 <span class="nav-badge" id="navReplyCount"></span></button>
+          <button class="nav-item" data-view="analysis">分析・改善</button>
+          <button class="nav-item" data-view="settings">設定</button>
+        </nav>
+        <div class="status-panel">
+          <span class="status-dot" id="publishDot"></span>
+          <div>
+            <strong id="publishStatus">予約投稿の自動送信 OFF</strong>
+            <small id="publishStatusNote">承認済みの予約投稿を、時刻になったら送ります</small>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">リサーチ → 生成 → 承認 → 投稿 → 分析</p>
+            <h2 id="viewTitle">概要</h2>
+          </div>
+          <div class="topbar-right"><span class="version" id="appVersion"></span><button class="button secondary" id="reloadBtn">再読み込み</button></div>
+        </header>
+
+        <div id="toast" class="toast" hidden></div>
+  <dialog id="scheduleDialog" class="dialog">
+    <form method="dialog" class="dialog-body">
+      <h3>予約日時</h3>
+      <p class="notice" id="scheduleDialogNote"></p>
+      <label>日時（日本時間）<input id="scheduleDialogInput" type="datetime-local" /></label>
+      <div class="row-actions">
+        <button class="button secondary" id="scheduleDialogCancel" type="button">キャンセル</button>
+        <button class="button" id="scheduleDialogOk" type="button">この日時で予約する</button>
+      </div>
+    </form>
+  </dialog>
+
+        <!-- 概要 -->
+        <section class="view active" id="dashboard">
+          <div class="metric-grid">
+            <button class="metric" data-goto="queue" data-filter="review"><span>承認待ち</span><strong id="reviewCount">0</strong></button>
+            <button class="metric" data-goto="queue" data-filter="approved"><span>承認済み（未予約）</span><strong id="approvedCount">0</strong></button>
+            <button class="metric" data-goto="queue" data-filter="scheduled"><span>予約済み</span><strong id="scheduledCount">0</strong></button>
+            <button class="metric" data-goto="queue" data-filter="published"><span>公開済み</span><strong id="publishedCount">0</strong></button>
+            <button class="metric" data-goto="queue" data-filter="error"><span>エラー</span><strong id="errorCount">0</strong></button>
+            <button class="metric" data-goto="replies"><span>未返信コメント</span><strong id="unhandledReplyCount">0</strong></button>
+          </div>
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head"><h3>次にやること</h3></div>
+              <div id="todoList" class="stack"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><h3>接続状態</h3></div>
+              <div id="connectionStatus" class="stack"></div>
+            </section>
+          </div>
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head"><h3>これから投稿されるもの</h3></div>
+              <div id="nextPosts" class="stack"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><h3>最近のログ</h3></div>
+              <div id="logs" class="log-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <!-- リサーチ -->
+        <section class="view" id="research">
+          <div class="tabs" data-tabs="research">
+            <button class="tab active" data-tab="refTab">参考投稿（Threads）</button>
+            <button class="tab" data-tab="webTab">Web参照元（Google検索）</button>
+          </div>
+
+          <div class="tab-panel active" id="refTab">
+            <div class="panel">
+              <div class="panel-head">
+                <h3>反応を集めている投稿を探す</h3>
+                <div class="row-actions">
+                  <select id="refSearchType" class="select-inline">
+                    <option value="TOP">人気順</option>
+                    <option value="RECENT">新着順</option>
+                  </select>
+                  <button class="button" id="refSearchBtn">Threadsで検索</button>
+                </div>
+              </div>
+              <div class="form-grid">
+                <label class="wide">キーワード<input id="refKeyword" placeholder="例: ハンドメイド 起業" /></label>
+              </div>
+              <p class="notice">Threads上の投稿をキーワードで検索して候補に追加します。Threads API の検索はアプリ審査前は自分の投稿しか返さないため、0件のときは自動で Web検索経由（Claude Code）に切り替えて公開投稿を最大8件集めます（1〜3分かかります）。それでも見つからない場合は、下の「手動で貼り付け」を使ってください。</p>
+              <details class="details">
+                <summary>手動で貼り付けて追加する</summary>
+                <div class="form-grid">
+                  <label class="wide">投稿本文<textarea id="refManualText" rows="4" placeholder="参考にしたい投稿の本文を貼り付け"></textarea></label>
+                  <label>投稿者（任意）<input id="refManualUser" placeholder="@username" /></label>
+                  <label>URL（任意）<input id="refManualUrl" placeholder="https://www.threads.net/..." /></label>
+                </div>
+                <div class="row-actions"><button class="button secondary" id="refManualAddBtn">候補に追加</button></div>
+              </details>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h3>参考投稿の候補 <span class="count-chip" id="refSelectedCount"></span></h3>
+                <div class="row-actions">
+                  <button class="button secondary" id="refClearBtn">選択を全解除</button>
+                  <button class="button" id="refAnalyzeBtn">選んだ投稿の型を分析</button>
+                </div>
+              </div>
+              <p class="notice">チェックした投稿が「型を分析」と「投稿生成」に使われます。本文をコピーするのではなく、フックや構造を学んで自分の言葉で書き直します。</p>
+              <div id="refAnalysisBox" class="analysis-box" hidden></div>
+              <div id="refList" class="stack"></div>
+            </div>
+          </div>
+
+          <div class="tab-panel" id="webTab">
+            <div class="panel">
+              <div class="panel-head">
+                <h3>キーワードで事実・最新情報を集める</h3>
+                <button class="button" id="researchBtn">Webを検索</button>
+              </div>
+              <div class="form-grid">
+                <label class="wide">キーワード<input id="researchKeyword" placeholder="例: ハンドメイド 集客 トレンド 2026" /></label>
+              </div>
+              <p class="notice">Web検索で参照元候補を集めます（Gemini は Google検索、Claude Code / Codex は各自の Web検索。Claude API では使えません）。チェックした参照元は投稿生成で「事実の根拠」として渡されます。</p>
+            </div>
+            <div class="panel">
+              <div class="panel-head"><h3>参照元の候補 <span class="count-chip" id="srcSelectedCount"></span></h3></div>
+              <div id="researchResults" class="stack"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 投稿生成 -->
+        <section class="view" id="generate">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>投稿案を作る</h3>
+              <button class="button" id="generateBtn">生成する</button>
+            </div>
+            <div class="form-grid">
+              <label>目的<input id="goalInput" value="認知拡大と見込み客との接点作り" /></label>
+              <label>テーマ<input id="topicInput" placeholder="例: AI活用で日々の業務を軽くする体験談" /></label>
+              <label>投稿日（この日から予約時刻を順に割り当て）<input id="dateInput" type="date" /></label>
+              <label>本数<input id="countInput" type="number" min="1" max="12" value="8" /></label>
+            </div>
+            <div id="generateInputs" class="input-summary"></div>
+            <p class="notice" id="generateNotice">生成した投稿は「承認待ち」として投稿キューに入ります。内容を確認して承認するまで外部には出ません。</p>
+          </div>
+          <div class="panel" id="generateResultPanel" hidden>
+            <div class="panel-head"><h3>今回の生成結果</h3><button class="button secondary" data-goto="queue" data-filter="review">投稿キューで確認</button></div>
+            <p class="notice" id="strategyMemo"></p>
+            <div id="generatedList" class="stack"></div>
+          </div>
+        </section>
+
+        <!-- 投稿キュー -->
+        <section class="view" id="queue">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>投稿キュー</h3>
+              <div class="row-actions">
+                <button class="button secondary" id="bulkApproveBtn">承認待ちをすべて承認</button>
+                <button class="button secondary" id="addPostBtn">手動で追加</button>
+              </div>
+            </div>
+            <div class="filter-row" id="queueFilters">
+              <button class="chip active" data-status="all">すべて</button>
+              <button class="chip" data-status="review">承認待ち</button>
+              <button class="chip" data-status="approved">承認済み</button>
+              <button class="chip" data-status="scheduled">予約済み</button>
+              <button class="chip" data-status="published">公開済み</button>
+              <button class="chip" data-status="error">エラー</button>
+              <button class="chip" data-status="rejected">却下</button>
+            </div>
+            <div id="postList" class="stack"></div>
+          </div>
+        </section>
+
+        <!-- コメント返信 -->
+        <section class="view" id="replies">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>コメント返信</h3>
+              <button class="button" id="fetchRepliesBtn">コメントを取得</button>
+                  <button class="button secondary" id="draftBatchBtn">AIでまとめて下書き</button>
+            </div>
+            <div class="filter-row" id="replyFilters">
+              <button class="chip active" data-status="open">未対応</button>
+              <button class="chip" data-status="held">要確認</button>
+              <button class="chip" data-status="drafted">下書きあり</button>
+              <button class="chip" data-status="responded">返信済み</button>
+              <button class="chip" data-status="ignored">対応しない</button>
+              <button class="chip" data-status="all">すべて</button>
+            </div>
+            <p class="notice">公開済み投稿へのコメントを取得し、AIで返信の下書きを作ります。送信は必ず内容を確認してから行います。</p>
+            <div id="replyList" class="stack"></div>
+          </div>
+        </section>
+
+        <!-- 分析・改善 -->
+        <section class="view" id="analysis">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>実績</h3>
+              <div class="row-actions">
+                <button class="button secondary" id="refreshInsightsBtn">インサイトを取得</button>
+                <button class="button" id="suggestBtn">改善提案を生成</button>
+              </div>
+            </div>
+            <div id="insightSummary" class="analysis-grid"></div>
+          </div>
+          <div class="split">
+            <section class="panel">
+              <div class="panel-head"><h3>カテゴリ別（平均）</h3></div>
+              <div id="categoryTable" class="table-wrap"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><h3>時間帯別（平均）</h3></div>
+              <div id="timeSlotTable" class="table-wrap"></div>
+            </section>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h3>投稿別（閲覧数順）</h3></div>
+            <div id="postInsightTable" class="table-wrap"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h3>改善提案</h3></div>
+            <div id="suggestionList" class="stack"></div>
+          </div>
+        </section>
+
+        <!-- 設定 -->
+        <section class="view" id="settings">
+          <div class="panel">
+            <div class="panel-head"><h3>1. AI（文章生成）</h3><button class="button secondary" id="aiCheckBtn">接続テスト</button></div>
+            <div class="form-grid">
+              <label>AIプロバイダ
+                <select id="aiProvider">
+                  <option value="claude-code">Claude Code（このPCの契約で動く・追加費用なし）</option>
+                  <option value="gemini">Gemini API（Google AI Studio のキー）</option>
+                  <option value="codex">Codex CLI（このPCの ChatGPT 契約で動く・追加費用なし）</option>
+                  <option value="claude-api">Claude API（Anthropic のキー・従量課金）</option>
+                </select>
+              </label>
+              <label data-provider="claude-code">Claude Code のモデル
+                <select id="claudeModel">
+                  <option value="sonnet">sonnet（速い・普段使い）</option>
+                  <option value="opus">opus（高品質・遅め）</option>
+                  <option value="haiku">haiku（最速・軽い用途）</option>
+                </select>
+              </label>
+              <label data-provider="codex">Codex のモデル（空欄なら Codex の既定）<input id="codexModel" placeholder="例: gpt-5-codex" /></label>
+              <label data-provider="gemini">Gemini APIキー<input id="geminiApiKey" type="password" autocomplete="off" placeholder="AIza..." /></label>
+              <label data-provider="gemini">Gemini モデル<input id="geminiModel" placeholder="自動選択" /></label>
+              <label class="toggle-row" data-provider="gemini"><input id="geminiModelAuto" type="checkbox" /> モデルを自動で選ぶ（無料枠で詰まりにくい Flash Lite 系を優先）</label>
+              <label data-provider="claude-api">Claude APIキー<input id="anthropicApiKey" type="password" autocomplete="off" placeholder="sk-ant-..." /></label>
+              <label data-provider="claude-api">Claude モデル<input id="anthropicModel" placeholder="claude-sonnet-5" /></label>
+            </div>
+            <div class="row-actions" data-provider="gemini">
+              <button class="button secondary" id="autoGeminiModelBtn">モデル一覧を取得して自動選択</button>
+              <span class="notice inline" id="geminiStatus"></span>
+            </div>
+            <p class="notice" data-provider="claude-code">このPCにインストール済みの Claude Code を裏で呼びます。Claude Code でログイン済みなら追加設定は不要です。利用量は Claude の契約枠から消費されます。</p>
+            <p class="notice" data-provider="codex">このPCにインストール済みの Codex CLI（OpenAI）を裏で呼びます。ターミナルで <code>codex</code> を起動して ChatGPT アカウントでログイン済みなら追加設定は不要です。利用量は ChatGPT の契約枠から消費されます（1回あたり Claude Code より多め）。Web参照元・参考投稿の Web検索も使えます。</p>
+            <p class="notice" data-provider="gemini">無料枠には1分あたり・1日あたりの回数制限があります。上限に達すると自動で待って再試行しますが、続けて使う場合はGoogle AI Studioで課金設定を入れてください。</p>
+            <p class="notice" data-provider="claude-api">Web参照元の検索（Google検索）は Claude API では使えません。参考投稿のThreads検索・手動貼り付けは使えます。</p>
+            <p class="notice inline" id="researchProviderNote"></p>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>2. Threads連携</h3></div>
+            <div id="threadsConnection" class="connection-box"></div>
+            <div class="form-grid">
+              <label>Threads App ID（「ユースケース → Threads API → 設定」のID。「アプリの設定 → ベーシック」のアプリIDとは別）<input id="threadsAppId" autocomplete="off" /></label>
+              <label>Threads App Secret（同じ画面のシークレット）<input id="threadsAppSecret" type="password" autocomplete="off" /></label>
+              <label class="wide">Redirect URI（Meta側の設定と完全一致させる）<input id="threadsRedirectUri" autocomplete="off" /></label>
+              <label class="wide">Scopes<input id="threadsScopes" autocomplete="off" /></label>
+              <label class="wide">アクセストークン（手動で貼る場合のみ）<input id="threadsAccessToken" type="password" autocomplete="off" /></label>
+            </div>
+            <div class="row-actions">
+              <button class="button" id="threadsAuthBtn">Threadsと連携する（認可画面を開く）</button>
+              <button class="button secondary" id="refreshThreadsTokenBtn">トークンを更新</button>
+              <button class="button secondary danger" id="threadsDisconnectBtn">連携を解除</button>
+            </div>
+            <details class="details" id="threadsSetupHelp">
+              <summary>設定手順</summary>
+              <ol class="steps">
+                <li>Meta for Developers でアプリを作成し、ユースケースに Threads API を追加する</li>
+                <li>左メニュー「ユースケース」→ Threads API の「設定」を開く。ここに表示される <b>Threads App ID</b> と <b>Threads App Secret</b> を使う（「アプリの設定 → ベーシック」のアプリIDを使うと「アプリIDが送信されませんでした」エラーになる）</li>
+                <li>同じ画面の「Redirect Callback URLs」に <code>https://localhost:4174/oauth/callback</code> を登録して保存する（Meta は https しか受け付けない。このツールが自己署名証明書で https://localhost:4174 を立てる）。localhost だと「フォームを保存できません」になる場合は、ツール同梱の relay フォルダの4ファイルを自分の公開サイトに置き、その公開URLを Meta の3欄と上の Redirect URI に入れる（relay/README.md 参照）</li>
+                <li>Threads App ID と Secret を上に貼り、「設定を保存」を押す</li>
+                <li>「Threadsと連携する」を押し、Threads側で許可する（Threadsアプリの「設定 → アカウント → ウェブサイトの権限 → テスター招待」で自分のアカウントをテスターに追加しておく必要がある場合がある）</li>
+                <li>許可後、ブラウザに「この接続ではプライバシーが保護されません」と出たら「詳細設定」→「localhost にアクセスする」を押す（自己署名証明書のため。localhost 内で完結するので外部には出ない）</li>
+                <li>「Threadsと連携しました」と表示されたら、この画面で「再読み込み」</li>
+                <li>うまくいかない場合の代替: Meta の Threads API 設定画面にある「ユーザートークン生成ツール」で自分のアカウントのトークンを発行し、上の「アクセストークン（手動で貼る場合のみ）」に貼って保存する</li>
+              </ol>
+            </details>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>3. 発信者</h3></div>
+            <div class="form-grid">
+              <label>発信者名・ブランド名<input id="brandName" /></label>
+              <label>基本CTA（誘導先。無ければ空）<input id="defaultCta" placeholder="例: プロフィールのリンクから無料相談へ" /></label>
+              <label class="wide">プロフィール・事業内容<textarea id="profile" rows="4" placeholder="誰に・何を・どんな経験から発信しているか"></textarea></label>
+              <label class="wide">文体ルール<textarea id="writingRules" rows="4"></textarea></label>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>4. 運用</h3></div>
+            <div class="form-grid">
+              <label class="wide">この画面のアクセスキー（任意・8文字以上。同じPCの別ユーザーや、外から開くときの合言葉。空欄なら不要）<input id="accessKey" type="password" autocomplete="off" /></label>
+              <label class="wide">予約時刻（カンマ区切り・日本時間）<input id="scheduleTimes" placeholder="07:00,09:00,11:00" /></label>
+              <label class="toggle-row"><input id="autoPublishEnabled" type="checkbox" /> 予約投稿の自動送信をON（このサーバーが起動している間だけ動作）</label>
+            </div>
+            <p class="notice">自動送信をONにしても、送られるのは「予約済み」の投稿だけです。承認待ちの投稿は送られません。</p>
+            <p class="notice" id="dataDirNote"></p>
+            <h4>コメント対応の自動化（サーバー起動中に裏で動く）</h4>
+            <div class="form-grid">
+              <label class="toggle-row"><input id="autoFetchRepliesEnabled" type="checkbox" /> 新着コメントを自動で取り込む</label>
+              <label>取り込み間隔（分）<input id="autoFetchRepliesMinutes" type="number" min="1" max="60" /></label>
+              <label class="toggle-row"><input id="autoReplyEnabled" type="checkbox" /> AIが判定して自動で返信する（クレーム・営業・個人情報・金銭・意味不明・事実確認が要る質問は「要確認」に残す）</label>
+              <label>返信の間隔（秒）<input id="autoReplyIntervalSec" type="number" min="5" max="600" /></label>
+              <label>1日の返信上限（件）<input id="autoReplyDailyCap" type="number" min="1" max="1000" /></label>
+              <label class="toggle-row"><input id="autoInsightsEnabled" type="checkbox" /> インサイトを1日1回自動で取り込む</label>
+            </div>
+            <p class="notice">自動返信がOFFのときも、コメント返信タブの「AIでまとめて下書き」で10件ずつ判定と下書きだけ作れます。送信は「この内容で返信する」を押したときだけです。ONにすると、AIが「返信する」と判定したものは間隔と上限の範囲で自動送信され、一覧に「自動返信」と表示されます。相手をユーザー名で呼ぶ書き方はしません。</p>
+          </div>
+
+          <div class="sticky-actions">
+            <span class="notice inline warn" id="settingsDirtyNote" hidden>未保存の変更があります。「設定を保存」を押すまで反映されません</span>
+            <span class="notice inline" id="settingsNotice"></span>
+            <button class="button" id="saveSettingsBtn">設定を保存</button>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="editDialog">
+      <form class="dialog-body" id="editForm">
+        <h3 id="dialogTitle">投稿を編集</h3>
+        <p class="notice" id="editNotice"></p>
+        <label>本文 <span class="count-chip" id="editCount"></span><textarea id="editText" rows="8" required></textarea></label>
+        <div class="form-grid">
+          <label>カテゴリ<input id="editCategory" list="categoryList" /></label>
+          <label>予約日時<input id="editScheduledAt" type="datetime-local" /></label>
+          <label>形式
+            <select id="editFormat">
+              <option value="TEXT">テキスト</option>
+              <option value="IMAGE">画像</option>
+              <option value="VIDEO">動画</option>
+            </select>
+          </label>
+          <label>メディアURL（画像・動画のとき）<input id="editMediaUrl" placeholder="https://..." /></label>
+          <label>代替テキスト<input id="editAltText" /></label>
+          <label>トピックタグ<input id="editTopicTag" placeholder="例: ハンドメイド" /></label>
+        </div>
+        <datalist id="categoryList">
+          <option value="Tips"></option><option value="本音・共感"></option><option value="失敗談"></option><option value="問いかけ"></option>
+          <option value="ツール紹介"></option><option value="導線"></option><option value="実績"></option><option value="観察"></option>
+        </datalist>
+        <menu>
+          <button class="button secondary" type="button" id="cancelEditBtn">キャンセル</button>
+          <button class="button" type="submit" id="savePostBtn">保存</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

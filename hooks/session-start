@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# SessionStart hook for joshicrea-threads-ops (macOS / Linux). Windows uses session-start.ps1.
+# Injects the plugin CLAUDE.md plus one line about the local server and setup state.
+set -u
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(dirname "$SCRIPT_DIR")"
+CLAUDE_MD="$PLUGIN_ROOT/CLAUDE.md"
+BASE_DIR="$HOME/.claude/threads-ops"
+[ -f "$CLAUDE_MD" ] || exit 0
+
+server_line="本体サーバー: 停止中（利用者に 起動.command の実行か PC の再起動を案内する）"
+code="$(curl -s -o /dev/null -m 2 -w '%{http_code}' -H 'x-threads-ops: 1' http://127.0.0.1:4173/api/state 2>/dev/null || echo 000)"
+if [ "$code" = "200" ]; then server_line="本体サーバー: 稼働中（http://localhost:4173）"; fi
+if [ "$code" = "401" ]; then server_line="本体サーバー: 稼働中（アクセスキー付き・http://localhost:4173）"; fi
+
+setup_line="初回セットアップ: 未（スキル threads-setup を始める）"
+if [ -f "$BASE_DIR/data/db.json" ]; then
+  name="$(node -e 'try{const d=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(String(d.settings&&d.settings.brandName||""))}catch{}' "$BASE_DIR/data/db.json" 2>/dev/null || true)"
+  if [ -n "$name" ]; then setup_line="初回セットアップ: 済（発信者: $name）"; fi
+fi
+
+node -e '
+const fs = require("fs");
+const content = fs.readFileSync(process.argv[1], "utf8");
+const ctx = "<EXTREMELY_IMPORTANT>\nThreads運用アシスタント（joshicrea-threads-ops plugin is active）。以下の指示に従うこと:\n\n" + content + "\n\n[今の状態] " + process.argv[2] + " ／ " + process.argv[3] + "\n</EXTREMELY_IMPORTANT>";
+process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: ctx } }));
+' "$CLAUDE_MD" "$server_line" "$setup_line"
+exit 0

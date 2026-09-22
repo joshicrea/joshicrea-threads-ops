@@ -1,0 +1,5 @@
+# /etc/caddy/Caddyfile — https（Let's Encrypt 自動）で受けて、アプリ（127.0.0.1:4173）へ転送する
+threads.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:4173
+}
