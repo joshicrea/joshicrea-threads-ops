@@ -14,10 +14,15 @@ try {
     $rel = (git rev-parse --show-prefix).TrimEnd("/")
     # git archive はバイナリ安全で、追跡ファイルだけを HEAD の内容で書き出す（PowerShell のパイプを通さない）
     $zip = Join-Path $env:TEMP "threads-ops-publish.zip"
-    git archive --format=zip --output "$zip" "HEAD:$rel"
+    # git archive はサブフォルダで実行すると cwd を pathspec として掛け、HEAD:<prefix> のツリーに対しては 0 件になる（2026-09-22 実測・公開リポの全ファイルを消した）。必ずトップレベルで実行する
+    $top = git rev-parse --show-toplevel
+    git -C "$top" archive --format=zip --output "$zip" "HEAD:$rel"
     if ($LASTEXITCODE -ne 0) { throw "git archive に失敗しました（prefix=$rel）" }
     Expand-Archive -Path $zip -DestinationPath $work -Force
     Remove-Item $zip -Force
+    foreach ($must in @("server.js", "install.ps1", "install.py", "mcp\server.mjs", ".claude-plugin\plugin.json")) {
+        if (-not (Test-Path (Join-Path $work $must))) { throw "書き出しに $must が無い。公開リポジトリには何も送らない" }
+    }
     $meta = Join-Path $work "Meta審査申請"
     if (Test-Path $meta) { Remove-Item $meta -Recurse -Force }
     if (-not $Message) { $Message = "sync " + (git rev-parse --short HEAD) + " " + (Get-Content VERSION -Raw).Trim() }

@@ -1184,6 +1184,11 @@ test("配布スクリプト: stop.ps1 が threads-ops.env の THREADS_DATA_DIR �
     assert.ok(buf.every((b) => b < 0x80), `${name} の中身は ASCII だけ（文字コードに依存しない）`);
     assert.ok(buf.toString().includes(name === "停止.cmd" ? "stop.ps1" : "uninstall.ps1"));
   }
+  // publish-github.ps1: サブフォルダで git archive を実行すると 0 件になり、公開リポの全ファイルを消す（2026-09-22 実測）
+  const publish = readFileSync(join(root, "publish-github.ps1"), "utf8");
+  assert.ok(publish.includes('git -C "$top" archive'), "publish-github.ps1: archive はトップレベルで実行する");
+  assert.ok(publish.includes('"server.js", "install.ps1"') && publish.includes("何も送らない"), "publish-github.ps1: 必須ファイルが無ければ送らない");
+  assert.ok(publish.includes("[Console]::OutputEncoding"), "publish-github.ps1: git の UTF-8 出力を正しく読む");
   const installPy = readFileSync(join(root, "install.py"), "utf8");
   for (const needle of ['chmod(0o755)', 'hooks/session-start', 'SuccessfulExit', 'uninstall.py', 'signal.SIGTERM', '.mcp.json']) {
     assert.ok(installPy.includes(needle), `install.py に ${needle} が無い`);
