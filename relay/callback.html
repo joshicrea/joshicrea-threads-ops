@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex,nofollow">
+<title>Threads連携 - 転送中</title>
+<script>
+  // Threads の認可結果（code / state）を、このPCで動いている運用アシスタントへそのまま渡す。
+  // Meta は localhost をコールバック先に登録できないため、公開ドメインのこのページを経由する。
+  var target = "http://localhost:4173/oauth/callback" + window.location.search;
+  window.location.replace(target);
+</script>
+</head>
+<body style="font-family:sans-serif;padding:32px">
+<p>運用アシスタントへ転送しています。切り替わらない場合は <a id="link" href="#">こちら</a> を押してください（このPCで運用アシスタントが起動している必要があります）。</p>
+<script>document.getElementById("link").href = target;</script>
+</body>
+</html>
