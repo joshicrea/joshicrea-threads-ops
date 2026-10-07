@@ -223,6 +223,16 @@ const tools = [
     description: "Threads と連携するための認可 URL を返す（利用者がブラウザで開いて許可する）。連携前にテスター招待の承認が要る。",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     run: async () => api("/api/threads-auth-url")
+  },
+  {
+    name: "threads_guide",
+    description: "利用者を案内するための指示書（再接続・初回設定・安全な初期値・詰まったとき）を返す。接続したら最初に読み、その順で利用者を案内する。Claude Code でも Codex でも同じ内容が返る。",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    run: async () => {
+      const p = join(here, "..", "指示書.md");
+      if (!existsSync(p)) throw new Error("指示書が見つかりません。インストールをもう一度実行してください（提供元に連絡してもよい）。");
+      return readFileSync(p, "utf8");
+    }
   }
 ];
 
@@ -242,7 +252,7 @@ async function handle(msg) {
       protocolVersion: "2025-06-18",
       capabilities: { tools: {} },
       serverInfo: { name: "threads-ops-assistant", version: "0.3.1" },
-      instructions: "Threads運用アシスタント（ローカル常駐サーバー）を操作するツール群。最初に threads_status を呼ぶ。承認・公開・返信の送信は利用者が本文を見て明示したときだけ行う。"
+      instructions: "Threads運用アシスタント（ローカル常駐サーバー）を操作するツール群。接続したら最初に threads_guide を呼んで指示書を読み、その順で利用者を案内する。続けて threads_status を呼ぶ。承認・公開・返信の送信は利用者が本文を見て明示したときだけ行う。"
     });
   }
   if (method === "notifications/initialized" || method?.startsWith("notifications/")) return;
@@ -253,7 +263,7 @@ async function handle(msg) {
     if (!tool) return replyError(id, -32602, `unknown tool: ${params?.name}`);
     try {
       const result = await tool.run(params.arguments || {});
-      return reply(id, { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
+      return reply(id, { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }] });
     } catch (error) {
       return reply(id, { content: [{ type: "text", text: `エラー: ${error.message}` }], isError: true });
     }
