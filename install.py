@@ -149,6 +149,29 @@ if node_path and mcp_json.exists():
     except Exception as e:
         print(f"注意: .mcp.json の書き換えに失敗しました。PATH の node で起動します: {e}")
 
+# Codex（~/.codex がある PC だけ）にも同じ MCP を登録する。Claude Code と Codex のどちらからでも操作できるようにする。
+# 既存の登録は置き換える（更新で二重にならない）。書き換え前の config.toml は .bak-threads-ops に控える
+def register_codex(home, node_exe, mcp_script, data_dir):
+    import re as _re
+    codex_dir = Path(home) / ".codex"
+    if not node_exe or not codex_dir.is_dir():
+        print("Codex が見つからないため、Codex への登録は飛ばしました（入れたあとにもう一度このスクリプトを実行すると登録されます）")
+        return False
+    toml = codex_dir / "config.toml"
+    old = toml.read_text(encoding="utf-8") if toml.exists() else ""
+    if toml.exists():
+        shutil.copy2(toml, str(toml) + ".bak-threads-ops")
+    block = f'[mcp_servers.threads-ops]\ncommand = "{Path(node_exe).as_posix()}"\nargs = ["{Path(mcp_script).as_posix()}"]\n\n[mcp_servers.threads-ops.env]\nTHREADS_DATA_DIR = "{Path(data_dir).as_posix()}"\n'
+    clean = _re.sub(r"(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|\Z)", "", old)
+    toml.write_text((clean.rstrip() + "\n\n" + block) if clean.strip() else block, encoding="utf-8")
+    print(f"Codex にも登録しました: {toml}（Codex を開き直すと使えます）")
+    return True
+
+try:
+    register_codex(Path.home(), node_path, install_path / "mcp" / "server.mjs", DATA_DIR)
+except Exception as e:
+    print(f"注意: Codex への登録に失敗しました（Claude Code の方は使えます）: {e}")
+
 # --- 5. 本体を安定した場所へ配置。データは別フォルダ ---
 for name in ["server.js", "start.js", "package.json", "public", "README.md", "relay", "uninstall.py", "アンインストール.md"]:
     src = install_path / name

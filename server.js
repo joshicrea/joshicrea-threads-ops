@@ -21,7 +21,7 @@ import { spawn } from "node:child_process";
 import { existsSync, chmodSync, readFileSync, unlinkSync } from "node:fs";
 import { extname, join, normalize, sep, dirname, delimiter } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(ROOT, "public");
@@ -67,7 +67,7 @@ const MAX_BODY_BYTES = 1_000_000;
 const JST_OFFSET = "+09:00";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
-const THREADS_GRAPH = "https://graph.threads.net";
+const THREADS_GRAPH = process.env.THREADS_GRAPH_BASE || "https://graph.threads.net"; // 検証用の偽APIへ向けるときだけ上書きする
 const THREADS_API = `${THREADS_GRAPH}/v1.0`;
 
 // Gemini 無料枠は RPM が小さい（Flash Lite でも 1分あたり十数回）。
@@ -83,6 +83,7 @@ const TOKEN_REFRESH_BEFORE_MS = 7 * 24 * 60 * 60 * 1000;
 const SCHEDULE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
 const SCHEDULE_STALE_MS = 24 * 60 * 60 * 1000;
 const SCHEDULE_RETRY_MAX = 5;
+const MONITORING_HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -95,8 +96,8 @@ const MIME_TYPES = {
 
 export const POST_STATUSES = ["review", "approved", "scheduled", "published", "rejected", "error"];
 export const THREADS_TEXT_LIMIT = 500;
-const CONTENT_FIELDS = ["text", "category", "format", "mediaUrl", "altText", "topicTag", "scheduledAt"];
-const DEFAULT_SCOPES = "threads_basic,threads_content_publish,threads_read_replies,threads_manage_replies,threads_manage_insights,threads_keyword_search";
+const CONTENT_FIELDS = ["text", "category", "format", "mediaUrl", "altText", "topicTag", "scheduledAt", "strategyMemo"];
+const DEFAULT_SCOPES = "threads_basic,threads_content_publish,threads_read_replies,threads_manage_replies,threads_manage_insights,threads_keyword_search,threads_profile_discovery";
 
 const defaultSettings = {
   aiProvider: "gemini",
@@ -111,8 +112,13 @@ const defaultSettings = {
   threadsTokenExpiresAt: "",
   threadsUserId: "",
   threadsUsername: "",
+  autoStoppedByIdentity: false, // 連携先を確認できず自動停止したとき true。補充が自動投稿を勝手にONに戻さないための印
+  replyStyle: "", // 返信だけの文体（口調・絵文字）。空なら writingRules に従う。投稿の生成には効かない（補充の絵文字ゲートと食い違わせないため）
+  expectedThreadsUsername: "", // 連携先として期待するユーザー名。設定すると、別のアカウントでの連携を拒否する（運用代行で他人の口座へ投稿しない）
   threadsAppId: "",
   threadsAppSecret: "",
+  threadsOAuthExchangeUrl: "",
+  threadsOAuthClientToken: "",
   // Meta の設定フォームは localhost の URL を保存できないため、公開ドメインの中継ページ（relay/callback.html）を既定にする。
   // 中継ページはブラウザを http://localhost:4173/oauth/callback へ転送するだけで、コードはこのPCの外に残らない。
   threadsRedirectUri: process.env.THREADS_REDIRECT_URI || (PUBLIC_ORIGIN ? `${PUBLIC_ORIGIN}/oauth/callback` : "https://bizcrea.com/threads/callback.html"),
@@ -122,10 +128,25 @@ const defaultSettings = {
   autoFetchRepliesMinutes: 5,
   autoReplyEnabled: false,
   autoReplyIntervalSec: 20,
+  autoReplyJaFromHour: 7, // 日本語コメントへの自動返信を送る時間帯（JST・開始時）
+  autoReplyJaToHour: 24, // 同・終了時（24=深夜0時まで）。英語のコメントには適用しない
   autoReplyDailyCap: 500,
   autoInsightsEnabled: true,
+  autoDeleteLowLikesEnabled: false,
+  autoDeleteAfterHours: 24,
+  autoDeleteMaxLikes: 9,
+  autoDeleteMaxReplies: 9, // 2026-10-03 林さん指示: いいねもコメントも10未満(9以下)のときだけ削除。どちらかが10以上なら残す
+  lastAutoDeleteFailureAt: "",
+  autoDeleteEnabledAt: "",
+  autoDeleteBlockedToken: "",
+  autoDeleteLog: [],
+  monitoringEnabled: false,
+  monitoringAccountId: "",
+  monitoringConsentAt: "",
+  monitoringRetentionDays: 30,
   autoReplyPausedUntil: "",
   lastDraftFailureAt: "",
+  lastAiRecoveryAt: "",
   accessKey: "",
   lastAiCheckAt: "",
   lastAiCheckProvider: "",
@@ -133,7 +154,10 @@ const defaultSettings = {
   profile: "",
   writingRules: "断言しすぎない。体験談を起点にする。最後はコメントしやすい問いで終える。",
   defaultCta: "",
-  scheduleTimes: ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"]
+  scheduleTimes: ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"],
+  postsPerDay: 0, // 1以上なら scheduleTimes ではなく、開始時〜終了時を本数ぶんに等分し、各枠の中でランダムな時刻にする
+  scheduleFromHour: 7,
+  scheduleToHour: 21
 };
 
 const SCHEMA_VERSION = 2; // db.json の形式番号。上げたら loadDb の移行処理に追記する
@@ -147,6 +171,13 @@ const defaultDb = {
   references: [],
   referenceAnalysis: null,
   suggestions: [],
+  monitoring: {
+    lastHeartbeatAt: "",
+    lastPostSuccessAt: "",
+    lastReplySuccessAt: "",
+    lastSafeError: null,
+    lastUpdatedAt: ""
+  },
   logs: []
 };
 
@@ -172,7 +203,7 @@ const knownSecrets = new Set();
 let accessKeyCache = "";
 function rememberSecrets(settings) {
   knownSecrets.clear();
-  for (const key of ["threadsAccessToken", "threadsAppSecret", "geminiApiKey", "anthropicApiKey", "accessKey"]) {
+  for (const key of ["threadsAccessToken", "threadsAppSecret", "threadsOAuthClientToken", "geminiApiKey", "anthropicApiKey", "accessKey"]) {
     const v = String(settings[key] || "");
     if (v.length >= 8) knownSecrets.add(v);
   }
@@ -245,9 +276,11 @@ async function loadDb() {
   const db = { ...structuredClone(defaultDb), ...raw };
   db.schemaVersion = SCHEMA_VERSION;
   db.settings = { ...defaultSettings, ...(raw.settings || {}) };
+  db.monitoring = { ...structuredClone(defaultDb.monitoring), ...(raw.monitoring || {}) };
   if (!db.settings.threadsScopes.includes("threads_keyword_search")) {
     db.settings.threadsScopes = DEFAULT_SCOPES;
   }
+  if (!db.settings.threadsScopes.includes("threads_profile_discovery")) db.settings.threadsScopes += ",threads_profile_discovery"; // 他アカウントの公開投稿の一覧用。次に連携し直したときに要求される
   delete db.settings.operationMode; // 旧バージョンの「自動モード」は廃止（承認制のみ）
   const legacyRedirect = /^https?:\/\/localhost:\d+\/oauth\/callback$/.test(db.settings.threadsRedirectUri || "")
     || (PUBLIC_ORIGIN && db.settings.threadsRedirectUri === "https://bizcrea.com/threads/callback.html");
@@ -312,9 +345,23 @@ function id(prefix) {
 }
 
 function log(db, level, message, meta = {}) {
-  const safeMeta = Object.fromEntries(Object.entries(meta).map(([k, v]) => [k, typeof v === "string" ? redactSecrets(v) : v]));
+  const safeMeta = sanitizeLogMeta(meta);
   db.logs.unshift({ id: id("log"), at: nowIso(), level, message: redactSecrets(message), meta: safeMeta });
   db.logs = db.logs.slice(0, 300);
+}
+
+function sanitizeLogMeta(value, key = "") {
+  if (/^(text|body|content|prompt|responseText|mediaUrl|altText)$/i.test(key)) return undefined;
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") return redactSecrets(value).slice(0, 500);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => sanitizeLogMeta(item)).filter((item) => item !== undefined);
+  if (typeof value === "object") {
+    return Object.fromEntries(Object.entries(value)
+      .map(([k, v]) => [k, sanitizeLogMeta(v, k)])
+      .filter(([, v]) => v !== undefined));
+  }
+  return String(value).slice(0, 200);
 }
 
 function maskSecret(value) {
@@ -332,6 +379,7 @@ function publicSettings(settings) {
     anthropicApiKey: maskSecret(settings.anthropicApiKey),
     threadsAccessToken: maskSecret(settings.threadsAccessToken),
     threadsAppSecret: maskSecret(settings.threadsAppSecret),
+    threadsOAuthClientToken: maskSecret(settings.threadsOAuthClientToken),
     accessKey: maskSecret(settings.accessKey)
   };
 }
@@ -359,6 +407,21 @@ async function bodyJson(req) {
   }
 }
 
+async function fetchJson(url, init = {}) {
+  const res = await fetch(url, init);
+  const text = await res.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new HttpError(502, `JSONとして読めない応答です: ${String(text || "").slice(0, 120)}`);
+  }
+  if (!res.ok) {
+    throw new HttpError(res.status, data.error || data.message || `HTTP ${res.status}`, data.detail || text);
+  }
+  return data;
+}
+
 class HttpError extends Error {
   constructor(status, message, detail = "") {
     super(message);
@@ -374,11 +437,13 @@ class ExternalApiError extends Error {
     let apiMessage = "";
     let retryAfterMs = 0;
     let this_apiCode = 0;
+    let this_apiSubcode = 0;
     try {
       const parsed = JSON.parse(rawText);
       apiStatus = parsed.error?.status || "";
       apiMessage = parsed.error?.message || parsed.error_message || "";
       this_apiCode = Number(parsed.error?.code ?? parsed.error_code ?? 0) || 0;
+      this_apiSubcode = Number(parsed.error?.error_subcode ?? 0) || 0;
       for (const d of parsed.error?.details || []) {
         if (typeof d.retryDelay === "string") retryAfterMs = Math.ceil(parseFloat(d.retryDelay) * 1000);
       }
@@ -392,6 +457,7 @@ class ExternalApiError extends Error {
     this.apiMessage = apiMessage;
     this.retryAfterMs = retryAfterMs;
     this.apiCode = this_apiCode;
+    this.apiSubcode = this_apiSubcode;
     this.detail = `${service} ${status} ${apiStatus} ${apiMessage}`.trim();
   }
 }
@@ -426,7 +492,7 @@ function humanizeExternalError(service, status, apiStatus, apiMessage, retryAfte
   }
   if (service === "Threads") {
     if (/does not have permission for this action|アクセスレベルが不十分/i.test(apiMessage)) {
-      return `この操作の権限がアプリに付いていません。Meta for Developers の「ユースケース → カスタマイズ → アクセス許可と機能」で必要な権限（キーワード検索なら threads_keyword_search）を追加し、設定画面の「Threadsと連携する」で再認可してください。${raw}`;
+      return `この操作の権限がアプリに付いていません。Meta for Developers の「ユースケース → カスタマイズ → アクセス許可と機能」で必要な権限（キーワード検索なら threads_keyword_search、他アカウントの投稿一覧なら threads_profile_discovery、自動削除なら threads_delete）を追加し、設定画面の「Threadsと連携する」で再認可してください。${raw}`;
     }
     if (status === 401 || status === 403 || /access token|session has expired|OAuthException/i.test(apiMessage)) {
       return `Threadsの認証が通りませんでした。アクセストークンが失効しているか、必要な権限（scope）が足りません。設定画面から再認可してください。${raw}`;
@@ -461,6 +527,78 @@ function safeUrl(value, label = "URL") {
   }
   if (!["http:", "https:"].includes(parsed.protocol)) throw new HttpError(400, `${label}は http または https で始まる必要があります。`);
   return parsed.toString().slice(0, 2000);
+}
+
+function monitoringStatusPayload(db) {
+  const monitoring = { ...structuredClone(defaultDb.monitoring), ...(db.monitoring || {}) };
+  return {
+    enabled: !!db.settings.monitoringEnabled,
+    configured: !!(db.settings.monitoringAccountId && db.settings.monitoringConsentAt),
+    accountId: db.settings.monitoringAccountId || "",
+    retentionDays: db.settings.monitoringRetentionDays,
+    lastHeartbeatAt: monitoring.lastHeartbeatAt || "",
+    lastPostSuccessAt: monitoring.lastPostSuccessAt || "",
+    lastReplySuccessAt: monitoring.lastReplySuccessAt || "",
+    lastSafeError: monitoring.lastSafeError || null,
+    lastUpdatedAt: monitoring.lastUpdatedAt || "",
+    serverTime: nowIso()
+  };
+}
+
+function classifySafeError(error, area = "unknown") {
+  const base = {
+    at: nowIso(),
+    area,
+    category: "unknown",
+    transient: false,
+    httpStatus: null,
+    apiCode: null,
+    apiSubcode: null
+  };
+  if (!error) return base;
+  if (isRateLimitError(error)) return { ...base, category: "rate_limited", transient: true, httpStatus: error.status || null, apiCode: error.apiCode || null, apiSubcode: error.apiSubcode || null };
+  if (error.network) return { ...base, category: "network", transient: true };
+  if (error instanceof ExternalApiError) {
+    const permission = /permission|access level|権限|アクセスレベル/i.test(error.apiMessage || "");
+    const auth = error.status === 401 || error.status === 403 || /access token|session|OAuthException/i.test(error.apiMessage || "");
+    return {
+      ...base,
+      category: permission ? "permission_denied" : auth ? "auth_required" : error.status >= 500 ? "upstream_unavailable" : error.status >= 400 ? "api_rejected" : "unknown",
+      transient: error.status >= 500,
+      httpStatus: error.status || null,
+      apiCode: error.apiCode || null,
+      apiSubcode: error.apiSubcode || null
+    };
+  }
+  if (error instanceof HttpError) {
+    return {
+      ...base,
+      category: error.status === 409 ? "conflict" : error.status >= 500 ? "server_error" : "validation",
+      transient: error.status >= 500,
+      httpStatus: error.status || null
+    };
+  }
+  return base;
+}
+
+function recordMonitoringEvent(db, type, { error, area } = {}) {
+  if (!db.settings.monitoringEnabled) return;
+  db.monitoring = { ...structuredClone(defaultDb.monitoring), ...(db.monitoring || {}) };
+  const at = nowIso();
+  if (type === "heartbeat") db.monitoring.lastHeartbeatAt = at;
+  if (type === "post_success") db.monitoring.lastPostSuccessAt = at;
+  if (type === "reply_success") db.monitoring.lastReplySuccessAt = at;
+  if (type === "safe_error") db.monitoring.lastSafeError = classifySafeError(error, area);
+  db.monitoring.lastUpdatedAt = at;
+}
+
+async function recordMonitoringHeartbeat() {
+  await withDb(async (db) => {
+    if (!db.settings.monitoringEnabled || !db.settings.monitoringConsentAt) return { save: false };
+    const last = Date.parse(db.monitoring?.lastHeartbeatAt || "") || 0;
+    if (Date.now() - last < MONITORING_HEARTBEAT_INTERVAL_MS - 5000) return { save: false };
+    recordMonitoringEvent(db, "heartbeat");
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,6 +1233,11 @@ async function searchThreadsPostsViaWeb(settings, keyword) {
       metrics: { likes: Number(p.likes) || 0, replies: Number(p.replies) || 0 },
       selected: false,
       analysis: null,
+      // 2026-09-23: WebFetchはThreadsのようなJS必須ページの実データを取得できず、
+      // もっともらしい値を創作することを対照実験で確認した（curlで実データ0件のページから
+      // 具体的なフォロワー数・いいね数が返る再現性あり）。この経路で得た数値・本文は未検証として扱う。
+      unverified: true,
+      unverifiedReason: "WebFetch経由のためいいね数・本文が実在するか未確認。採用前に本人アカウントで目視確認してください。",
       createdAt: nowIso()
     });
   }
@@ -1116,9 +1259,40 @@ async function threadsFetch(path, { method = "GET", params = {}, token } = {}) {
     if (body) body.set("access_token", token);
     else url.searchParams.set("access_token", token);
   }
-  const res = await fetch(url, { method, body, signal: AbortSignal.timeout(30_000) });
+  let res;
+  try {
+    res = await fetch(url, { method, body, signal: AbortSignal.timeout(30_000) });
+  } catch (error) {
+    const code = error?.cause?.code || error?.cause?.name || error?.name || "";
+    const failure = new Error(`Threadsへ通信できませんでした（${code || "原因不明"}）`);
+    failure.network = true;
+    throw failure;
+  }
   if (!res.ok) throw new ExternalApiError("Threads", res.status, await res.text());
   return res.json();
+}
+
+function threadsFailureText(error) {
+  return `${error?.message || ""} ${error?.detail || ""} ${error?.apiMessage || ""}`.trim();
+}
+
+function isThreadsMissingObjectError(error) {
+  return error instanceof ExternalApiError
+    && error.status >= 400 && error.status < 500
+    && /does not exist|unsupported get request|cannot be loaded/i.test(threadsFailureText(error));
+}
+
+function isTransientThreadsError(error) {
+  if (error?.network) return true;
+  if (error instanceof ExternalApiError) return error.status === 408 || error.status === 409 || error.status === 425 || error.status === 429 || error.status >= 500 || isRateLimitError(error);
+  return /ETIMEDOUT|ECONNRESET|EAI_AGAIN|fetch failed|network|timeout|通信できません/i.test(threadsFailureText(error));
+}
+
+function boundedBackoffMs(attempt, { baseMs = 5 * 60_000, maxMs = 6 * 60 * 60_000, jitterRatio = 0.2 } = {}) {
+  const n = Math.max(0, Number(attempt) || 0);
+  const raw = Math.min(maxMs, baseMs * (2 ** Math.min(n, 8)));
+  const jitter = Math.floor(raw * jitterRatio * Math.random());
+  return Math.min(maxMs, raw + jitter);
 }
 
 function requireToken(settings) {
@@ -1130,11 +1304,135 @@ function requireToken(settings) {
 
 // OAuth state はリクエストごとに乱数を発行し、コールバックで照合する（CSRF対策）。
 const pendingOauthStates = new Map();
+// 複数アカウントを別ポートで動かすとき、連携の戻り先（中継ページは4173固定）を正しいサーバーへ振り分けるための印。
+// THREADS_ACCOUNT_ID=reje なら state は "reje.<乱数>"。THREADS_PEERS="reje=5173,foo=5175" は、自分のものでない印を持つ戻りの転送先。
+const ACCOUNT_ID = /^[a-z0-9]{1,16}$/.test(process.env.THREADS_ACCOUNT_ID || "") ? process.env.THREADS_ACCOUNT_ID : "";
+const PEER_PORTS = new Map(String(process.env.THREADS_PEERS || "").split(",").map((pair) => pair.split("=")).filter(([k, v]) => /^[a-z0-9]{1,16}$/.test(k || "") && /^\d{2,5}$/.test(v || "")).map(([k, v]) => [k, Number(v)]));
+const hostedOauthStates = new Map();
+const OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
+function ownsOauthState(state) {
+  const startedAt = pendingOauthStates.get(String(state || ""));
+  return typeof startedAt === "number" && Date.now() - startedAt < OAUTH_STATE_TTL_MS;
+}
 
-function getThreadsAuthUrl(settings) {
+function hostedOAuthSettings() {
+  return {
+    threadsAppId: process.env.THREADS_HOST_APP_ID || process.env.THREADS_APP_ID || "",
+    threadsAppSecret: process.env.THREADS_HOST_APP_SECRET || process.env.THREADS_APP_SECRET || "",
+    threadsRedirectUri: process.env.THREADS_HOST_REDIRECT_URI || process.env.THREADS_REDIRECT_URI || defaultSettings.threadsRedirectUri,
+    threadsScopes: process.env.THREADS_HOST_SCOPES || DEFAULT_SCOPES
+  };
+}
+
+function normalizeThreadsUsername(value) {
+  return String(value || "").trim().replace(/^@/, "").toLowerCase();
+}
+
+function normalizeScopeList(value) {
+  const list = Array.isArray(value) ? value : String(value || "").split(",");
+  return list.map((s) => String(s || "").trim()).filter(Boolean);
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(String(value || ""), "utf8").digest("hex");
+}
+
+function timingSafeStringEqual(a, b) {
+  const aa = Buffer.from(String(a || ""));
+  const bb = Buffer.from(String(b || ""));
+  return aa.length === bb.length && timingSafeEqual(aa, bb);
+}
+
+function parseHostedOAuthClients() {
+  const raw = String(process.env.THREADS_HOST_CLIENTS || "").trim();
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new HttpError(503, "Hosted OAuth client allowlist JSON is invalid.");
+  }
+  const entries = Array.isArray(parsed)
+    ? parsed
+    : Object.entries(parsed || {}).map(([token, cfg]) => ({ token, ...(cfg && typeof cfg === "object" ? cfg : {}) }));
+  return entries.map((entry, index) => ({
+    id: String(entry.id || entry.name || `client-${index + 1}`).slice(0, 80),
+    token: String(entry.token || ""),
+    tokenSha256: String(entry.tokenSha256 || "").toLowerCase(),
+    expectedThreadsUsername: normalizeThreadsUsername(entry.expectedThreadsUsername || entry.username || entry.threadsUsername),
+    scopes: normalizeScopeList(entry.scopes || entry.allowedScopes),
+    enabled: entry.enabled !== false && !entry.revokedAt,
+    expiresAt: entry.expiresAt || ""
+  }));
+}
+
+function hostedClientTokenMatches(client, suppliedToken) {
+  if (!suppliedToken || suppliedToken.length < 16) return false;
+  if (client.tokenSha256) return /^[a-f0-9]{64}$/.test(client.tokenSha256) && timingSafeStringEqual(sha256Hex(suppliedToken), client.tokenSha256);
+  return client.token.length >= 16 && timingSafeStringEqual(client.token, suppliedToken);
+}
+
+function assertHostedOAuthClient(req) {
+  const got = String(req.headers["x-threads-oauth-client"] || "");
+  const clients = parseHostedOAuthClients();
+  if (!clients.length) throw new HttpError(503, "Hosted OAuth client allowlist is not configured.");
+  const client = clients.find((item) => hostedClientTokenMatches(item, got));
+  if (!client || !client.enabled) throw new HttpError(401, "Hosted OAuth client is not registered or has been revoked.");
+  if (client.expiresAt && Date.parse(client.expiresAt) <= Date.now()) throw new HttpError(401, "Hosted OAuth client token has expired.");
+  if (!client.expectedThreadsUsername || !/^[a-z0-9._]{1,30}$/.test(client.expectedThreadsUsername)) throw new HttpError(503, "Hosted OAuth client is missing an allowed Threads username.");
+  if (!client.scopes.length) throw new HttpError(503, "Hosted OAuth client is missing allowed scopes.");
+  return client;
+}
+
+function pruneHostedOauthStates() {
+  for (const [state, item] of hostedOauthStates) {
+    if (Date.now() - item.createdAt > 15 * 60 * 1000) hostedOauthStates.delete(state);
+  }
+}
+
+function buildHostedAuthUrl({ expectedThreadsUsername, scopes, autoDeleteLowLikesEnabled, client }) {
+  const settings = hostedOAuthSettings();
+  if (!settings.threadsAppId || !settings.threadsAppSecret) throw new HttpError(503, "OAuthホストにApp ID / App Secretが未設定です。");
+  const expected = normalizeThreadsUsername(expectedThreadsUsername);
+  if (!expected || !/^[a-z0-9._]{1,30}$/.test(expected)) throw new HttpError(400, "期待するThreadsユーザー名が未設定です。");
+  if (!client || expected !== client.expectedThreadsUsername) throw new HttpError(403, "Hosted OAuth client is not allowed for this Threads username.");
+  pruneHostedOauthStates();
+  const state = `host.${randomBytes(24).toString("hex")}`;
+  const allowed = new Set(client.scopes);
+  const requestedList = normalizeScopeList(scopes || settings.threadsScopes || DEFAULT_SCOPES);
+  for (const scope of requestedList) {
+    if (!allowed.has(scope)) throw new HttpError(400, `許可されていないThreads scopeです: ${scope}`);
+  }
+  const requestedScopes = requestedList.join(",");
+  hostedOauthStates.set(state, { createdAt: Date.now(), expectedThreadsUsername: expected, scopes: requestedScopes, clientId: client.id });
+  const url = new URL("https://threads.net/oauth/authorize");
+  url.searchParams.set("client_id", settings.threadsAppId);
+  url.searchParams.set("redirect_uri", settings.threadsRedirectUri);
+  url.searchParams.set("scope", autoDeleteLowLikesEnabled && allowed.has("threads_delete") && !requestedScopes.split(",").includes("threads_delete") ? `${requestedScopes},threads_delete` : requestedScopes);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("state", state);
+  return { url: url.toString(), state, expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString() };
+}
+
+async function exchangeHostedOauthCode({ code, state, expectedThreadsUsername, client }) {
+  pruneHostedOauthStates();
+  const saved = hostedOauthStates.get(String(state || ""));
+  if (!saved) throw new HttpError(400, "OAuth stateが不正または期限切れです。もう一度認証してください。");
+  hostedOauthStates.delete(String(state || ""));
+  const expected = normalizeThreadsUsername(expectedThreadsUsername);
+  if (!expected || expected !== saved.expectedThreadsUsername) throw new HttpError(400, "期待ユーザー名と認証リクエストのstateが一致しません。");
+  if (!client || saved.clientId !== client.id) throw new HttpError(401, "Hosted OAuth client does not match the authorization request.");
+  if (expected !== client.expectedThreadsUsername) throw new HttpError(400, "Hosted OAuth client is not allowed for this Threads username.");
+  const token = await exchangeThreadsCode({ ...hostedOAuthSettings(), expectedThreadsUsername: expected }, String(code || ""));
+  const got = String(token.username || "").toLowerCase();
+  if (!got || got !== expected) throw new HttpError(409, `認証されたThreadsアカウント @${got || "unknown"} が期待する @${expected} と一致しません。`);
+  return token;
+}
+
+function getLocalThreadsAuthUrl(settings) {
   if (!settings.threadsAppId) throw new HttpError(400, "Threads App IDが未設定です。");
   if (!settings.threadsRedirectUri) throw new HttpError(400, "Threads Redirect URIが未設定です。");
-  const state = randomBytes(16).toString("hex");
+  const state = `${ACCOUNT_ID ? `${ACCOUNT_ID}.` : ""}${randomBytes(16).toString("hex")}`;
   pendingOauthStates.set(state, Date.now());
   for (const [key, at] of pendingOauthStates) {
     if (Date.now() - at > 15 * 60 * 1000) pendingOauthStates.delete(key);
@@ -1142,13 +1440,56 @@ function getThreadsAuthUrl(settings) {
   const url = new URL("https://threads.net/oauth/authorize");
   url.searchParams.set("client_id", settings.threadsAppId);
   url.searchParams.set("redirect_uri", settings.threadsRedirectUri);
-  url.searchParams.set("scope", settings.threadsScopes || DEFAULT_SCOPES);
+  const scopes = settings.threadsScopes || DEFAULT_SCOPES;
+  // 削除の権限は、自動削除をONにしている利用者の連携URLにだけ付ける（OFFの利用者のOAuthを、削除権限の有無で壊さない）
+  url.searchParams.set("scope", settings.autoDeleteLowLikesEnabled && !scopes.split(",").includes("threads_delete") ? `${scopes},threads_delete` : scopes);
   url.searchParams.set("response_type", "code");
   url.searchParams.set("state", state);
   return url.toString();
 }
 
-async function exchangeThreadsCode(settings, code) {
+function oauthHostEndpoint(settings, action) {
+  const base = String(settings.threadsOAuthExchangeUrl || "").trim().replace(/\/+$/, "");
+  return base ? `${base}/${action}` : "";
+}
+
+async function getThreadsAuthUrl(settings) {
+  if (!settings.threadsOAuthExchangeUrl) return getLocalThreadsAuthUrl(settings);
+  if (!settings.expectedThreadsUsername) throw new HttpError(400, "Threads連携の前に、連携先として期待するユーザー名を設定してください。");
+  const data = await fetchJson(oauthHostEndpoint(settings, "create"), {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-threads-oauth-client": settings.threadsOAuthClientToken || "" },
+    body: JSON.stringify({
+      expectedThreadsUsername: settings.expectedThreadsUsername,
+      scopes: settings.threadsScopes || DEFAULT_SCOPES,
+      autoDeleteLowLikesEnabled: !!settings.autoDeleteLowLikesEnabled
+    })
+  });
+  if (!data.url || !data.state) throw new HttpError(502, "OAuthホストから認証URLを取得できませんでした。");
+  pendingOauthStates.set(String(data.state), Date.now());
+  return String(data.url);
+}
+
+async function exchangeThreadsCodeHosted(settings, code, state) {
+  const data = await fetchJson(oauthHostEndpoint(settings, "exchange"), {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-threads-oauth-client": settings.threadsOAuthClientToken || "" },
+    body: JSON.stringify({
+      code: code.replace(/#_$/, ""),
+      state,
+      expectedThreadsUsername: settings.expectedThreadsUsername
+    })
+  });
+  return {
+    accessToken: String(data.accessToken || ""),
+    expiresAt: String(data.expiresAt || ""),
+    userId: String(data.userId || ""),
+    username: String(data.username || "")
+  };
+}
+
+async function exchangeThreadsCode(settings, code, state = "") {
+  if (settings.threadsOAuthExchangeUrl) return exchangeThreadsCodeHosted(settings, code, state);
   if (!settings.threadsAppId || !settings.threadsAppSecret) throw new HttpError(400, "Threads App ID / App Secret が未設定です。");
   const shortToken = await threadsFetch(`${THREADS_GRAPH}/oauth/access_token`, {
     method: "POST",
@@ -1190,8 +1531,72 @@ async function refreshThreadsToken(settings) {
 }
 
 // 投稿は「コンテナ作成 → (メディアなら処理完了待ち) → 公開」の2段階。
+// 投稿の直前に、トークンの持ち主が期待したアカウントかを Threads に問い合わせて照合する（公開する側に倒さない）。
+// 照合できない（通信失敗）ときは公開せず、予約投稿は10分後に再試行する（上限 SCHEDULE_RETRY_MAX）。不一致は自動投稿・自動返信を止める。
+const identityCache = new Map(); // token末尾 → { at, id, username }
+async function assertPublishIdentity(settings, token) {
+  const key = token.slice(-12);
+  let who = identityCache.get(key);
+  if (!who || Date.now() - who.at > 5 * 60_000) {
+    let me;
+    try {
+      me = await threadsFetch("/me", { params: { fields: "id,username" }, token });
+    } catch (error) {
+      error.retryable = true; // 持ち主を確認できなかっただけ（通信・一時的な応答）。公開はしないが、投稿は永久エラーにせず次の周期で再試行する
+      throw error;
+    }
+    who = { at: Date.now(), id: String(me.id || ""), username: String(me.username || "") };
+    identityCache.set(key, who);
+  }
+  const expected = String(settings.expectedThreadsUsername || "").trim().replace(/^@/, "").toLowerCase();
+  const wrongId = settings.threadsUserId && who.id && settings.threadsUserId !== who.id;
+  const wrongName = expected && who.username.toLowerCase() !== expected;
+  if (!expected) {
+    // 期待ユーザー名が無いと、ブラウザのログインが別のお客様のまま連携した状態を見分けられない（トークンの持ち主=連携時に保存した持ち主になるため）。公開しない
+    const e = new HttpError(409, "この口座には連携先のユーザー名（期待ユーザー名）が設定されていないため、投稿しません。設定画面の「連携先として期待するユーザー名」を入れてください。");
+    e.identityMismatch = true;
+    stopAutosOnIdentityProblem(e.message);
+    throw e;
+  }
+  if (settings.autoStoppedByIdentity && who.id && !wrongId && !wrongName) {
+    withDb(async (db) => { if (!db.settings.autoStoppedByIdentity) return { save: false }; db.settings.autoStoppedByIdentity = false; }).catch((error) => appendErrorLog(error));
+  }
+  if (!who.id || wrongId || wrongName) {
+    const e = new HttpError(409, `投稿を中止しました。トークンの持ち主 @${who.username || "不明"} が、この口座の連携先（${expected ? "@" + expected : settings.threadsUsername ? "@" + settings.threadsUsername : "未設定"}）と一致しません。`);
+    e.identityMismatch = true;
+    stopAutosOnIdentityProblem(e.message);
+    throw e;
+  }
+}
+
+// 持ち主が期待と違う・期待が未設定のとき、予約送信・返信・手動公開のどの経路から来ても、自動投稿と自動返信を止める。
+// 呼び出し側がDBのロックを持っていても詰まらないよう、待たずに予約だけする
+function stopAutosOnIdentityProblem(reason) {
+  withDb(async (db) => {
+    if (!db.settings.autoPublishEnabled && !db.settings.autoReplyEnabled) return { save: false };
+    db.settings.autoPublishEnabled = false;
+    db.settings.autoReplyEnabled = false;
+    db.settings.autoStoppedByIdentity = true;
+    log(db, "error", "連携先のアカウントを確認できないため、自動投稿・自動返信を止めました。", { reason });
+  }).catch((error) => appendErrorLog(error));
+}
+
+// 送信直前の最終ゲート。予約・手動のどちらの公開もここを通る（承認後に本文が編集された・案件ルール違反・同じ本文が既に出ている、を止める）。
+// 返信は定型文が重なりうるので対象外
+async function assertContentGate(post) {
+  if (post.replyToId) return;
+  const violations = profileViolations(post.text);
+  if (violations.length) throw new HttpError(409, `送信直前の検査で止めました: ${violations.join("、")}`);
+  const norm = (t) => String(t || "").normalize("NFKC").replace(/[\s。、．，！？!?,.…・「」『』（）()]+/g, "");
+  const fresh = await readDb();
+  const twin = fresh.posts.find((x) => x.id !== post.id && x.status === "published" && norm(x.text) === norm(post.text));
+  if (twin) throw new HttpError(409, "送信直前の検査で止めました: 同じ本文が既に公開されています（二重投稿の防止）");
+}
+
 async function publishThreadsPost(settings, post, { onContainer } = {}) {
   const token = requireToken(settings);
+  await assertPublishIdentity(settings, token);
+  await assertContentGate(post);
   if (!post.text?.trim() && post.format === "TEXT") throw new HttpError(400, "本文が空です。");
   if (post.format !== "TEXT" && !post.mediaUrl) throw new HttpError(400, "IMAGE/VIDEO投稿にはメディアURL（公開URL）が必要です。");
   const params = {
@@ -1251,7 +1656,8 @@ async function fetchThreadsInsights(settings, post) {
   });
   const metrics = {};
   for (const item of data.data || []) {
-    metrics[item.name] = item.values?.[0]?.value ?? item.total_value?.value ?? 0;
+    const v = item.values?.[0]?.value ?? item.total_value?.value;
+    metrics[item.name] = v === undefined || v === null ? null : v; // 欠けた値は0にせず null のまま持つ（集計側は `|| 0` で読む）
   }
   return { id: id("ins"), postId: post.id, threadsId: post.threadsId, at: nowIso(), metrics };
 }
@@ -1263,7 +1669,7 @@ async function fetchThreadsReplies(settings, post, knownIds = new Set()) {
   let after = "";
   for (let page = 0; page < REPLY_FETCH_MAX_PAGES; page += 1) {
     const data = await threadsFetch(`/${post.threadsId}/replies`, {
-      params: { fields: "id,text,timestamp,permalink,username,is_reply_owned_by_me", reverse: "true", limit: 100, after },
+      params: { fields: "id,text,timestamp,permalink,username,is_reply_owned_by_me,media_type,media_url", reverse: "true", limit: 100, after },
       token
     });
     const items = data.data || [];
@@ -1281,6 +1687,8 @@ async function fetchThreadsReplies(settings, post, knownIds = new Set()) {
       username: reply.username || "",
       timestamp: reply.timestamp || "",
       permalink: reply.permalink || "",
+      mediaType: reply.media_type || "",
+      mediaUrl: reply.media_url || "",
       status: "unhandled",
       responseText: "",
       respondedThreadsId: "",
@@ -1318,6 +1726,47 @@ async function searchThreadsPosts(settings, keyword, searchType = "TOP") {
     }));
 }
 
+// 特定ユーザー1アカウントの公開投稿を一覧する: scope threads_profile_discovery が必要（公開アカウントのみ・公式の説明は Meta アプリ画面）。
+// 反応数の項目名は公式で未確認のため、最初は反応数つきで試し、項目名の誤りで拒否されたら本文系の項目だけで取り直す。
+const PROFILE_POST_FIELDS_BASE = "id,text,media_type,permalink,timestamp,username";
+const PROFILE_POST_FIELDS_METRICS = `${PROFILE_POST_FIELDS_BASE},like_count,reply_count,repost_count,quote_count`;
+async function listProfilePosts(settings, rawUsername, maxPosts = 100) {
+  const token = requireToken(settings);
+  const username = String(rawUsername || "").trim().replace(/^@/, "");
+  if (!/^[A-Za-z0-9._]{1,40}$/.test(username)) throw new HttpError(400, "ユーザー名は半角英数字・ピリオド・アンダースコアで入力してください（@は付けても付けなくても構いません）。");
+  let fields = PROFILE_POST_FIELDS_METRICS;
+  const items = [];
+  let after = "";
+  let fieldsFellBack = false;
+  for (let page = 0; page < 10 && items.length < maxPosts; page += 1) {
+    const params = { username, fields, limit: 25, ...(after ? { after } : {}) };
+    let data;
+    try {
+      data = await threadsFetch("/profile_posts", { params, token });
+    } catch (error) {
+      if (page === 0 && !fieldsFellBack && error instanceof ExternalApiError && error.apiCode === 100 && /field/i.test(error.apiMessage || "")) {
+        fields = PROFILE_POST_FIELDS_BASE;
+        fieldsFellBack = true;
+        page -= 1;
+        continue;
+      }
+      throw error;
+    }
+    items.push(...(data.data || []));
+    after = data.paging?.cursors?.after || "";
+    if (!after || !(data.data || []).length) break;
+  }
+  return {
+    username,
+    withMetrics: !fieldsFellBack,
+    posts: items.slice(0, maxPosts).map((item) => ({
+      threadsId: String(item.id), text: item.text || "", mediaType: item.media_type || "TEXT", permalink: item.permalink || "",
+      timestamp: item.timestamp || "", username: item.username || username,
+      likes: item.like_count ?? null, replies: item.reply_count ?? null, reposts: item.repost_count ?? null, quotes: item.quote_count ?? null
+    }))
+  };
+}
+
 // ---------------------------------------------------------------------------
 // プロンプトとスキーマ
 // ---------------------------------------------------------------------------
@@ -1335,6 +1784,7 @@ function latestMetricsByPost(db) {
   for (const item of db.insights) {
     if (!map.has(item.postId)) map.set(item.postId, item.metrics || {});
   }
+  for (const p of db.posts) if (p.finalMetrics && !map.has(p.id)) map.set(p.id, p.finalMetrics); // 削除した投稿の最後の数字（insights の切り詰めに左右されない）
   return map;
 }
 
@@ -1366,7 +1816,11 @@ function buildDraftPrompt(db, request) {
     ""
   ];
   if (references.length) {
-    lines.push("## 参考にする投稿（型を学ぶ。文章のコピー・言い換えは禁止。発信者自身の経験と言葉で書き直す）");
+    lines.push(
+      "## 参考にする投稿（型を学ぶ。文章のコピー・言い換えは禁止。発信者自身の経験と言葉で書き直す）",
+      "**「型を学ぶ」とは、テーマ・キーワードだけを抜き出すことではない。** 参考投稿が持つ「フック（1文目の入り方）→展開（本論の運び・段落の順序）→オチ（締め方）」という構造をそのまま保持し、中身（題材・エピソード・具体例）だけを発信者の実態に置き換える。構造を捨てて話題だけ借りると、参考投稿と無関係な一般論になる（2026-09-23〜24 の運用で実際に発生し、依頼者から「何をマネしているのか分からない」と指摘された）。",
+      "参考投稿を選ぶ際は、その内容が発信者にとって実際に語れる/行える行動かを確認する（発信者がしていない行動——他人のアプリ開発の話・関係のないイベント出店等——をそのまま真似ない）。"
+    );
     for (const ref of references) {
       lines.push(`- 投稿: ${ref.text.replace(/\s+/g, " ").slice(0, 400)}`);
       if (ref.analysis?.hook) lines.push(`  型: フック=${ref.analysis.hook} / 構造=${ref.analysis.structure} / 効いている理由=${ref.analysis.whyItWorks}`);
@@ -1397,11 +1851,17 @@ function buildDraftPrompt(db, request) {
     for (const { post, m } of top) lines.push(`- [views ${m.views || 0} / likes ${m.likes || 0} / replies ${m.replies || 0}] ${post.text.replace(/\s+/g, " ").slice(0, 160)}`);
     lines.push("");
   }
+  lines.push(...profilePromptLines());
   lines.push(
     "## 書き方",
-    "- カテゴリは Tips / 本音・共感 / 失敗談 / 問いかけ / ツール紹介 / 導線 / 実績 / 観察 から分散させる（同じカテゴリを3本以上続けない）",
-    `- 1投稿は日本語で80〜350文字（Threadsの上限${THREADS_TEXT_LIMIT}文字を超えない）。改行で読みやすく。絵文字は使わない`,
+    "- カテゴリは Tips / 本音・共感 / 失敗談 / 問いかけ / ツール紹介 / 導線 / 実績 / 観察 から分散させる（同じカテゴリを3本以上続けない）。ただし、自然に質問できない内容を無理に「問いかけ」へ寄せない",
+    request.language === "en"
+      ? `- 1投稿は自然な英語で120〜400文字（Threadsの上限${THREADS_TEXT_LIMIT}文字を超えない）。日本語の直訳にせず、海外の読者に向けて書く。改行で読みやすく。${emojiRule(db.settings)}`
+      : `- 1投稿は日本語で80〜350文字（Threadsの上限${THREADS_TEXT_LIMIT}文字を超えない）。改行で読みやすく。${emojiRule(db.settings)}`,
     "- 順番は投稿順（朝はTips・ツール紹介、夜は共感・失敗談・問いかけ）",
+    "- 質問で終える場合は、本文の流れから自然につながる、答えやすい質問を1つだけにする。疑問文を複数入れない",
+    "- 「どう思いますか？」「何を感じますか？」「この話から何を持ち帰りますか？」のような、本文と関係が薄い汎用質問や翻訳調の質問で締めない",
+    "- 質問が自然でない投稿は、疑問符を足さず、気づき・余韻・短い提案で終える",
     "- 事実でないエピソードや数字を作らない。参考投稿の固有の体験をそのまま使わない",
     "- strategyMemo には、今回の狙いと参考投稿から何を取り入れたかを2〜3文で書く"
   );
@@ -1427,6 +1887,27 @@ const draftSchema = {
   },
   required: ["posts", "strategyMemo"]
 };
+
+// 文体ルール(writingRules)に「絵文字を使う」と書いてあるアカウントだけ、絵文字・「！」「？」を使う文体にする。
+// 書いていなければ従来どおり絵文字を使わない（林大地側の既存の文体を変えない）。
+function allowsEmoji(settings) {
+  return /絵文字(や「[！？!?]」)*(も|を)使(う|って)/.test(String(settings?.writingRules || ""));
+}
+function emojiRule(settings) {
+  return allowsEmoji(settings) ? "絵文字と「！」「？」を使って親しみやすく書く" : "絵文字は使わない。「！」「？」は使ってよい";
+}
+
+// 返信だけの文体。replyStyle があれば、返信プロンプトで最優先に従わせる。絵文字の可否は replyStyle に「絵文字」と書いてあるかで決める
+function replyEmojiRule(settings) {
+  const style = String(settings?.replyStyle || "");
+  if (/絵文字を(使う|入れる|多め|2|3)/.test(style)) return "絵文字を2〜3個、文中や文末に自然に入れる（下の文体どおり）。「！」「？」も使ってよい";
+  // 絵文字がNGなのは林大地の口座だけ（林さん指示 2026-10-03）。他の口座（女性向けコンテンツ）は返信で絵文字を使ってよい
+  return "絵文字を1〜2個、自然に添えてよい。「！」「？」も使ってよい";
+}
+function replyStyleLines(settings) {
+  const style = String(settings?.replyStyle || "").trim();
+  return style ? [`- 返信の文体（この発信者の声。他の書き方より優先して従う）:\n${style}`] : [];
+}
 
 function buildReferenceAnalysisPrompt(settings, references) {
   return [
@@ -1483,10 +1964,18 @@ function buildReplyDraftPrompt(settings, post, reply) {
     `${reply.username ? `@${reply.username}: ` : ""}${reply.text}`,
     "",
     "## 書き方",
-    "- 40〜120文字。相手の言葉を1つ拾って返す。売り込まない。絵文字は使わない",
+    "- 発信者自身の体験・実績・日常を作らない（「私も」「うちも」「レジュフラワーも〜することが多い」「作ることが多いので」など）。共感は、相手の話への感想で示す。相手の書いた内容（続柄・数・名前・物）を言い換えるときは、書かれたとおりに読む（例: grandniece は「姪の娘」で、「姪」ではない）。分からない言葉は言い換えずに、そのまま受ける",
+    "- 返信は、コメントと同じ言語で書く。コメントが英語なら必ず英語で返し、日本語を混ぜない（日本語のコメントには日本語）。投稿が日本語でも、コメントの言語に合わせる",
+    `- 日本語は40〜120文字、英語は60〜240文字。売り込まない。${replyEmojiRule(settings)}`,
+    ...replyStyleLines(settings),
+    "- 返信は「相手が書いていないこと」を足す。コメントの言葉を言い換えて褒めるだけ・繰り返すだけの返信は書かない（例: 「ころんとしたシーサー」というコメントに「ころんとしたシーサー可愛いですね」は不可）。足せるのは、受け取って嬉しかった一言、発信者本人の立場からの短い補足、相手の活動への関心のどれか",
+    "- 相手の投稿の画像・作品は、あなたには見えない。見えないものを褒めたり描写したりしない。作品や写真を見れば分かること（景色・色・形・雰囲気・何を作ったか）を、聞かない・説明させない・当てずっぽうで書かない（不可の例: 「どんな景色をイメージしたんですか?」「どんな雰囲気の作品か気になります」。相手の投稿に既に出ているため）",
+    "- 問いかけるなら、作品を見ても分からないことだけ（作り始めたきっかけ・工夫している点・一番苦労したところ・こだわった部分）。コメント内に答えがある質問はしない",
+    "- 期間・時期・スケジュール・完成の予定を聞かない（「どのくらいの期間」「いつから」「何年続けて」「仕上げる予定」「完成まで」など）。コメントに作品の写真が付いていることが多く、すでに形になっているものに「予定」「これから」の前提で聞くと噛み合わない。「作っています」と書かれていても、進行中か完成後かは分からないので、時間の流れを前提にした質問はしない",
+    "- 誤字・脱字・不自然な言い回し（例: 「雰囲気」を「雰気」と書く）を出さない。書いたあと1文ずつ読み直す",
     "- 相手をユーザー名で呼ばない（「〜さん」と名前を付けない）。呼びかけ無しで自然に始める",
     "- 質問には具体的に答える。否定的なコメントには防御せず、受け止めてから一言添える",
-    "- 会話が続くなら、最後に軽い問いかけを1つ"
+    "- 最後の問いかけは必須ではない。内容に応じて、問いかけで終える返信と、答えて終える返信を使い分ける"
   ].join("\n");
 }
 
@@ -1514,7 +2003,10 @@ function buildSuggestionPrompt(settings, stats) {
     "- nextTopics: 次に書くべき投稿テーマ案（最大5つ・各1文）",
     "- styleNotes: 文体・構成で気づいたことを最大3点",
     "- excludedRecent は公開24時間未満で集計から外した件数。数字の少なさを根拠に断定しない",
-    "- 日本語で。絵文字は使わない"
+    "- 伸びている投稿(top)は、1文目の入り方・構成・話題・時間帯のどれが効いたかを、投稿本文の実物から具体的に書く。本文にない理由は書かない",
+    "- 本数が少ない区分の平均で断定しない。件数(count)が2件以下の区分は傾向として扱わない",
+    "- 文体ルールと矛盾する提案（禁止語・禁止表現の推奨、一人称の体験の捏造、数字の創作）はしない",
+    `- 日本語で。${emojiRule(settings)}`
   ].join("\n");
 }
 
@@ -1591,7 +2083,11 @@ function normalizePost(input) {
     createdAt: input.createdAt || nowIso(),
     updatedAt: nowIso(),
     publishedAt: input.publishedAt || "",
-    error: input.error || ""
+    error: input.error || "",
+    // 却下（reject）した理由を一言で残す。書き直せば出せるか後から判断するための材料（Q044で新設）。
+    // reject時にapplyTransitionが書き込み、restoreで承認待ちへ戻すときにクリアする。
+    rejectReason: input.rejectReason || "",
+    copyOverlapWarning: input.copyOverlapWarning || null
   };
 }
 
@@ -1617,17 +2113,91 @@ function assertTextWithinLimit(post) {
   if (post.format !== "TEXT" && !post.mediaUrl) throw new HttpError(400, `${post.format}投稿にはメディアURL（公開URL）が必要です。編集で入れてください。`);
 }
 
-function applyTransition(post, action) {
+// 案件固有ルール（1行の上限・出してはいけない語・使ってはいけない言い回し）を
+// data ディレクトリの .check_profile.json から読む。キャッシュせず毎回読むのは、
+// 運用中にルールを足した直後から効かせるため（ファイルは小さい）。
+//
+// 2026-09-24 追加の背景: specific account で「1行40字・協会名を出さない・伝聞導入を使わない」
+// という案件ルールを7周のあいだ一度も自動で検査できていなかった。プロファイルが
+// 5キーしか持たず表現できなかったため、生成役が毎周スクラッチパッドに使い捨ての
+// 判定スクリプトを書いては捨てていた。読者検証では、協会名の出た行で2人が同時に
+// 離脱し、76字の1行目では3人全員が読み切れずに離脱している。人が思い出したときだけ
+// 走る検査は、この案件では7周とも走らなかった。
+function loadCheckProfile() {
+  try {
+    const raw = readFileSync(join(DATA_DIR, ".check_profile.json"), "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;   // 無い・壊れている場合は検査しない（既存案件を壊さない）
+  }
+}
+
+// 承認時のゲート（profileViolations）と同じルールを、生成の指示にも渡す。
+// 検査だけあって生成側が知らないと、承認の段階で却下され続け、補充が目標に届かない（2026-10-03 specific account）。
+function profilePromptLines() {
+  const profile = loadCheckProfile();
+  if (!profile) return [];
+  const out = ["## この発信者の案件ルール（承認時に機械検査され、違反すると却下される）"];
+  if (Number(profile.max_line_chars) > 0) out.push(`- 1行は${profile.max_line_chars}字以内。長くなるなら改行で区切る（1行目も同じ）`);
+  const terms = Array.isArray(profile.forbidden_terms) ? profile.forbidden_terms.filter(Boolean) : [];
+  if (terms.length) out.push(`- 次の語は使わない: ${terms.join("、")}`);
+  const pats = Array.isArray(profile.forbidden_patterns) ? profile.forbidden_patterns : [];
+  if (pats.length) out.push(`- 次の言い回しは使わない: ${pats.map((p) => p.name).filter(Boolean).join("、")}`);
+  out.push("");
+  return out.length > 2 ? out : [];
+}
+
+// 本文だけを見る。見出し・表・箇条書き・引用は成果物の構造であって本文ではない。
+function profileViolations(text) {
+  const profile = loadCheckProfile();
+  if (!profile) return [];
+  const out = [];
+  const limit = Number(profile.max_line_chars) || 0;
+  const terms = Array.isArray(profile.forbidden_terms) ? profile.forbidden_terms : [];
+  const pats = Array.isArray(profile.forbidden_patterns) ? profile.forbidden_patterns : [];
+  const lines = String(text || "").split("\n");
+  lines.forEach((line, idx) => {
+    const s = line.trim();
+    if (!s || s.startsWith("#") || s.startsWith("|") || s.startsWith("-") || s.startsWith(">")) return;
+    const n = [...s].length;
+    if (limit && n > limit) out.push(`${idx + 1}行目が${n}字（上限${limit}字）`);
+    for (const t of terms) if (t && s.includes(t)) out.push(`${idx + 1}行目に禁止語「${t}」`);
+    for (const p of pats) {
+      if (!p || !p.regex) continue;
+      let rx;
+      try { rx = new RegExp(p.regex); } catch { continue; }
+      if (rx.test(s)) out.push(`${idx + 1}行目に${p.name || p.regex}`);
+    }
+  });
+  return out;
+}
+
+function applyTransition(post, action, options = {}) {
   const rule = TRANSITIONS[action];
   if (!rule) throw new HttpError(400, `不明な操作です: ${action}`);
   if (!rule.from.includes(post.status)) {
     throw new HttpError(409, `この投稿は「${statusLabel(post.status)}」なので「${actionLabel(action)}」できません。`);
+  }
+  // 参考投稿との一致率が高いまま気づかず承認されるのを防ぐ（手動追加の丸写し検査を承認時にも強制する）
+  if (action === "approve" && post.copyOverlapWarning && !options.force) {
+    throw new HttpError(409, `参考投稿との一致率が${post.copyOverlapWarning.ratio}%あります。本文を見直すか、force指定で承認してください。`);
+  }
+  // 案件固有ルールの違反を、承認・予約の瞬間に止める。force で越えられるのは
+  // copyOverlap と同じ扱い（越えた事実がログに残る）。
+  if ((action === "approve" || action === "schedule") && !options.force) {
+    const bad = profileViolations(post.text);
+    if (bad.length) {
+      throw new HttpError(409, `案件ルール違反が${bad.length}件あります: ${bad.slice(0, 3).join(" / ")}${bad.length > 3 ? ` ほか${bad.length - 3}件` : ""}。本文を直すか、force指定で承認してください。`);
+    }
   }
   if (action === "approve" || action === "schedule") assertTextWithinLimit(post);
   if (action === "schedule") {
     if (!post.scheduledAt) throw new HttpError(400, "予約するには予約日時が必要です。編集で日時を入れてください。");
     if (Date.parse(post.scheduledAt) < Date.now() - 60_000) throw new HttpError(400, "予約日時が過去です。編集で日時を直してください。");
   }
+  // 却下理由（Q044で新設）。reject時に残し、restoreで承認待ちへ戻したら次の却下まで持ち越さずクリアする。
+  if (action === "reject") post.rejectReason = String(options.reason || "").slice(0, 200);
+  if (action === "restore") post.rejectReason = "";
   post.status = rule.to;
   post.error = "";
   post.updatedAt = nowIso();
@@ -1649,7 +2219,33 @@ function canPublish(post) {
 }
 
 // 日付 + 予約時刻候補（JST）から、本数ぶんの予約日時を順に割り当てる。
+// 揺らぎ割り当て: 開始時〜終了時（JST）を postsPerDay 個の枠に等分し、枠の中でランダムな分を選ぶ。枠どうしは10分以上あける
+function assignJitteredSchedule(settings, dateStr, count) {
+  const perDay = Math.max(1, Math.floor(Number(settings.postsPerDay)) || 1);
+  const from = Number.isFinite(Number(settings.scheduleFromHour)) ? Number(settings.scheduleFromHour) : 7;
+  const to = Number.isFinite(Number(settings.scheduleToHour)) ? Number(settings.scheduleToHour) : 21;
+  const width = Math.max(1, (to - from) * 60 / perDay);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(dateStr || "") ? dateStr : new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo" }).format(new Date());
+  const slots = [];
+  for (let day = 0; day <= 30 && slots.length < count; day += 1) {
+    const base = new Date(`${date}T00:00:00${JST_OFFSET}`);
+    base.setUTCDate(base.getUTCDate() + day);
+    let lastMinute = -100;
+    for (let i = 0; i < perDay && slots.length < count; i += 1) {
+      const lo = Math.floor(from * 60 + i * width);
+      const hi = Math.max(lo, Math.floor(from * 60 + (i + 1) * width) - 1);
+      let minute = lo + Math.floor(Math.random() * (hi - lo + 1));
+      if (minute - lastMinute < 10) minute = Math.min(lastMinute + 10, Math.max(hi, lastMinute + 10));
+      lastMinute = minute;
+      const at = new Date(base.getTime() + minute * 60_000);
+      if (at.getTime() > Date.now() + 5 * 60_000) slots.push(at.toISOString());
+    }
+  }
+  return slots;
+}
+
 function assignSchedule(settings, dateStr, count) {
+  if (Number(settings.postsPerDay) >= 1) return assignJitteredSchedule(settings, dateStr, count);
   const date = /^\d{4}-\d{2}-\d{2}$/.test(dateStr || "") ? dateStr : new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo" }).format(new Date());
   const times = (settings.scheduleTimes || []).filter((t) => /^\d{2}:\d{2}$/.test(t)).sort();
   const slots = [];
@@ -1679,6 +2275,7 @@ async function markPublished(db, post, result, message) {
   delete post.publishing;
   delete post.publishFailedAt;
   delete post.textChangedAfterFailure;
+  recordMonitoringEvent(db, "post_success");
   log(db, "info", message, { postId: post.id, threadsId: post.threadsId });
 }
 
@@ -1690,6 +2287,7 @@ function markPublishError(db, post, error, message) {
   delete post.publishing;
   delete post.retryAfter;
   delete post.retryCount;
+  recordMonitoringEvent(db, "safe_error", { error, area: "post_publish" });
   log(db, "error", message, { postId: post.id, error: error.message, detail: error.detail || "" });
 }
 
@@ -1809,20 +2407,33 @@ function buildReplyBatchPrompt(settings, items) {
     "",
     "## 判定ルール（decision）",
     "- reply: 感想・共感・質問・体験談など、本人が普通に返して問題ないコメント",
-    "- hold: 次のどれかに当たるもの。返信文は書かず reason に理由を1行: クレーム・批判が強いもの／営業・宣伝・勧誘／個人情報や連絡先を求める・含む／金銭・契約・返金の話／意味が取れない・スパム／事実確認が要る質問（料金・日程・実績の数字など）",
+    "- hold: 次のどれかに当たるもの。返信文は書かず reason に理由を1行: クレーム・批判が強いもの／発信者に購入・参加・契約・連絡を迫る露骨な勧誘（宣伝そのものが目的で、投稿のテーマと無関係なもの）／個人情報や連絡先を求める・含む／金銭・契約・返金の話／意味が取れない・スパム／事実確認が要る質問（料金・日程・実績の数字など）",
+    "- 宣伝・告知が多少混じっていても、投稿のテーマに沿った中身（感想・共感・体験・質問）があるコメントは reply にしてよい。その場合、返信は宣伝・告知・商品・イベント・URL・誘導には一切触れず、テーマに合った部分だけに答える（宣伝を褒めない・断らない・話題にしない）。宣伝・告知の要素があるコメントへの返信には問いかけを入れず、答えて終える（会話を引き延ばさない）",
+    "- 微妙なものは必ず hold にする（迷ったら hold）。具体的には、皮肉とも感想ともとれる／ネガティブ寄り・反論・揶揄の気配がある／意図が読み取れない／短すぎて文脈が分からない／返信すると誤解や炎上を生みそうなもの。素直な感想・共感・お礼・自己紹介・答えが明確な質問だけを reply にする",
     "",
     "## 書き方（reply のとき）",
-    "- 40〜120文字。相手の言葉を1つ拾って返す。売り込まない。絵文字は使わない",
+    "- 発信者自身の体験・実績・日常を作らない（「私も」「うちも」「レジュフラワーも〜することが多い」「作ることが多いので」など）。共感は、相手の話への感想で示す。相手の書いた内容（続柄・数・名前・物）を言い換えるときは、書かれたとおりに読む（例: grandniece は「姪の娘」で、「姪」ではない）。分からない言葉は言い換えずに、そのまま受ける",
+    "- 返信は、コメントと同じ言語で書く。コメントが英語なら必ず英語で返し、日本語を混ぜない（日本語のコメントには日本語）。投稿が日本語でも、コメントの言語に合わせる",
+    `- 日本語は40〜120文字、英語は60〜240文字。売り込まない。${replyEmojiRule(settings)}`,
+    ...replyStyleLines(settings),
+    "- 返信は「相手が書いていないこと」を足す。コメントの言葉を言い換えて褒めるだけ・繰り返すだけの返信は書かない（例: 「ころんとしたシーサー」というコメントに「ころんとしたシーサー可愛いですね」は不可）。足せるのは、受け取って嬉しかった一言、発信者本人の立場からの短い補足、相手の活動への関心のどれか",
+    "- 相手の投稿の画像・作品は、あなたには見えない。見えないものを褒めたり描写したりしない。作品や写真を見れば分かること（景色・色・形・雰囲気・何を作ったか）を、聞かない・説明させない・当てずっぽうで書かない（不可の例: 「どんな景色をイメージしたんですか?」「どんな雰囲気の作品か気になります」。相手の投稿に既に出ているため）",
+    "- 問いかけるなら、作品を見ても分からないことだけ（作り始めたきっかけ・工夫している点・一番苦労したところ・こだわった部分）。コメント内に答えがある質問はしない",
+    "- 期間・時期・スケジュール・完成の予定を聞かない（「どのくらいの期間」「いつから」「何年続けて」「仕上げる予定」「完成まで」など）。コメントに作品の写真が付いていることが多く、すでに形になっているものに「予定」「これから」の前提で聞くと噛み合わない。「作っています」と書かれていても、進行中か完成後かは分からないので、時間の流れを前提にした質問はしない",
+    "- 誤字・脱字・不自然な言い回し（例: 「雰囲気」を「雰気」と書く）を出さない。書いたあと1文ずつ読み直す",
     "- 相手をユーザー名で呼ばない（「〜さん」と名前を付けない）。呼びかけ無しで自然に始める",
     "- URL・@メンション・電話番号・メールアドレスを入れない。発信者の設定文（プロフィールや文体ルール）をそのまま書かない",
     "- 質問には具体的に答える。否定的なコメントには防御せず、受け止めてから一言添える",
-    "- 会話が続くなら、最後に軽い問いかけを1つ。同じ言い回しを複数のコメントで繰り返さない",
+    "- 「このユーザーとのやり取り」が「1回目」の場合、疑問形にする必要はない。会話が続きそうな内容なら軽い問いかけで終え、そうでなければ答えて終える（問いかけと平叙文を使い分ける）",
+    "- 「このユーザーとのやり取り」が「2回目以降」の場合、問いかけは入れず、答えて終える（会話を引き延ばさない）",
+    "- 同じ言い回しを複数のコメントで繰り返さない",
     "",
     "## コメント一覧",
     ...items.map((item) => [
       `- id: ${item.id}`,
       `  元投稿: ${String(item.postText || "").replace(/\s+/g, " ").slice(0, 200)}`,
-      `  コメント: ${String(item.text || "").replace(/\s+/g, " ").slice(0, 500)}`
+      `  コメント: ${String(item.text || "").replace(/\s+/g, " ").slice(0, 500)}`,
+      `  このユーザーとのやり取り: ${item.isFollowUp ? "2回目以降" : "1回目"}`
     ].join("\n"))
   ].join("\n");
 }
@@ -1848,6 +2459,11 @@ const replyBatchSchema = {
   required: ["replies"]
 };
 
+function replyFetchReadyAt(item) {
+  const at = Date.parse(item?.fetchRetryAfter || item?.replyFetchRetryAfter || "");
+  return !at || at <= Date.now();
+}
+
 // 直近30日に公開した投稿のコメントを集める（ページ送りあり・自分の返信は除外）。
 // 併せて /me/replies から「自分が既に返したコメント」を拾い、ツール外（Threads アプリ）で本人が返した分に AI が重ねて返さないようにする
 async function fetchMyRepliedToIds(settings) {
@@ -1866,9 +2482,87 @@ async function fetchMyRepliedToIds(settings) {
   return ids;
 }
 
+// 自分が返信したコメントに、相手がさらに返信してきた分を取り込む（会話の続き）。
+// 同じ投稿・同じユーザー・返信済みあり、で既存の判定が「2回目以降」（問いかけなし）になる。
+// 連鎖は FOLLOWUP_MAX_DEPTH 往復まで。スパム的な応酬が無限に続かないための上限。
+const FOLLOWUP_MAX_DEPTH = 3;
+const FOLLOWUP_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+const FOLLOWUP_MAX_CHECKS_PER_TICK = 40;
+async function fetchFollowUpReplies(snapshot, knownIds) {
+  const token = requireToken(snapshot.settings);
+  const since = Date.now() - FOLLOWUP_LOOKBACK_MS;
+  const parents = snapshot.replies
+    .filter((r) => r.status === "responded" && r.respondedThreadsId && !r.followupDead && replyFetchReadyAt(r) && (r.depth || 1) < FOLLOWUP_MAX_DEPTH && Date.parse(r.respondedAt || "") >= since)
+    .sort((a, b) => (b.respondedAt || "").localeCompare(a.respondedAt || ""))
+    .slice(0, FOLLOWUP_MAX_CHECKS_PER_TICK);
+  const found = [];
+  // 親1件の失敗で全体を捨てない（2026-10-03: 消えた自動返信1件の400が12.5時間、会話の続きの取り込みを全部止めた）。
+  // Threads が「存在しない」と返した親は followupDead を付けて次から対象外にし、同じ失敗を5分ごとに繰り返さない
+  found.deadParentIds = [];
+  found.failures = [];
+  for (const parent of parents) {
+    let data;
+    try {
+      data = await threadsFetch(`/${parent.respondedThreadsId}/replies`, {
+        params: { fields: "id,text,timestamp,permalink,username,is_reply_owned_by_me,media_type,media_url", reverse: "true", limit: 25 },
+        token
+      });
+    } catch (error) {
+      if (/does not exist|Unsupported get request|cannot be loaded/i.test(`${error.message} ${error.detail || ""}`)) found.deadParentIds.push(parent.id);
+      else found.failures.push({ postId: "", error: `返信への返信の取得に失敗: ${error.message}`, detail: error.detail || "" });
+      continue;
+    }
+    for (const item of data.data || []) {
+      if (item.is_reply_owned_by_me || knownIds.has(String(item.id))) continue;
+      found.push({
+        id: String(item.id),
+        postId: parent.postId,
+        rootThreadsId: parent.rootThreadsId,
+        parentReplyId: parent.id,
+        depth: (parent.depth || 1) + 1,
+        text: item.text || "",
+        username: item.username || "",
+        timestamp: item.timestamp || "",
+        permalink: item.permalink || "",
+        mediaType: item.media_type || "",
+        mediaUrl: item.media_url || "",
+        status: "unhandled",
+        responseText: "",
+        respondedThreadsId: "",
+        fetchedAt: nowIso()
+      });
+    }
+  }
+  return found;
+}
+
+function applyReplyFetchFailures(db, failures) {
+  for (const f of failures || []) {
+    if (f.postId) {
+      const p = db.posts.find((post) => post.id === f.postId);
+      if (p) {
+        if (f.terminal) {
+          p.repliesFetchDead = true;
+          p.repliesFetchDeadAt = nowIso();
+        } else if (f.transient) {
+          p.replyFetchFailCount = (p.replyFetchFailCount || 0) + 1;
+          p.replyFetchRetryAfter = new Date(Date.now() + boundedBackoffMs(p.replyFetchFailCount - 1)).toISOString();
+        }
+      }
+    }
+    if (f.replyId && f.transient) {
+      const r = db.replies.find((reply) => reply.id === f.replyId);
+      if (r) {
+        r.fetchFailCount = (r.fetchFailCount || 0) + 1;
+        r.fetchRetryAfter = new Date(Date.now() + boundedBackoffMs(r.fetchFailCount - 1)).toISOString();
+      }
+    }
+  }
+}
+
 async function collectNewReplies(snapshot) {
   const since = Date.now() - REPLY_FETCH_LOOKBACK_MS;
-  const targets = snapshot.posts.filter((post) => post.status === "published" && post.threadsId && (!post.publishedAt || Date.parse(post.publishedAt) >= since));
+  const targets = snapshot.posts.filter((post) => post.status === "published" && post.threadsId && !post.deletedFromThreadsAt && !post.autoDeleteUncertainAt && !post.repliesFetchDead && replyFetchReadyAt(post) && (!post.publishedAt || Date.parse(post.publishedAt) >= since));
   const knownIds = new Set(snapshot.replies.map((reply) => reply.id));
   const fetched = [];
   const failures = [];
@@ -1876,8 +2570,21 @@ async function collectNewReplies(snapshot) {
     try {
       fetched.push(...await fetchThreadsReplies(snapshot.settings, post, knownIds));
     } catch (error) {
-      failures.push({ postId: post.id, error: error.message, detail: error.detail || "" });
+      failures.push({ postId: post.id, transient: isTransientThreadsError(error), terminal: isThreadsMissingObjectError(error), error: error.message, detail: error.detail || "" });
     }
+  }
+  try {
+    const followUps = await fetchFollowUpReplies(snapshot, knownIds);
+    fetched.push(...followUps);
+    failures.push(...(followUps.failures || []));
+    if (followUps.deadParentIds?.length) {
+      await withDb(async (d) => {
+        for (const r of d.replies) if (followUps.deadParentIds.includes(r.id)) r.followupDead = true;
+        log(d, "info", `Threads から消えた自動返信 ${followUps.deadParentIds.length} 件を、会話の続きの取得対象から外しました。`, {});
+      });
+    }
+  } catch (error) {
+    failures.push({ postId: "", error: `返信への返信の取得に失敗: ${error.message}`, detail: error.detail || "" });
   }
   let repliedByMe = new Map();
   try {
@@ -1911,6 +2618,7 @@ async function collectNewReplies(snapshot) {
     // 送信中（sendingAt）のまま残った返信の扱いは recoverPublishing（スケジューラ冒頭）に一本化
     d.replies.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
     d.replies = d.replies.slice(0, 20000);
+    applyReplyFetchFailures(d, failures);
     for (const f of failures) log(d, "error", "返信取得に失敗しました。", f);
     if (n || external || failures.length) log(d, "info", `コメントを取得しました（新規${n}件${external ? ` / 本人が返信済み${external}件` : ""} / 失敗${failures.length}件）。`);
     return { value: n };
@@ -1922,8 +2630,36 @@ async function collectNewReplies(snapshot) {
 // 新しいコメントから処理する（数百件たまったとき、古いものより今日のコメントを先に返す）
 const REPLY_DRAFT_MAX_ATTEMPTS = 3;
 const REPLY_DRAFT_FAILURE_BACKOFF_MS = 5 * 60 * 1000;
+// AI側の障害（認証切れ・上限・一時停止）で「要確認」に止まった返信を、人が押さなくても拾い直す間隔と対象期間。
+// 2026-10-06: 認証切れの数時間で林・ペット・レジュ計23件が止まり、人がボタンを押すまで誰にも見えないまま残った
+const REPLY_AI_RECOVERY_EVERY_MS = 30 * 60 * 1000;
+const REPLY_AI_RECOVERY_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 // 自動送信してはいけない本文: URL・@メンション・電話番号・メール・「〜さん」呼びかけ
-const REPLY_TEXT_BLOCKLIST = /https?:\/\/|www\.|\b[\w-]+\.(?:com|net|jp|io|me|co|org|info|biz)\b|[@＠][^\s@＠、。]{2,}|(?:\d[\d\-‐−ー ]{8,}\d)|[\w.+-]+@[\w-]+\.[\w.]+|[A-Za-z0-9_.]{2,}(?:さん|様)|さん[、。！？!? ]|さん$|様[、。！？!? ]|line\s*id|ライン\s*id/iu;
+const REPLY_VAGUE_ENDING = /気がします|気がして|かもしれません|かもしれない|ような気/u;
+// replyStyle（返信だけの文体）を設定した口座は、「かもしれません」を許す。ペットの気持ちの解釈は断定せず「〜かも」の範囲に留める、という文体ルールと両立させるため。気がします系は引き続き止める
+const REPLY_VAGUE_ENDING_SOFT = /気がします|気がして|ような気/u;
+// 投稿を見れば分かることを聞き返す文型（「どんな景色をイメージしたんですか」「どんな雰囲気の作品か気になります」）。林さんが2回指摘（2026-10-03）
+const REPLY_ASKS_VISIBLE = /どんな[^。？?\n]{0,12}(景色|雰囲気|イメージ|作品)[^。\n]{0,8}(ですか|んですか|でしょう|気になります)|(作品|雰囲気|景色)[^。\n]{0,12}気になります(?!！)|(何を|どのような|どういった|どんな)[^。\n]{0,12}(表現|思い浮かべ|思い描|イメージ)[^。\n]{0,10}(ですか|んですか|でしょう|たの[？?]|のか|気になります)|どんな[^。\n]{0,8}(お花|花|色)[^。\n]{0,8}(使って|ですか|んですか)|何色[^。\n]{0,8}(使って|ですか|んですか)|何をイメージ|どういうイメージ/u;
+// 返信文がコメントの言い換えか（コメントの3文字連続のうち、返信に含まれる割合）。コメントが短いときは判定しない
+// 期間・時期・完成予定を聞き返す文型（「どのくらいの期間をかけて仕上げる予定なんですか」「何年続けているんですか」）。作品の写真が付いたコメントは完成品のことが多く、「予定」の前提が噛み合わない。林さんの指摘（2026-10-04）
+const REPLY_ASKS_SCHEDULE = /(どのくらい|どれくらい|どれぐらい|どのぐらい)(の期間|の時間|かけ|で(仕上|完成)|経|続け|作って|編んで|やって)|いつ(頃|ごろ)?(から|まで|完成|仕上)|何(年|ヶ月|か月|日|週間)(目|くらい|ぐらい|かけ|続け|経)|(仕上げる|完成する|完成の|完成までの|仕上がる)(予定|見込み)|完成(まで|予定)|予定(なん|です|は|で)/u;
+// コメントが英語（日本語の文字が1つも無く、英字の語がある）なのに、返信文に日本語の文字が入っているもの。英語のコメントに日本語で返すと相手に読めない（2026-10-05 林さんの指摘）
+const JA_CHAR = /[ぁ-んァ-ヶ一-龥]/u;
+function replyLanguageMismatch(comment, reply) {
+  const c = String(comment || "");
+  return !JA_CHAR.test(c) && /[A-Za-z]{3}/.test(c) && JA_CHAR.test(String(reply || ""));
+}
+function replyEchoesComment(comment, reply) {
+  const c = normalizeForQuote(comment);
+  const r = normalizeForQuote(reply);
+  if (c.length < 14) return false;
+  const grams = new Set();
+  for (let i = 0; i + 3 <= c.length; i += 1) grams.add(c.slice(i, i + 3));
+  let hit = 0;
+  for (const g of grams) if (r.includes(g)) hit += 1;
+  return grams.size > 0 && hit / grams.size >= 0.5;
+}
+const REPLY_TEXT_BLOCKLIST =/https?:\/\/|www\.|\b[\w-]+\.(?:com|net|jp|io|me|co|org|info|biz)\b|[@＠][^\s@＠、。]{2,}|(?:\d[\d\-‐−ー ]{8,}\d)|[\w.+-]+@[\w-]+\.[\w.]+|[A-Za-z0-9_.]{2,}(?:さん|様)|さん[、。！？!? ]|さん$|様[、。！？!? ]|line\s*id|ライン\s*id/iu;
 
 function normalizeForQuote(text) {
   return String(text || "").normalize("NFKC").replace(/[\s「」『』"'“”‘’…・、。！？!?,.\-]/g, "").toLowerCase();
@@ -1936,16 +2672,51 @@ function pickPendingReplies(replies) {
     .slice(0, REPLY_BATCH_SIZE);
 }
 
+// AI障害で止まった返信を、AIが戻っているか試すために未対応へ戻す対象を選ぶ。失敗したらもう1回の失敗で同じ保留に戻る（30分に1回しか呼ばない）
+function pickAiFailedForRecovery(replies, now = Date.now(), lastRecoveryAt = 0) {
+  if (now - lastRecoveryAt < REPLY_AI_RECOVERY_EVERY_MS) return [];
+  return replies.filter((r) => r.status === "held" && /^AI処理に\d+回失敗/.test(r.holdReason || "") && r.text
+    && now - (Date.parse(r.timestamp || "") || now) < REPLY_AI_RECOVERY_MAX_AGE_MS);
+}
+
+async function recoverAiFailedReplies(snapshot) {
+  const targets = pickAiFailedForRecovery(snapshot.replies, Date.now(), Date.parse(snapshot.settings.lastAiRecoveryAt || "") || 0);
+  if (!targets.length) return false;
+  await withDb(async (d) => {
+    d.settings.lastAiRecoveryAt = nowIso();
+    let n = 0;
+    for (const r of d.replies) {
+      if (targets.some((t) => t.id === r.id) && r.status === "held") {
+        r.status = "unhandled";
+        r.holdReason = "";
+        r.draftAttempts = REPLY_DRAFT_MAX_ATTEMPTS - 1;
+        n += 1;
+      }
+    }
+    d.settings.lastDraftFailureAt = "";
+    log(d, "info", `AI処理の障害で止まっていた返信${n}件を、下書きし直しに戻しました（30分ごとに再挑戦します）。`);
+  });
+  return true;
+}
+
 async function draftRepliesBatch(snapshot) {
   const pending = pickPendingReplies(snapshot.replies);
   if (!pending.length) return { drafted: 0, held: 0, failed: false };
-  const items = pending.map((reply) => ({ id: reply.id, text: reply.text, postText: snapshot.posts.find((p) => p.id === reply.postId)?.text || "" }));
+  // 同じ投稿に同じユーザーが返信済みで応答したことがあれば2回目以降のやり取りとみなす
+  // （2026-09-23 林さん指示: 1回目は問いかけを意識、2回目以降は問いかけなし）
+  const items = pending.map((reply) => {
+    const isFollowUp = reply.username
+      ? snapshot.replies.some((r) => r.id !== reply.id && r.postId === reply.postId && r.username === reply.username && r.status === "responded")
+      : false;
+    return { id: reply.id, text: reply.text, postText: snapshot.posts.find((p) => p.id === reply.postId)?.text || "", isFollowUp };
+  });
   let result;
   try {
     result = await callAiJson(snapshot.settings, buildReplyBatchPrompt(snapshot.settings, items), replyBatchSchema, { maxOutputTokens: 4096 });
     if (!result || !Array.isArray(result.replies)) throw new HttpError(502, "AIの応答に replies 配列がありません。");
   } catch (error) {
     // 失敗した10件は試行回数を進め、上限に達したら要確認へ。次の10件は次回に回る（同じ10件で止まらない）
+    await appendErrorLog(new Error(`返信の下書き生成に失敗: ${String(error?.message || error)}`)).catch(() => {});
     await withDb(async (d) => {
       d.settings.lastDraftFailureAt = nowIso();
       let heldNow = 0;
@@ -1984,6 +2755,12 @@ async function draftRepliesBatch(snapshot) {
       else if ([...text].length > THREADS_TEXT_LIMIT) hold = `返信文が${THREADS_TEXT_LIMIT}文字を超えています`;
       else if (REPLY_TEXT_BLOCKLIST.test(text)) hold = "返信文にURL・メンション・連絡先・名前の呼びかけが含まれるため自動送信を見送りました";
       else if (seenTexts.has(text)) hold = "同じ文面の返信が同時に作られたため自動送信を見送りました";
+      else if ((String(d.settings.replyStyle || "").trim() ? REPLY_VAGUE_ENDING_SOFT : REPLY_VAGUE_ENDING).test(text)) hold = "返信文に「気がします」「かもしれません」などの曖昧な言い回しがあるため自動送信を見送りました（断定で書き直してください）";
+      else if (replyLanguageMismatch(item.text, text)) hold = "コメントが英語なのに返信文が日本語のため自動送信を見送りました（英語で書き直してください）";
+      else if (REPLY_ASKS_SCHEDULE.test(text)) hold = "返信文が、期間・時期・完成の予定を聞き返しているため自動送信を見送りました（作品はすでに形になっていることが多く、噛み合いません）";
+      else if (REPLY_ASKS_VISIBLE.test(text)) hold = "返信文が、投稿を見れば分かることを聞き返しているため自動送信を見送りました";
+      else if (replyEchoesComment(item.text, text)) hold = "返信文がコメントの言い換えになっているため自動送信を見送りました";
+      else if ((found.depth || 1) >= 2 && /[?？]/.test(text)) hold = "2回目以降の返信に問いかけが含まれるため自動送信を見送りました";
       if (hold) {
         found.status = "held";
         found.holdReason = hold;
@@ -2033,6 +2810,7 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
         found.autoQueued = false;
         found.respondedAt = found.respondedAt || nowIso();
         found.error = "";
+        recordMonitoringEvent(d, "reply_success");
         log(d, "info", "このコメントには既に自分の返信が付いていたため、送信せず返信済みにしました。", { replyId });
         return { value: found };
       });
@@ -2043,12 +2821,41 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
   } catch (error) {
     failure = error;
   }
+  // 通信失敗は「送れたか」が分からない。返信が付いたかを直接見て、付いていれば返信済み・付いていなければ未送信と確定させる
+  let confirmedSent = null; // true=付いている / false=付いていない / null=確認できなかった
+  if (!result && failure?.network) {
+    for (let k = 0; k < 2 && confirmedSent === null; k += 1) {
+      try {
+        confirmedSent = await alreadyRepliedByMe(settings, replyId);
+      } catch {
+        await sleep(3000);
+      }
+    }
+  }
   const updated = await withDb(async (d) => {
     const found = findOr404(d.replies, replyId, "コメント");
+    const wasAuto = !!found.autoQueued;
     found.responseText = text;
     found.sendingAt = "";
     const rateLimited = !result && isRateLimitError(failure);
     if (!rateLimited) found.autoQueued = false; // 成否不明の失敗は自動再送しない（429 だけは未送信が確定しているので下書きのまま残す）
+    if (!result && confirmedSent === true) {
+      found.status = "responded";
+      found.external = true;
+      found.respondedAt = found.respondedAt || nowIso();
+      found.error = "";
+      recordMonitoringEvent(d, "reply_success");
+      log(d, "info", "通信は失敗しましたが、返信は付いていたため返信済みにしました。", { replyId: found.id });
+      return { value: found };
+    }
+    if (!result && confirmedSent === false && wasAuto && (found.retryCount || 0) < MAX_REPLY_RETRIES) {
+      found.status = "drafted";
+      found.autoQueued = true;
+      found.retryCount = (found.retryCount || 0) + 1;
+      found.error = "";
+      log(d, "info", "通信に失敗しましたが、返信は付いていないことを確認したので、次の巡回で再送します。", { replyId: found.id, retryCount: found.retryCount, error: failure.message });
+      return { value: found };
+    }
     if (result) {
       found.status = "responded";
       found.respondedThreadsId = result.id;
@@ -2056,8 +2863,10 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
       found.auto = auto;
       found.error = "";
       if (auto) d.settings.lastAutoReplyAt = found.respondedAt;
+      recordMonitoringEvent(d, "reply_success");
       log(d, "info", auto ? "コメントへ自動返信しました。" : "コメントへ返信しました。", { replyId: found.id, threadsId: result.id });
     } else {
+      recordMonitoringEvent(d, "safe_error", { error: failure, area: "reply_send" });
       if (rateLimited) {
         d.settings.autoReplyPausedUntil = new Date(Date.now() + (failure.retryAfterMs || 10 * 60 * 1000)).toISOString();
         found.error = "";
@@ -2080,6 +2889,58 @@ function repliesSentLast24h(db) {
   return db.replies.filter((r) => r.status === "responded" && Date.parse(r.respondedAt || "") >= dayAgo).length;
 }
 
+const MAX_REPLY_RETRIES = 3;
+// 日本語コメントへの返信は JST の autoReplyJaFromHour〜autoReplyJaToHour の間だけ送る（英語のコメントは時間を問わない）
+const hasJapanese = (text) => /[぀-ヿ一-鿿]/.test(String(text || ""));
+function isJaReplyHour(settings, now = Date.now()) {
+  const from = Number.isFinite(Number(settings.autoReplyJaFromHour)) ? Number(settings.autoReplyJaFromHour) : 7;
+  const to = Number.isFinite(Number(settings.autoReplyJaToHour)) ? Number(settings.autoReplyJaToHour) : 24;
+  const hour = new Date(now + 9 * 3600_000).getUTCHours();
+  return hour >= from && hour < to;
+}
+// 通信失敗で error のまま止まった自動返信を回収する。返信が付いていれば返信済み、付いていなければ再送に戻す
+async function requeueNetworkFailedReplies(snapshot) {
+  const s = snapshot.settings;
+  if (!s.autoReplyEnabled || !s.threadsAccessToken) return { requeued: 0, markedSent: 0 };
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const targets = snapshot.replies
+    .filter((r) => r.status === "error" && r.autoDrafted && r.responseText && !r.sendingAt && !inFlight.has(`reply:${r.id}`)
+      && (r.retryCount || 0) < MAX_REPLY_RETRIES && /fetch failed|通信できませんでした/.test(r.error || "")
+      && (Date.parse(r.timestamp || "") || 0) > weekAgo)
+    .slice(0, 5);
+  let requeued = 0;
+  let markedSent = 0;
+  for (const r of targets) {
+    let sent;
+    try {
+      sent = await alreadyRepliedByMe(s, r.id);
+    } catch {
+      continue; // 確認できないものは触らない（次の巡回でもう一度）
+    }
+    await withDb(async (d) => {
+      const found = d.replies.find((x) => x.id === r.id);
+      if (!found || found.status !== "error") return { save: false };
+      if (sent) {
+        found.status = "responded";
+        found.external = true;
+        found.respondedAt = found.respondedAt || nowIso();
+        found.error = "";
+        log(d, "info", "通信失敗で止まっていた返信は、実際には付いていたため返信済みにしました。", { replyId: found.id });
+      } else {
+        found.status = "drafted";
+        found.autoQueued = true;
+        found.retryCount = (found.retryCount || 0) + 1;
+        found.error = "";
+        log(d, "info", "通信失敗で止まっていた返信は付いていなかったため、再送に戻しました。", { replyId: found.id, retryCount: found.retryCount });
+      }
+      return { value: found };
+    });
+    if (sent) markedSent += 1;
+    else requeued += 1;
+  }
+  return { requeued, markedSent };
+}
+
 // 自動送信: autoQueued の下書きだけを、間隔と1日上限を守って送る。1ティックは最大 AUTO_REPLY_MAX_PER_TICK 件（ティックが60秒を超えないように）
 const AUTO_REPLY_MAX_PER_TICK = 3;
 async function sendAutoReplies(snapshot) {
@@ -2095,10 +2956,12 @@ async function sendAutoReplies(snapshot) {
       if (!d.settings.autoReplyEnabled) return { save: false, value: null };
       if (d.settings.autoReplyPausedUntil && Date.parse(d.settings.autoReplyPausedUntil) > Date.now()) return { save: false, value: null };
       if (repliesSentLast24h(d) >= cap) return { save: false, value: null };
-      const last = Date.parse(d.settings.lastAutoReplyAt || "") || 0;
-      if (Date.now() - last < intervalMs) return { save: false, value: null };
+      if (i === 0) {
+        const last = Date.parse(d.settings.lastAutoReplyAt || "") || 0;
+        if (Date.now() - last < intervalMs) return { save: false, value: null };
+      }
       const next = d.replies
-        .filter((r) => r.status === "drafted" && r.autoQueued && r.responseText && !r.sendingAt && !inFlight.has(`reply:${r.id}`))
+        .filter((r) => r.status === "drafted" && r.autoQueued && r.responseText && !r.sendingAt && !inFlight.has(`reply:${r.id}`) && (isJaReplyHour(d.settings) || !hasJapanese(r.text)))
         .sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""))[0];
       if (!next) return { save: false, value: null };
       inFlight.add(`reply:${next.id}`);
@@ -2123,7 +2986,7 @@ async function sendAutoReplies(snapshot) {
 
 // インサイトの取り込み（手動ボタンと日次自動の共通経路）
 async function collectInsights(snapshot) {
-  const targets = snapshot.posts.filter((post) => post.status === "published" && post.threadsId);
+  const targets = snapshot.posts.filter((post) => post.status === "published" && post.threadsId && !post.deletedFromThreadsAt && !post.autoDeleteUncertainAt);
   const results = [];
   const failures = [];
   for (const post of targets) {
@@ -2143,6 +3006,157 @@ async function collectInsights(snapshot) {
   return { fetched: results.length, failed: failures.length, failures, targets: targets.length };
 }
 
+// 反応の少ない投稿の自動削除: 公開から autoDeleteAfterHours(24以上) 時間たち、いいねが autoDeleteMaxLikes 以下、かつコメント(replies)が autoDeleteMaxReplies 以下の投稿だけを Threads から消す（どちらかがしきい値を超えれば残す。取り消せない操作）。
+// ・既定はOFF。ONにした時刻(autoDeleteEnabledAt)より前に公開した投稿は対象にしない（過去の投稿へ遡って消さない）。
+// ・消す直前に Threads 側のインサイトを取り直していいね数を確かめる。取れない・読めない・しきい値超なら消さない。
+// ・消す前に取り直したインサイトを記録に残す。削除後も投稿の記録（本文・数字）は残し、deletedFromThreadsAt を付けて以後の取得対象から外す（分析の材料に使うため）。
+// ・失敗したら6時間は何もしない。投稿ごとに3回失敗したらその投稿は対象から外す。権限エラーは連携し直す（トークンが変わる）まで試さない。
+const AUTO_DELETE_CHECK_EVERY_MS = 30 * 60_000;
+const AUTO_DELETE_MAX_PER_RUN = 10;
+const AUTO_DELETE_MAX_PER_DAY = 50; // Threads の上限は1日100件。半分に抑える（直近24時間の件数で数える）
+const AUTO_DELETE_FAILURE_BACKOFF_MS = 6 * 60 * 60_000;
+const AUTO_DELETE_MAX_FAILS_PER_POST = 3;
+const AUTO_DELETE_MAX_TRANSIENT_FAILS_PER_POST = 6;
+const deletedButUnrecorded = new Map(); // 削除は通ったが記録の保存に失敗した投稿（threadsId -> 記録し直すための材料）。次の周の最初に記録だけやり直す
+const DAY_MS = 24 * 60 * 60_000;
+
+async function recordAutoDeleteFailure(post, message, extra, { blockToken = "", uncertain = false, countAgainstPost = false } = {}) {
+  await withDb(async (d) => {
+    if (!countAgainstPost) d.settings.lastAutoDeleteFailureAt = nowIso(); // 投稿のせいの失敗では全体を止めない（不良な1件がほかの削除を塞がない）
+    if (blockToken) d.settings.autoDeleteBlockedToken = blockToken;
+    const p = d.posts.find((x) => x.id === post.id);
+    if (p && (countAgainstPost || uncertain)) p.autoDeleteFailCount = (p.autoDeleteFailCount || 0) + 1;
+    else if (p && !blockToken) p.autoDeleteTransientFailCount = (p.autoDeleteTransientFailCount || 0) + 1; // 原因が分からない失敗（5xx・通信）も投稿ごとに数える
+    if (p && uncertain) p.autoDeleteUncertainAt = nowIso(); // 消えたか不明。以後は対象にもしない
+    if (uncertain) d.settings.autoDeleteLog = [...(d.settings.autoDeleteLog || []), nowIso()].filter((t) => Date.now() - Date.parse(t) < DAY_MS); // 消えている可能性があるので上限には数える
+    if (p && !blockToken && !countAgainstPost) p.autoDeleteRetryAfter = new Date(Date.now() + boundedBackoffMs((p.autoDeleteTransientFailCount || 1) - 1, { baseMs: 30 * 60_000 })).toISOString();
+    log(d, "error", message, { postId: post.id, threadsId: post.threadsId, ...extra });
+  });
+}
+
+// 失敗の原因が「その投稿」にあるか（HTTP 4xx で、レート制限・トークン失効・権限不足ではない）
+function failureIsAboutPost(error) {
+  return error instanceof ExternalApiError && error.status >= 400 && error.status < 500 && !isRateLimitError(error) && ![10, 190, 200].includes(error.apiCode);
+}
+
+// 削除は通っているので、記録の書き込みに失敗しても3回までやり直す
+async function markPostDeleted(post, reason, insight) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await withDb(async (d) => {
+        const p = d.posts.find((x) => x.id === post.id);
+        if (!p || p.deletedFromThreadsAt) return { save: false };
+        p.deletedFromThreadsAt = nowIso();
+        p.deleteReason = reason;
+        d.settings.autoDeleteLog = [...(d.settings.autoDeleteLog || []), nowIso()].filter((t) => Date.now() - Date.parse(t) < DAY_MS);
+        if (insight) { p.finalMetrics = insight.metrics; d.insights.unshift(insight); d.insights = d.insights.slice(0, 2000); }
+        // 消えた投稿へのコメントには返信できないので、未対応のものは「対応しない」に回す（送信エラーの繰り返しを防ぐ）
+        for (const r of d.replies) {
+          if (r.postId === post.id && ["unhandled", "drafted", "held", "error"].includes(r.status)) { r.status = "ignored"; r.autoQueued = false; r.holdReason = "投稿を自動削除したため返信できません"; }
+        }
+        log(d, "info", "反応の少ない投稿をThreadsから削除しました。", { postId: p.id, threadsId: post.threadsId, likes: insight?.metrics?.likes, text: p.text.slice(0, 40) });
+      });
+      return true;
+    } catch {
+      await sleep(1000);
+    }
+  }
+  await withDb(async (d) => { log(d, "error", "Threadsからの削除は成功しましたが、記録の保存に失敗しました。", { postId: post.id, threadsId: post.threadsId }); }).catch(() => {});
+  return false;
+}
+
+async function deleteLowLikePosts(snapshot) {
+  const s = snapshot.settings;
+  const token = requireToken(s);
+  const result = { checked: 0, deleted: 0, skipped: 0, failed: 0, blocked: false };
+  for (const [tid, v] of deletedButUnrecorded) if (await markPostDeleted(v.post, v.reason, v.insight)) deletedButUnrecorded.delete(tid);
+  if (deletedButUnrecorded.size) return result; // 記録できていない削除が残っている間は、新しく消さない
+  if (s.autoDeleteBlockedToken && s.autoDeleteBlockedToken === token.slice(-12)) return { ...result, blocked: true }; // 権限エラーの後は、連携し直してトークンが変わるまで試さない
+  if (Date.now() - (Date.parse(s.lastAutoDeleteFailureAt || "") || 0) < AUTO_DELETE_FAILURE_BACKOFF_MS) return result;
+  const enabledAt = Date.parse(s.autoDeleteEnabledAt || "");
+  const maxLikes = Number(s.autoDeleteMaxLikes);
+  const maxReplies = Number(s.autoDeleteMaxReplies);
+  if (!enabledAt || !Number.isInteger(maxLikes) || maxLikes < 0 || !Number.isInteger(maxReplies) || maxReplies < 0) return result; // しきい値が読めないときは何も消さない
+  const hours = Math.max(24, Number(s.autoDeleteAfterHours) || 24); // 24時間未満には設定させない（数字が育つ前に消さない）
+  const cutoff = Date.now() - hours * 60 * 60_000;
+  const doneIn24h = (s.autoDeleteLog || []).filter((t) => Date.now() - Date.parse(t) < DAY_MS).length;
+  const room = Math.max(0, Math.min(AUTO_DELETE_MAX_PER_RUN, AUTO_DELETE_MAX_PER_DAY - doneIn24h));
+  const candidates = snapshot.posts
+    .filter((p) => p.status === "published" && p.threadsId && !p.deletedFromThreadsAt && !p.replyToId
+      && p.publishedAt && Date.parse(p.publishedAt) <= cutoff && Date.parse(p.publishedAt) >= enabledAt
+      && (!p.autoDeleteRetryAfter || Date.parse(p.autoDeleteRetryAfter) <= Date.now())
+      && !p.autoDeleteJudgedAt && !(p.autoDeleteFailCount >= AUTO_DELETE_MAX_FAILS_PER_POST) && !((p.autoDeleteTransientFailCount || 0) >= AUTO_DELETE_MAX_TRANSIENT_FAILS_PER_POST)
+      && !p.autoDeleteUncertainAt && !deletedButUnrecorded.has(p.threadsId))
+    .sort((a, b) => ((a.autoDeleteFailCount || 0) + (a.autoDeleteTransientFailCount || 0)) - ((b.autoDeleteFailCount || 0) + (b.autoDeleteTransientFailCount || 0)) || Date.parse(a.publishedAt) - Date.parse(b.publishedAt))
+    .slice(0, room);
+  result.checked = candidates.length;
+  for (const post of candidates) {
+    let insight;
+    try {
+      insight = await fetchThreadsInsights(s, post);
+    } catch (error) {
+      result.failed += 1;
+      await recordAutoDeleteFailure(post, "自動削除の前のいいね数の確認に失敗しました。この投稿は消さず、削除の処理を6時間止めます。", { code: error.apiCode, subcode: error.apiSubcode, error: String(error.message).slice(0, 200) }, { countAgainstPost: failureIsAboutPost(error) });
+      if (failureIsAboutPost(error)) continue; // この投稿だけの問題。次の投稿へ進む
+      break;
+    }
+    const rawLikes = insight.metrics?.likes;
+    const likes = typeof rawLikes === "number" ? rawLikes : (typeof rawLikes === "string" && /^\d+$/.test(rawLikes.trim()) ? Number(rawLikes) : NaN);
+    if (!Number.isInteger(likes) || likes < 0) {
+      result.failed += 1;
+      await recordAutoDeleteFailure(post, "いいね数が読めなかったため、この投稿は消しませんでした。", { metrics: JSON.stringify(insight.metrics).slice(0, 200) }, { countAgainstPost: true });
+      continue;
+    }
+    const rawReplies = insight.metrics?.replies;
+    const repliesCount = typeof rawReplies === "number" ? rawReplies : (typeof rawReplies === "string" && /^\d+$/.test(rawReplies.trim()) ? Number(rawReplies) : NaN);
+    if (!Number.isInteger(repliesCount) || repliesCount < 0) {
+      result.failed += 1;
+      await recordAutoDeleteFailure(post, "コメント数が読めなかったため、この投稿は消しませんでした。", { metrics: JSON.stringify(insight.metrics).slice(0, 200) }, { countAgainstPost: true });
+      continue;
+    }
+    if (likes > maxLikes || repliesCount > maxReplies) { // 24時間時点の判定で残す。以後は判定し直さない（いいねの取り消しやしきい値の変更で、残した投稿を後から消さない）
+      await withDb(async (d) => {
+        const p = d.posts.find((x) => x.id === post.id);
+        if (p) { p.autoDeleteJudgedAt = nowIso(); p.autoDeleteJudgedLikes = likes; p.autoDeleteJudgedMax = maxLikes; p.autoDeleteJudgedReplies = repliesCount; p.autoDeleteJudgedMaxReplies = maxReplies; }
+        d.insights.unshift(insight);
+        d.insights = d.insights.slice(0, 2000);
+      });
+      result.skipped += 1;
+      continue;
+    }
+    // 削除の直前に設定を読み直す（OFFにされた・しきい値を変えた・連携し直した場合は、古い判定のまま消さない）
+    const fresh = (await readDb()).settings;
+    if (!fresh.autoDeleteLowLikesEnabled || fresh.autoDeleteEnabledAt !== s.autoDeleteEnabledAt || fresh.threadsAccessToken !== token || Number(fresh.autoDeleteMaxLikes) !== maxLikes || Number(fresh.autoDeleteMaxReplies) !== maxReplies) break;
+    let res;
+    try {
+      res = await threadsFetch(`/${post.threadsId}`, { method: "DELETE", token });
+    } catch (error) {
+      result.failed += 1;
+      const known = error instanceof ExternalApiError;
+      // 同じ投稿のインサイト取得は通っている＝投稿は存在する。それでも削除が拒否されるのは、削除の権限が無いとき
+      const noPermission = known && [10, 100, 200].includes(error.apiCode); // 削除だけが code 100/10/200 で拒否されるのは権限不足の疑いが最も高い。連携し直すまで止める
+      await recordAutoDeleteFailure(post, noPermission
+        ? "自動削除に失敗しました。削除の権限(threads_delete)が付いていません。設定で「Threadsと連携する」を押し直してください（押し直すまで削除は試しません）。"
+        : "自動削除に失敗しました。", { code: error.apiCode, subcode: error.apiSubcode, error: String(error.message).slice(0, 200) },
+      { blockToken: noPermission ? token.slice(-12) : "", uncertain: !known || error.status >= 500, countAgainstPost: !noPermission && failureIsAboutPost(error) }); // 5xx・通信エラー・解析失敗は「消えたか不明」
+      if (!noPermission && failureIsAboutPost(error)) continue;
+      break;
+    }
+    if (!(res?.success === true || res?.deleted_id)) {
+      result.failed += 1;
+      await recordAutoDeleteFailure(post, "削除の応答が成功を示していません。", { body: JSON.stringify(res).slice(0, 200) }, { uncertain: true });
+      break;
+    }
+    result.deleted += 1;
+    const reason = `公開から${hours}時間たっても、いいねが${maxLikes}以下（${likes}）かつコメントが${maxReplies}以下（${repliesCount}）だったため自動削除`;
+    if (!(await markPostDeleted(post, reason, insight))) {
+      deletedButUnrecorded.set(post.threadsId, { post, reason, insight });
+      break; // 記録できない状態で削除を進めない
+    }
+  }
+  return result;
+}
+
 // 自動処理の1周: 取得（N分ごと）→ 下書き（未対応があれば・失敗後は5分空ける）→ 送信（ONのとき）→ インサイト（1日1回）
 async function autoReplyTick() {
   const snapshot = await readDb();
@@ -2156,15 +3170,44 @@ async function autoReplyTick() {
     await collectNewReplies(current);
     current = await readDb();
   }
-  const lastFailure = Date.parse(s.lastDraftFailureAt || "") || 0;
+  if (s.autoReplyEnabled && (await recoverAiFailedReplies(current))) current = await readDb();
+  // 先に送る。下書き作成はAIの応答待ちが長く、先に走ると、できあがっている下書きの送信まで遅れてコメントが溜まる
+  await requeueNetworkFailedReplies(current);
+  current = await readDb();
+  await sendAutoReplies(current);
+  current = await readDb();
+  const lastFailure = Date.parse(current.settings.lastDraftFailureAt || "") || 0;
   if (s.autoReplyEnabled && Date.now() - lastFailure >= REPLY_DRAFT_FAILURE_BACKOFF_MS && pickPendingReplies(current.replies).length) {
     await draftRepliesBatch(current);
     current = await readDb();
+    await sendAutoReplies(current);
   }
-  await sendAutoReplies(current);
   const lastInsights = Date.parse(s.lastInsightsAutoAt || "") || 0;
   if (s.autoInsightsEnabled && Date.now() - lastInsights >= 24 * 60 * 60 * 1000 && current.posts.some((p) => p.status === "published" && p.threadsId)) {
     await collectInsights(current);
+    current = await readDb();
+  }
+  const lastDeleteCheck = Date.parse(s.lastAutoDeleteCheckAt || "") || 0;
+  if (s.autoDeleteLowLikesEnabled && Date.now() - lastDeleteCheck >= AUTO_DELETE_CHECK_EVERY_MS) {
+    await withDb(async (d) => { d.settings.lastAutoDeleteCheckAt = nowIso(); });
+    try {
+      await deleteLowLikePosts(current);
+    } catch (error) {
+      await withDb(async (d) => { log(d, "error", "反応のない投稿の自動削除の処理で例外が出ました。", { error: String(error.message).slice(0, 200) }); });
+    }
+    current = await readDb();
+  }
+  // 取得の直後に分析まで回す（1日1回・失敗時は6時間空ける）。結果は次の投稿生成の方針に自動で入る（buildDraftPrompt）
+  const lastSuggestion = Date.parse(current.suggestions?.[0]?.at || "") || 0;
+  const lastAttempt = Date.parse(s.lastSuggestionAttemptAt || "") || 0;
+  if (s.autoInsightsEnabled && Date.now() - lastSuggestion >= 20 * 60 * 60 * 1000 && Date.now() - lastAttempt >= 6 * 60 * 60 * 1000
+    && buildStats(current).publishedWithInsights >= 3) {
+    await withDb(async (d) => { d.settings.lastSuggestionAttemptAt = nowIso(); });
+    try {
+      await generateSuggestion(current);
+    } catch (error) {
+      await withDb(async (d) => { log(d, "error", "日次の実績分析に失敗しました。", { error: error.message }); });
+    }
   }
 }
 
@@ -2192,6 +3235,23 @@ async function schedulerTick() {
         const post = db.posts.find((p) => p.id === stale.id);
         if (!post || !isStale(post) || inFlight.has(post.id)) return { save: false };
         markPublishError(db, post, new Error("予約時刻を24時間以上過ぎていたため送りませんでした（PC が止まっていた間の予約）。内容を確認して予約し直してください。"), "期限を過ぎた予約投稿を止めました。");
+      });
+    }
+    // 承認待ち・承認済み（未予約）のまま予約時刻を過ぎた投稿は、公開処理にも期限切れ処理にも掛からず、誰にも知らされない
+    // （2026-10-03: レジュの08:00枠が承認されないまま10:30を過ぎても、画面・ログ・検知のどれも動かなかった）。1件につき1回だけ error ログと印を付ける
+    const isMissedSlot = (post) => (post.status === "review" || post.status === "approved") && post.scheduledAt && !post.missedSlotAt && Date.now() - Date.parse(post.scheduledAt) > 5 * 60 * 1000;
+    const missed = snapshot.posts.filter(isMissedSlot);
+    if (missed.length) {
+      await withDb(async (db) => {
+        let n = 0;
+        for (const m of missed) {
+          const post = db.posts.find((p) => p.id === m.id);
+          if (!post || !isMissedSlot(post)) continue;
+          post.missedSlotAt = nowIso();
+          n += 1;
+        }
+        if (!n) return { save: false };
+        log(db, "error", `予約時刻を過ぎても承認・予約されていない投稿が ${n} 件あります。承認して予約し直すか、却下してください。`, { count: n });
       });
     }
     if (snapshot.settings.autoPublishEnabled && snapshot.settings.threadsAccessToken && !tokenExpired) {
@@ -2227,6 +3287,13 @@ async function schedulerTick() {
           });
         } catch (error) {
           failure = error;
+          if (error.identityMismatch) {
+            await withDb(async (db) => {
+              db.settings.autoPublishEnabled = false;
+              db.settings.autoReplyEnabled = false;
+              log(db, "error", "連携先のアカウントが期待と違うため、自動投稿・自動返信を止めました。連携を確認してください。", { error: error.message });
+            });
+          }
         }
         await withDb(async (db) => {
           const post = db.posts.find((item) => item.id === postId);
@@ -2239,7 +3306,7 @@ async function schedulerTick() {
             await markPublished(db, post, result, "予約投稿を公開しました。");
             delete post.retryAfter;
             delete post.retryCount;
-          } else if (isRateLimitError(failure) && (post.retryCount || 0) < SCHEDULE_RETRY_MAX) {
+          } else if ((isRateLimitError(failure) || failure?.retryable) && (post.retryCount || 0) < SCHEDULE_RETRY_MAX) {
             post.retryCount = (post.retryCount || 0) + 1;
             post.retryAfter = new Date(Date.now() + SCHEDULE_RETRY_INTERVAL_MS).toISOString();
             post.error = `${failure.message}（${post.retryCount}回目・10分後に再送します）`;
@@ -2313,15 +3380,35 @@ function sanitizeSettings(current, input) {
       next.accessKey = k;
       continue;
     }
-    if (["geminiApiKey", "anthropicApiKey", "threadsAccessToken", "threadsAppSecret"].includes(key)) {
+    if (["geminiApiKey", "anthropicApiKey", "threadsAccessToken", "threadsAppSecret", "threadsOAuthClientToken"].includes(key)) {
       if (isMaskedSecret(value)) continue;
       // 伏字欄を部分的に編集した値（*が混ざる）は、壊れたキーとして保存せず、貼り直しを求める
       if (String(value || "").includes("*")) throw new HttpError(400, "キーの欄に伏字（*）が混ざっています。欄を空にしてから、キー全体を貼り直してください。");
       next[key] = String(value || "").trim();
       continue;
     }
-    if (key === "threadsRedirectUri") {
+    if (key === "threadsRedirectUri" || key === "threadsOAuthExchangeUrl") {
+      if (key === "threadsOAuthExchangeUrl" && !String(value || "").trim()) {
+        next[key] = "";
+        continue;
+      }
       next[key] = safeUrl(value, "Redirect URI");
+      continue;
+    }
+    if (key === "monitoringAccountId") {
+      const accountId = String(value || "").trim();
+      if (accountId && !/^[A-Za-z0-9._:-]{1,80}$/.test(accountId)) throw new HttpError(400, "監視用アカウントIDは英数字と . _ : - だけで80文字以内にしてください。");
+      next[key] = accountId;
+      continue;
+    }
+    if (key === "monitoringConsentAt") {
+      next[key] = String(value || "").trim().slice(0, 80);
+      continue;
+    }
+    if (key === "expectedThreadsUsername") {
+      const name = String(value || "").trim().replace(/^@/, "");
+      if (name && !/^[A-Za-z0-9._]{1,30}$/.test(name)) throw new HttpError(400, "ユーザー名は英数字・ピリオド・アンダースコアだけで入力してください（@は不要です）。");
+      next[key] = name;
       continue;
     }
     if (key === "scheduleTimes") {
@@ -2331,18 +3418,25 @@ function sanitizeSettings(current, input) {
       next.scheduleTimes = [...new Set(times)].sort();
       continue;
     }
-    if (key === "autoFetchRepliesMinutes" || key === "autoReplyIntervalSec" || key === "autoReplyDailyCap") {
-      const bounds = { autoFetchRepliesMinutes: [1, 60, "コメント取得の間隔（分）"], autoReplyIntervalSec: [5, 600, "自動返信の間隔（秒）"], autoReplyDailyCap: [1, THREADS_REPLY_DAILY_LIMIT, "自動返信の1日上限"] }[key];
+    if ((key === "autoDeleteMaxLikes" || key === "autoDeleteMaxReplies") && !/^\d{1,4}$/.test(String(value ?? "").trim())) throw new HttpError(400, "自動削除のいいね数・コメント数のしきい値は 0〜1000 の整数で入力してください。");
+    if (key === "autoFetchRepliesMinutes" || key === "autoReplyIntervalSec" || key === "autoReplyDailyCap" || key === "autoDeleteMaxLikes" || key === "autoDeleteMaxReplies" || key === "autoReplyJaFromHour" || key === "autoReplyJaToHour" || key === "postsPerDay" || key === "scheduleFromHour" || key === "scheduleToHour" || key === "monitoringRetentionDays") {
+      const bounds = { postsPerDay: [0, 100, "1日の投稿数"], scheduleFromHour: [0, 23, "投稿の開始時"], scheduleToHour: [1, 24, "投稿の終了時"], autoReplyJaFromHour: [0, 23, "日本語返信の開始時"], autoReplyJaToHour: [1, 24, "日本語返信の終了時"], autoFetchRepliesMinutes: [1, 60, "コメント取得の間隔（分）"], autoReplyIntervalSec: [5, 600, "自動返信の間隔（秒）"], autoReplyDailyCap: [1, THREADS_REPLY_DAILY_LIMIT, "自動返信の1日上限"], autoDeleteMaxLikes: [0, 1000, "自動削除のいいね数のしきい値"], autoDeleteMaxReplies: [0, 1000, "自動削除のコメント数のしきい値"], monitoringRetentionDays: [1, 90, "監視状態の保持日数"] }[key];
       const n = Number(value);
       if (!Number.isFinite(n) || n < bounds[0] || n > bounds[1]) throw new HttpError(400, `${bounds[2]}は ${bounds[0]}〜${bounds[1]} の数字で入力してください。`);
       next[key] = Math.floor(n);
       continue;
     }
     if (typeof current[key] === "boolean") {
+      if (key === "monitoringEnabled" && Boolean(value)) {
+        const accountId = "monitoringAccountId" in input ? String(input.monitoringAccountId || "").trim() : next.monitoringAccountId;
+        if (!accountId) throw new HttpError(400, "監視をONにするには監視用アカウントIDが必要です。");
+        if (!next.monitoringConsentAt) next.monitoringConsentAt = nowIso();
+      }
+      if (key === "monitoringEnabled" && !Boolean(value)) next.monitoringConsentAt = "";
       next[key] = Boolean(value);
       continue;
     }
-    const limit = { brandName: 100, defaultCta: 500, profile: 3000, writingRules: 3000, threadsScopes: 500, geminiModel: 100, anthropicModel: 100, threadsAppId: 64 }[key] || 2000;
+    const limit = { brandName: 100, defaultCta: 500, profile: 3000, writingRules: 3000, threadsScopes: 500, geminiModel: 100, anthropicModel: 100, threadsAppId: 64, threadsOAuthExchangeUrl: 500 }[key] || 2000;
     next[key] = String(value ?? "").trim().slice(0, limit);
   }
   if (next.threadsScopes && !next.threadsScopes.includes("threads_basic")) {
@@ -2369,6 +3463,7 @@ function statePayload(db) {
     suggestions: db.suggestions,
     logs: db.logs,
     stats: buildStats(db),
+    monitoring: monitoringStatusPayload(db),
     https: httpsStatus,
     publicOrigin: PUBLIC_ORIGIN,
     version: APP_VERSION,
@@ -2384,10 +3479,20 @@ function route(method, pattern, handler) {
 
 route("GET", "/api/state", async () => readDb().then((db) => ({ status: 200, body: statePayload(db) })));
 
+route("GET", "/api/monitoring/status", async () => {
+  const db = await readDb();
+  return { status: 200, body: { monitoring: monitoringStatusPayload(db) } };
+});
+
 route("POST", "/api/settings", async ({ body }) => {
   const settings = await withDb(async (db) => {
     const before = db.settings;
-    db.settings = sanitizeSettings(db.settings, body);
+    const input = { ...body };
+    for (const key of ["autoDeleteEnabledAt", "autoDeleteBlockedToken", "autoDeleteLog", "autoDeleteAfterHours"]) delete input[key]; // 画面から書き換えさせない（サーバーが管理する値）
+    if ("autoDeleteLowLikesEnabled" in input && typeof input.autoDeleteLowLikesEnabled !== "boolean") throw new HttpError(400, "自動削除のON/OFFは true か false で指定してください。");
+    db.settings = sanitizeSettings(db.settings, input);
+    if (db.settings.autoDeleteLowLikesEnabled && !before.autoDeleteLowLikesEnabled) db.settings.autoDeleteEnabledAt = nowIso(); // この時刻より前の投稿は消さない
+    if (!db.settings.autoDeleteLowLikesEnabled) db.settings.autoDeleteEnabledAt = "";
     if (before.geminiApiKey !== db.settings.geminiApiKey) invalidateModelCache();
     log(db, "info", "設定を保存しました。");
     return { value: publicSettings(db.settings) };
@@ -2395,9 +3500,12 @@ route("POST", "/api/settings", async ({ body }) => {
   return { status: 200, body: { settings } };
 });
 
+// 同じPCの別ポートのサーバーから「このstateは自分が始めた連携か」を聞かれたときに答える（真偽だけ。stateの値は返さない）
+route("POST", "/api/oauth-state-owner", async ({ body }) => ({ status: 200, body: { owns: ownsOauthState(String(body.state || "")) } }));
+
 route("GET", "/api/threads-auth-url", async () => {
   const db = await readDb();
-  return { status: 200, body: { url: getThreadsAuthUrl(db.settings) } };
+  return { status: 200, body: { url: await getThreadsAuthUrl(db.settings) } };
 });
 
 route("POST", "/api/gemini-models", async () => {
@@ -2484,6 +3592,26 @@ route("PUT", "/api/research/sources/:id", async ({ params, body }) => {
 });
 
 // --- 参考投稿（Threadsキーワード検索 / 手動貼り付け / 型の分析） ---
+// 特定ユーザー1アカウントの公開投稿を一覧する。save:true なら参考投稿（未選択）としても保存する
+route("POST", "/api/profile-posts", async ({ body }) => {
+  const db = await readDb();
+  const result = await listProfilePosts(db.settings, body.username, Math.min(Math.max(Number(body.limit) || 100, 1), 250));
+  let saved = 0;
+  if (body.save === true) {
+    saved = await withDb(async (d) => {
+      const known = new Set(d.references.map((ref) => ref.threadsId).filter(Boolean));
+      const fresh = result.posts.filter((p) => p.text && !known.has(p.threadsId)).map((p) => ({
+        id: id("ref"), threadsId: p.threadsId, source: "profile", keyword: `@${result.username}の投稿${p.likes === null ? "" : `（いいね${p.likes}）`}`,
+        text: p.text, username: p.username, permalink: p.permalink, timestamp: p.timestamp, mediaType: p.mediaType, selected: false, analysis: null, createdAt: nowIso()
+      }));
+      d.references.unshift(...fresh);
+      d.references = d.references.slice(0, 300);
+      return { value: fresh.length };
+    });
+  }
+  return { status: 200, body: { ...result, count: result.posts.length, saved } };
+});
+
 route("POST", "/api/references/search", async ({ body }) => {
   const keyword = String(body.keyword || "").trim();
   if (!keyword) throw new HttpError(400, "キーワードを入力してください。");
@@ -2581,6 +3709,31 @@ function ngramOverlap(text, source, n = 5) {
 }
 const COPY_OVERLAP_LIMIT = 0.3;
 
+// 手動追加・手動編集された投稿にも同じ丸写し検査を掛ける（AI生成経路(/api/generate-posts)だけに
+// 掛かっていたため、Claude Code等で下書きして直接POSTした投稿が一度も検査を通らずに予約・公開
+// されていた。2026-09-23 原因分析70_/71_番で判明。ここは「弾く」のではなく「警告を残す」——
+// 実在の投稿を意図的になぞる制作では、多少の重複は許容判断があり得るため、機械的に拒否せず
+// 人が見て判断できる形でpostに刻む）
+function checkCopyOverlap(d, text) {
+  const references = (d.references || []).filter((ref) => ref.selected).map((ref) => ref.text || "");
+  let worst = 0;
+  let worstRef = "";
+  for (const ref of references) {
+    const ov = ngramOverlap(text, ref);
+    if (ov > worst) { worst = ov; worstRef = ref; }
+  }
+  if (worst <= COPY_OVERLAP_LIMIT) return null;
+  return { ratio: Math.round(worst * 100), sourceSnippet: worstRef.slice(0, 40) };
+}
+
+function questionQualityIssue(post) {
+  const text = String(post?.text || "").trim();
+  if (!text) return "";
+  const questions = text.match(/[？?]/g) || [];
+  if (questions.length > 1) return "質問が複数ある";
+  return "";
+}
+
 route("POST", "/api/generate-posts", async ({ body }) => {
   const count = Math.min(Math.max(Number(body.count) || 8, 1), 12);
   const db = await readDb();
@@ -2594,6 +3747,8 @@ route("POST", "/api/generate-posts", async ({ body }) => {
     if (!text) { skipped.push({ reason: "本文が空", text: "" }); return false; }
     const copied = references.find((ref) => ngramOverlap(text, ref) > COPY_OVERLAP_LIMIT);
     if (copied) { skipped.push({ reason: "参考投稿の丸写しに近い", text: text.slice(0, 60) }); return false; }
+    const questionIssue = questionQualityIssue(post);
+    if (questionIssue) { skipped.push({ reason: questionIssue, text: text.slice(0, 60) }); return false; }
     return true;
   });
   const posts = await withDb(async (d) => {
@@ -2628,8 +3783,12 @@ route("POST", "/api/posts", async ({ body }) => {
   const post = await withDb(async (d) => {
     const created = normalizePost({ ...pickContent(body), status: "review", origin: "manual" });
     if (!created.text.trim()) throw new HttpError(400, "本文を入力してください。");
+    created.copyOverlapWarning = checkCopyOverlap(d, created.text);
     d.posts.unshift(created);
     log(d, "info", "投稿を手動追加しました。", { postId: created.id });
+    if (created.copyOverlapWarning) {
+      log(d, "error", `参考投稿との一致率が高いため確認してください（${created.copyOverlapWarning.ratio}%一致）。`, { postId: created.id });
+    }
     return { value: created };
   });
   return { status: 200, body: { post } };
@@ -2653,6 +3812,12 @@ route("PUT", "/api/posts/:id", async ({ params, body }) => {
       next.status = "review";
       log(d, "info", "本文が変わったため承認待ちに戻しました。", { postId: found.id });
     }
+    if (contentChanged) {
+      next.copyOverlapWarning = checkCopyOverlap(d, next.text);
+      if (next.copyOverlapWarning) {
+        log(d, "error", `参考投稿との一致率が高いため確認してください（${next.copyOverlapWarning.ratio}%一致）。`, { postId: found.id });
+      }
+    }
     if (next.status === "scheduled" && "scheduledAt" in patch) {
       if (!next.scheduledAt) throw new HttpError(400, "予約済みの投稿の日時は空にできません。先に「予約を解除」してください。");
       if (Date.parse(next.scheduledAt) < Date.now() - 60_000) throw new HttpError(400, "予約日時が過去です。未来の日時を入れてください。");
@@ -2670,8 +3835,13 @@ route("POST", "/api/posts/:id/transition", async ({ params, body }) => {
     if (body.action === "schedule" && body.scheduledAt) {
       found.scheduledAt = normalizePost({ scheduledAt: body.scheduledAt }).scheduledAt;
     }
-    applyTransition(found, body.action);
+    applyTransition(found, body.action, { force: !!body.force, reason: body.reason });
     log(d, "info", `投稿を${actionLabel(body.action)}しました。`, { postId: found.id, status: found.status });
+    // トピックタグが空のまま承認・予約されるのを、気づかず素通りさせない（弾かず記録に残すだけ）。
+    // 2026-09-23: 予約16本が全てtopicTag空のまま予約されていた原因分析(71_原因分析.md)対策。
+    if ((body.action === "approve" || body.action === "schedule") && !found.topicTag) {
+      log(d, "info", "トピックタグが未設定のまま進みました。関連するものがあれば編集で設定してください。", { postId: found.id });
+    }
     return { value: found };
   });
   return { status: 200, body: { post } };
@@ -2773,6 +3943,8 @@ route("POST", "/api/fetch-replies", async () => {
 route("POST", "/api/replies/draft-batch", async () => {
   // AI 障害で要確認になった分は、人がこのボタンを押したときだけ再挑戦の列に戻す
   await withDb(async (d) => {
+    const hasNormalPending = d.replies.some((r) => r.status === "unhandled" && !r.responseText && r.text);
+    if (hasNormalPending) return { save: false };
     for (const r of d.replies) {
       if (r.status === "held" && /^AI処理に\d+回失敗/.test(r.holdReason || "")) {
         r.status = "unhandled";
@@ -2827,6 +3999,43 @@ route("PUT", "/api/replies/:id", async ({ params, body }) => {
   return { status: 200, body: { reply } };
 });
 
+// スパムコメントを非表示にする（Threads側で「全員に対して非表示」。画面から元に戻せる。削除ではない）
+route("POST", "/api/replies/:id/hide", async ({ params, body }) => {
+  const snapshot = await readDb();
+  const target = findOr404(snapshot.replies, params.id, "コメント");
+  const hide = body.hide !== false;
+  await threadsFetch(`/${target.id}/manage_reply`, { method: "POST", params: { hide: hide ? "true" : "false" }, token: requireToken(snapshot.settings) });
+  const reply = await withDb(async (d) => {
+    const found = findOr404(d.replies, params.id, "コメント");
+    if (hide) {
+      found.hidden = true;
+      found.hiddenAt = nowIso();
+      found.autoQueued = false;
+      if (found.status !== "responded") { found.status = "ignored"; found.holdReason = "スパムとして非表示にしました"; }
+    } else {
+      found.hidden = false;
+      found.hiddenAt = "";
+      if (found.status === "ignored" && found.holdReason === "スパムとして非表示にしました") { found.status = "unhandled"; found.holdReason = ""; }
+    }
+    log(d, "info", hide ? "コメントをスパムとして非表示にしました。" : "コメントの非表示を解除しました。", { replyId: found.id, username: found.username });
+    return { value: found };
+  });
+  return { status: 200, body: { reply } };
+});
+
+// 自分が送った返信のURLを返す（無ければThreads APIで取って保存する）。「Threadsで見る」から返信そのものを開くため
+route("GET", "/api/replies/:id/response-link", async ({ params }) => {
+  const snapshot = await readDb();
+  const target = findOr404(snapshot.replies, params.id, "コメント");
+  if (target.responsePermalink) return { status: 200, body: { url: target.responsePermalink } };
+  if (!target.respondedThreadsId) throw new HttpError(404, "このコメントにはまだ返信していません。");
+  const detail = await threadsFetch(`/${target.respondedThreadsId}`, { params: { fields: "permalink" }, token: requireToken(snapshot.settings) });
+  const url = String(detail.permalink || "");
+  if (!url) throw new HttpError(502, "Threadsから返信のURLを取得できませんでした。");
+  await withDb(async (d) => { findOr404(d.replies, params.id, "コメント").responsePermalink = url; return { value: null }; });
+  return { status: 200, body: { url } };
+});
+
 route("POST", "/api/replies/:id/respond", async ({ params, body }) => {
   const lockKey = `reply:${params.id}`;
   const { text, settings, replyId, wasError } = await withDb(async (d) => {
@@ -2850,20 +4059,23 @@ route("POST", "/api/replies/:id/respond", async ({ params, body }) => {
 });
 
 // --- 改善提案 ---
-route("POST", "/api/suggestions", async () => {
-  const snapshot = await readDb();
+async function generateSuggestion(snapshot) {
   const stats = buildStats(snapshot);
   if (stats.publishedWithInsights < 3) {
     throw new HttpError(400, `改善提案にはインサイト付きの公開投稿が3件以上必要です（現在${stats.publishedWithInsights}件）。先に「インサイトを取得」してください。`);
   }
   const result = await callAiJson(snapshot.settings, buildSuggestionPrompt(snapshot.settings, stats), suggestionSchema, { maxOutputTokens: 4096 });
-  const suggestion = await withDb(async (d) => {
+  return withDb(async (d) => {
     const item = { id: id("sug"), at: nowIso(), basedOn: stats.publishedWithInsights, ...result };
     d.suggestions.unshift(item);
     d.suggestions = d.suggestions.slice(0, 20);
     log(d, "info", "改善提案を生成しました。", { basedOn: stats.publishedWithInsights });
     return { value: item };
   });
+}
+
+route("POST", "/api/suggestions", async () => {
+  const suggestion = await generateSuggestion(await readDb());
   return { status: 200, body: { suggestion } };
 });
 
@@ -2945,19 +4157,72 @@ function htmlPage(res, status, title, bodyHtml) {
   res.end(`<!doctype html><html lang="ja"><meta charset="utf-8"><title>${escapeHtml(title)}</title><body style="font-family:sans-serif;padding:32px;max-width:640px"><h1 style="font-size:20px">${escapeHtml(title)}</h1>${bodyHtml}</body></html>`);
 }
 
+// 連携しようとしているアカウントが、同じ端末の別の口座（THREADS_PEERS）に既に連携済みなら、その口座の識別名を返す。
+// ブラウザのログインが別アカウントのまま連携すると、別の口座へ投稿・返信してしまうのを防ぐ（2026-10-03 実際に3口座が同じアカウントになった）
+async function findPeerWithSameUser(userId) {
+  if (!userId) return "";
+  for (const [peerId, port] of PEER_PORTS) {
+    try {
+      const res = await fetch(`http://localhost:${port}/api/state`, { headers: { "x-threads-ops": "1" }, signal: AbortSignal.timeout(3000) });
+      if (!res.ok) continue;
+      const peer = await res.json();
+      if (peer?.settings?.threadsUserId && peer.settings.threadsUserId === userId) return peerId;
+    } catch {
+      // 起動していない口座は照合できない。連携は止めない
+    }
+  }
+  return "";
+}
+
 async function handleOauthCallback(res, url) {
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state") || "";
   const error = url.searchParams.get("error_description") || url.searchParams.get("error");
   if (error) return htmlPage(res, 400, "Threads認可エラー", `<p>${escapeHtml(error)}</p><p>このタブを閉じて、設定画面からやり直してください。</p>`);
   if (!code) return htmlPage(res, 400, "Threads認可エラー", "<p>認可コードがありません。</p>");
+  const peerPort = PEER_PORTS.get(state.split(".")[0]);
+  if (!pendingOauthStates.has(state) && state.includes(".") && peerPort) { // 別アカウントのサーバーが始めた連携の戻り。そちらへ渡す（localhostのみ）
+    res.writeHead(302, { location: `http://localhost:${peerPort}/oauth/callback${url.search}`, "cache-control": "no-store" });
+    return res.end();
+  }
+  if (!ownsOauthState(state) && state) { // ホスト発行のstateには口座の印が無い。同じPCの他のポートに「このstateは自分のものか」を聞き、持ち主へ渡す（localhostのみ）
+    for (const port of new Set(PEER_PORTS.values())) {
+      if (port === PORT) continue;
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/oauth-state-owner`, {
+          method: "POST", headers: { "content-type": "application/json", "x-threads-ops": "1" },
+          body: JSON.stringify({ state }), signal: AbortSignal.timeout(3000)
+        });
+        if (response.ok && (await response.json()).owns) {
+          res.writeHead(302, { location: `http://localhost:${port}/oauth/callback${url.search}`, "cache-control": "no-store" });
+          return res.end();
+        }
+      } catch { /* 持ち主が分からないstateでは認可しない */ }
+    }
+  }
   if (!pendingOauthStates.has(state)) {
     return htmlPage(res, 400, "Threads認可エラー", "<p>認可リクエストの照合に失敗しました（state不一致・期限切れ）。設定画面の「Threadsと連携する」からやり直してください。</p>");
   }
   pendingOauthStates.delete(state);
   const snapshot = await readDb();
   try {
-    const token = await exchangeThreadsCode(snapshot.settings, code);
+    const token = await exchangeThreadsCode(snapshot.settings, code, state);
+    // 運用代行では、ブラウザのログインが別のお客様のままだと、他人のアカウントに投稿してしまう。連携を確定する前に照合する。
+    const expected = String(snapshot.settings.expectedThreadsUsername || "").trim().replace(/^@/, "").toLowerCase();
+    const got = String(token.username || "").toLowerCase();
+    if (!expected) {
+      await withDb(async (d) => log(d, "error", "期待ユーザー名が未設定のため、連携を確定しませんでした。", { got: token.username }));
+      return htmlPage(res, 409, "連携を確定しませんでした", `<p>認可されたのは @${escapeHtml(token.username || "不明")} です。この口座には「連携先として期待するユーザー名」が設定されていないため、連携を確定しませんでした（別のお客様のアカウントに連携してしまう事故を防ぐためです）。</p><p>運用アシスタントの設定画面で、この口座の期待ユーザー名を入れてから、もう一度連携してください。今の連携は変わっていません。</p>`);
+    }
+    if (got !== expected) {
+      await withDb(async (d) => log(d, "error", "期待したユーザー名と違うため、連携を取り消しました。", { expected, got: token.username }));
+      return htmlPage(res, 409, "連携を取り消しました", `<p>認可されたのは @${escapeHtml(token.username || "不明")} です。この口座に設定されたユーザー名は @${escapeHtml(expected)} で、一致しませんでした。</p><p>ブラウザのThreadsで、正しいアカウントにログインし直してから、もう一度連携してください。今の連携は変わっていません。</p>`);
+    }
+    const duplicate = await findPeerWithSameUser(token.userId);
+    if (duplicate) {
+      await withDb(async (d) => log(d, "error", "別の口座と同じThreadsアカウントのため、連携を取り消しました。", { peer: duplicate, username: token.username }));
+      return htmlPage(res, 409, "別の口座と同じアカウントです", `<p>認可されたのは @${escapeHtml(token.username || "不明")} で、口座「${escapeHtml(duplicate)}」に連携済みのアカウントです。この口座には連携しませんでした。</p><p>ブラウザのThreadsで、この口座のアカウントにログインし直してから、設定画面の「Threadsと連携する」をもう一度押してください。</p>`);
+    }
     await withDb(async (d) => {
       d.settings.threadsAccessToken = token.accessToken;
       d.settings.threadsTokenExpiresAt = token.expiresAt;
@@ -2998,6 +4263,14 @@ const server = createServer(async (req, res) => {
     }
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url);
+    if (url.pathname === "/oauth-host/create" && req.method === "POST") {
+      const client = assertHostedOAuthClient(req);
+      return json(res, 200, buildHostedAuthUrl({ ...(await bodyJson(req)), client }));
+    }
+    if (url.pathname === "/oauth-host/exchange" && req.method === "POST") {
+      const client = assertHostedOAuthClient(req);
+      return json(res, 200, await exchangeHostedOauthCode({ ...(await bodyJson(req)), client }));
+    }
     if (url.pathname === "/oauth/callback") return await handleOauthCallback(res, url);
     // Meta のアプリ設定で必須になる「アンインストール」「データ削除」のコールバック。受け取って記録するだけ（1人用のため削除対象データは data/ を消せば足りる）
     if (url.pathname === "/threads/uninstall" || url.pathname === "/threads/delete") {
@@ -3007,18 +4280,19 @@ const server = createServer(async (req, res) => {
     return await serveStatic(res, url.pathname);
   } catch (error) {
     await appendErrorLog(error);
-    if (!res.headersSent) json(res, 500, { error: "サーバー内部エラー", detail: error.message });
+    if (!res.headersSent && error instanceof HttpError) json(res, error.status, { error: error.message, detail: error.detail || "" });
+    else if (!res.headersSent) json(res, 500, { error: "サーバー内部エラー", detail: error.message });
   }
 });
 
 // テスト用に内部関数を公開する（購入者が使うAPIではない）
 export { appendErrorLog };
 export const _internals = {
-  recoverPublishing, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
+  recoverPublishing, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, sanitizeLogMeta, isTransientThreadsError, isThreadsMissingObjectError, boundedBackoffMs, applyReplyFetchFailures, recordAutoDeleteFailureForTest: recordAutoDeleteFailure, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
   toStrictSchema,
   REPLY_TEXT_BLOCKLIST,
-  autoReplyTick,
-  draftRepliesBatch, schedulerTick, assignSchedule, sanitizeSettings, applyTransition, normalizePost, readDb, withDb };
+  autoReplyTick, classifySafeError, monitoringStatusPayload, buildDraftPrompt, questionQualityIssue,
+  draftRepliesBatch, pickAiFailedForRecovery, recoverAiFailedReplies, REPLY_AI_RECOVERY_EVERY_MS, schedulerTick, assignSchedule, sanitizeSettings, applyTransition, normalizePost, readDb, withDb };
 
 // 自己署名証明書（localhost・10年）。openssl が無ければ https は立てず、手動トークン運用を案内する。
 function findOpenssl() {
@@ -3099,8 +4373,11 @@ export async function startServer(port = PORT, host = HOST) {
   if (isExposed(host) && !accessKeyCache) {
     throw new Error("外へ公開する形（HOST が 127.0.0.1 以外、または THREADS_PUBLIC_ORIGIN あり）では、アクセスキーが必要です。環境変数 THREADS_ACCESS_KEY（8文字以上）を設定して起動してください。");
   }
+  recordMonitoringHeartbeat().catch((error) => appendErrorLog(error));
   const timer = setInterval(() => { schedulerTick(); }, 60_000);
+  const monitoringTimer = setInterval(() => { recordMonitoringHeartbeat().catch((error) => appendErrorLog(error)); }, MONITORING_HEARTBEAT_INTERVAL_MS);
   timer.unref();
+  monitoringTimer.unref();
   server.requestTimeout = 300_000;
   listeningPort = port;
   await new Promise((resolve, reject) => {

@@ -3,7 +3,7 @@
 // 同じフォルダに threads-ops.env（KEY=VALUE・1行1件）があれば、未設定の環境変数だけそこから補う。
 // プラグイン配布ではデータの置き場所（THREADS_DATA_DIR）をここで渡す。
 import { exec } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -20,6 +20,25 @@ if (existsSync(envFile)) {
 const { startServer, appendErrorLog } = await import("./server.js");
 const port = Number(process.env.PORT || 4173);
 const url = `http://localhost:${port}`;
+const dataDir = process.env.THREADS_DATA_DIR || join(here, "data");
+const lifecycleLog = join(dataDir, "lifecycle.log");
+
+function appendLifecycle(event, extra = {}) {
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    const safe = {
+      at: new Date().toISOString(),
+      event,
+      pid: process.pid,
+      port,
+      dataDirName: dataDir.split(/[\\/]/).pop(),
+      ...extra
+    };
+    appendFileSync(lifecycleLog, `${JSON.stringify(safe)}\n`, "utf8");
+  } catch {
+    // lifecycle logging must never prevent the app from starting.
+  }
+}
 
 async function alreadyRunningHere() {
   try {
@@ -38,8 +57,11 @@ function openBrowser() {
 }
 
 try {
+  appendLifecycle("start-attempt");
   await startServer(port);
+  appendLifecycle("start-listening");
 } catch (error) {
+  appendLifecycle("start-error", { code: error.code || "", message: String(error.message || "").slice(0, 200) });
   if (error.code === "EADDRINUSE") {
     if (await alreadyRunningHere()) {
       console.log(`Threads運用アシスタントは既に起動しています（自動起動、または別の黒い画面）。`);
@@ -63,3 +85,13 @@ try {
     openBrowser();
   }
 }
+
+process.on("exit", (code) => appendLifecycle("process-exit", { code }));
+process.on("SIGINT", () => {
+  appendLifecycle("signal", { signal: "SIGINT" });
+  process.exit(130);
+});
+process.on("SIGTERM", () => {
+  appendLifecycle("signal", { signal: "SIGTERM" });
+  process.exit(143);
+});

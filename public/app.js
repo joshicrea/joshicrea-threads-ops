@@ -333,7 +333,7 @@ function renderReferences() {
     <article class="ref-card ${ref.selected ? "selected" : ""}">
       <label class="ref-head">
         <input type="checkbox" data-ref-toggle="${ref.id}" ${ref.selected ? "checked" : ""} />
-        <span class="post-meta">${ref.username ? `@${escapeHtml(ref.username)}` : "手動追加"}${ref.keyword ? ` / 「${escapeHtml(ref.keyword)}」` : ""}${ref.timestamp ? ` / ${fmtDate(ref.timestamp)}` : ""}${ref.metrics ? ` / いいね ${Number(ref.metrics.likes) || 0} / 返信 ${Number(ref.metrics.replies) || 0}` : ""}</span>
+        <span class="post-meta">${ref.username ? `@${escapeHtml(ref.username)}` : "手動追加"}${ref.keyword ? ` / 「${escapeHtml(ref.keyword)}」` : ""}${ref.timestamp ? ` / ${fmtDate(ref.timestamp)}` : ""}${ref.metrics ? ` / いいね ${Number(ref.metrics.likes) || 0} / 返信 ${Number(ref.metrics.replies) || 0}` : ""}${ref.unverified ? ` / <strong style="color:#c0392b">未検証（AI取得・要目視確認）</strong>` : ""}</span>
         <span class="spacer"></span>
         ${safeHref(ref.permalink) ? `<a class="link" href="${safeHref(ref.permalink)}" target="_blank" rel="noreferrer">元投稿</a>` : ""}
         <button class="small-button ghost" data-ref-delete="${ref.id}" type="button">削除</button>
@@ -430,12 +430,14 @@ function renderQueue() {
       <div class="post-row-head">
         ${statusPill(post.status)}
         <span class="post-meta">${escapeHtml(post.category || CATEGORY_LABEL_FALLBACK)}${post.format !== "TEXT" ? ` / ${post.format}` : ""}</span>
-        <span class="post-meta">${post.status === "published" ? `公開 ${fmtDate(post.publishedAt)}` : post.scheduledAt ? `予定 ${fmtDate(post.scheduledAt)}` : "日時未設定"}</span>
+        <span class="post-meta">${post.status === "published" ? `公開 ${fmtDate(post.publishedAt)}${post.deletedFromThreadsAt ? "（反応が少なく自動削除済み）" : ""}` :post.scheduledAt ? `予定 ${fmtDate(post.scheduledAt)}` : "日時未設定"}</span>
         <span class="spacer"></span>
         <div class="row-actions">${postActions(post).join("")}</div>
       </div>
       <div class="post-text">${nl2br(post.text)}</div>
+      ${post.copyOverlapWarning ? `<div class="error-box">参考投稿との一致率が${post.copyOverlapWarning.ratio}%あります（「${escapeHtml(post.copyOverlapWarning.sourceSnippet)}...」と近い）。承認は本文を見直すか、内容を確認したうえで進めてください。</div>` : ""}
       ${post.error ? `<div class="error-box">${escapeHtml(post.error)}</div>` : ""}
+      ${post.rejectReason ? `<div class="notice">却下理由: ${escapeHtml(post.rejectReason)}</div>` : ""}
     </article>
   `).join("") : `<p class="notice">${state.queueFilter === "all" ? "投稿はまだありません。「投稿生成」で作るか、「手動で追加」してください。" : "この状態の投稿はありません。"}</p>`;
 }
@@ -486,13 +488,19 @@ async function transition(id, action, button) {
   const post = state.posts.find((item) => item.id === id);
   if (!post) return;
   let scheduledAt;
+  let reason;
   const past = post.scheduledAt && Date.parse(post.scheduledAt) < Date.now() - 60_000;
   if (action === "schedule" && (!post.scheduledAt || past)) {
     scheduledAt = await askScheduleDatetime(nextScheduleSlot(), past ? "割り当て済みの予約時刻が過ぎているので、日時を選び直してください。" : "");
     if (!scheduledAt) return;
   }
+  if (action === "reject") {
+    // 却下理由を一言だけ聞く（Q044で新設）。あとで「書き直せば出せる」かを判断する材料にする。空欄でも却下できる。
+    reason = window.prompt("却下する理由を一言で（あとで書き直すかの判断材料にします。空でもOK）", "");
+    if (reason === null) return;
+  }
   await busy(button, "処理中", async () => {
-    await api(`/api/posts/${encodeURIComponent(id)}/transition`, { method: "POST", body: { action, scheduledAt } });
+    await api(`/api/posts/${encodeURIComponent(id)}/transition`, { method: "POST", body: { action, scheduledAt, reason } });
     await loadState();
     toast({ approve: "承認しました。", schedule: "予約しました。", unschedule: "予約を解除しました。", reject: "却下しました。", restore: "承認待ちに戻しました。" }[action] || "更新しました。");
   });
@@ -500,6 +508,17 @@ async function transition(id, action, button) {
 
 // 設定の予約時刻（HH:MM・日本時間）から、今より後の直近の枠を返す（ローカル時刻で計算）
 function nextScheduleSlot() {
+  if (Number(state.settings.postsPerDay) >= 1) {
+    const from = Number(state.settings.scheduleFromHour ?? 7);
+    const to = Number(state.settings.scheduleToHour ?? 21);
+    const now = new Date();
+    for (let day = 0; day < 8; day += 1) {
+      const lo = new Date(now.getFullYear(), now.getMonth(), now.getDate() + day, from, 0, 0, 0).getTime();
+      const hi = new Date(now.getFullYear(), now.getMonth(), now.getDate() + day, to, 0, 0, 0).getTime();
+      const start = Math.max(lo, now.getTime() + 5 * 60_000);
+      if (start < hi) return new Date(start + Math.floor(Math.random() * (hi - start))).toISOString();
+    }
+  }
   const times = (state.settings.scheduleTimes || []).filter((t) => /^\d{2}:\d{2}$/.test(t)).sort();
   const now = new Date();
   for (let day = 0; day < 8; day += 1) {
@@ -594,10 +613,16 @@ function renderRepliesList() {
         <strong>${reply.username ? `@${escapeHtml(reply.username)}` : "名前不明"}</strong>
         <span class="post-meta">${fmtDate(reply.timestamp)}</span>
         <span class="spacer"></span>
-        ${safeHref(reply.permalink) ? `<a class="link" href="${safeHref(reply.permalink)}" target="_blank" rel="noreferrer">Threadsで見る</a>` : ""}
+        ${reply.hidden ? `<span class="status-pill r-ignored">スパムとして非表示済み</span>` : ""}
+        ${reply.status === "responded" && reply.respondedThreadsId ? `<button class="small-button" data-reply-action="open-response" data-id="${reply.id}" type="button">返信をThreadsで見る</button>` : ""}
+        ${safeHref(reply.permalink) ? `<a class="link" href="${safeHref(reply.permalink)}" target="_blank" rel="noreferrer">コメントをThreadsで見る</a>` : ""}
+        ${reply.hidden
+          ? `<button class="small-button ghost" data-reply-action="unhide" data-id="${reply.id}" type="button">非表示を解除</button>`
+          : `<button class="small-button ghost" data-reply-action="hide" data-id="${reply.id}" type="button">スパムとして非表示</button>`}
       </div>
       <div class="quote">元投稿: ${escapeHtml(postText(reply).slice(0, 90))}${postText(reply).length > 90 ? "..." : ""}</div>
       <div class="reply-text">${nl2br(reply.text)}</div>
+      ${safeHref(reply.mediaUrl) ? `<a href="${safeHref(reply.mediaUrl)}" target="_blank" rel="noreferrer"><img class="reply-media" src="${safeHref(reply.mediaUrl)}" alt="コメントに添付された画像" loading="lazy" referrerpolicy="no-referrer" style="max-width:240px;max-height:240px;border-radius:8px;margin:6px 0;display:block"></a>` : ""}
       ${reply.status === "responded"
         ? `<div class="responded">返信済み（${fmtDate(reply.respondedAt)}）: ${nl2br(reply.responseText)}</div>`
         : reply.status === "ignored"
@@ -639,6 +664,34 @@ async function replyAction(action, id, button) {
       }
     });
   }
+  if (action === "open-response") {
+    const win = window.open("", "_blank"); // 非同期の後に開くとブロックされるので、先に空の窓を開けておく
+    try {
+      const result = await api(`/api/replies/${encodeURIComponent(id)}/response-link`);
+      if (win) { win.opener = null; win.location.href = result.url; } else window.open(result.url, "_blank", "noopener,noreferrer");
+    } catch (error) {
+      if (win) win.close();
+      toast(`返信のURLを取得できませんでした: ${error.message}`, "error");
+    }
+    return;
+  }
+  if (action === "hide") {
+    if (!confirm("このコメントをスパムとして非表示にします。Threads上で全員に対して非表示になります（削除ではなく、Threadsの画面から元に戻せます）。")) return;
+    await busy(button, "非表示中", async () => {
+      await api(`/api/replies/${encodeURIComponent(id)}/hide`, { method: "POST", body: { hide: true } });
+      await loadState();
+      toast("スパムとして非表示にしました。");
+    });
+    return;
+  }
+  if (action === "unhide") {
+    await busy(button, "解除中", async () => {
+      await api(`/api/replies/${encodeURIComponent(id)}/hide`, { method: "POST", body: { hide: false } });
+      await loadState();
+      toast("非表示を解除しました。");
+    });
+    return;
+  }
   if (action === "ignore" || action === "reopen" || action === "unqueue") {
     await busy(button, "更新中", async () => {
       // unqueue: 「未対応に戻す」と同じ経路で、下書きは残しつつ自動送信の資格だけ外す
@@ -664,10 +717,37 @@ async function persistReplyDraft(id, text) {
 // ---------------------------------------------------------------------------
 // 分析・改善
 // ---------------------------------------------------------------------------
+// 長い一覧を20件ずつに分ける（投稿別の表・改善提案）。ページ番号は画面の中だけで持つ
+const ANALYSIS_PAGE_SIZE = 20;
+const analysisPage = { posts: 0, sugg: 0 };
+function analysisPageOf(key, total) {
+  const pages = Math.max(1, Math.ceil(total / ANALYSIS_PAGE_SIZE));
+  analysisPage[key] = Math.min(Math.max(analysisPage[key], 0), pages - 1);
+  return { cur: analysisPage[key], pages };
+}
+function pagedSlice(key, items) {
+  const { cur } = analysisPageOf(key, items.length);
+  return items.slice(cur * ANALYSIS_PAGE_SIZE, (cur + 1) * ANALYSIS_PAGE_SIZE);
+}
+function pagerHtml(key, total) {
+  if (total <= ANALYSIS_PAGE_SIZE) return "";
+  const { cur, pages } = analysisPageOf(key, total);
+  const from = cur * ANALYSIS_PAGE_SIZE + 1;
+  const to = Math.min(total, (cur + 1) * ANALYSIS_PAGE_SIZE);
+  return `<div class="row-actions pager"><button class="small-button ghost" type="button" data-pager="${key}" data-dir="-1"${cur === 0 ? " disabled" : ""}>前へ</button><span>${from}〜${to}件 / 全${total}件（${cur + 1}/${pages}ページ）</span><button class="small-button ghost" type="button" data-pager="${key}" data-dir="1"${cur >= pages - 1 ? " disabled" : ""}>次へ</button></div>`;
+}
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-pager]");
+  if (!button || button.disabled) return;
+  analysisPage[button.dataset.pager] += Number(button.dataset.dir);
+  renderAnalysis();
+});
+
 function renderAnalysis() {
   const stats = state.stats || { publishedWithInsights: 0, byCategory: {}, byTimeSlot: {}, top: [] };
   const latest = new Map();
   for (const item of state.insights) if (!latest.has(item.postId)) latest.set(item.postId, item);
+  for (const post of state.posts) if (post.finalMetrics && !latest.has(post.id)) latest.set(post.id, { postId: post.id, metrics: post.finalMetrics }); // 削除した投稿の最後の数字
   const totals = {};
   for (const item of latest.values()) for (const [k, v] of Object.entries(item.metrics || {})) totals[k] = (totals[k] || 0) + Number(v || 0);
   const labels = { views: "閲覧", likes: "いいね", replies: "返信", reposts: "再投稿", quotes: "引用", shares: "シェア" };
@@ -688,10 +768,10 @@ function renderAnalysis() {
     .map((post) => ({ post, m: latest.get(post.id).metrics || {} }))
     .sort((a, b) => (b.m.views || 0) - (a.m.views || 0));
   $("#postInsightTable").innerHTML = rows.length
-    ? `<table><thead><tr><th>公開</th><th>カテゴリ</th><th>本文</th><th>閲覧</th><th>いいね</th><th>返信</th><th>再投稿</th></tr></thead><tbody>${rows.map(({ post, m }) => `<tr><td>${fmtDate(post.publishedAt)}</td><td>${escapeHtml(post.category)}</td><td class="cell-text">${escapeHtml(post.text.slice(0, 80))}${safeHref(post.permalink) ? ` <a class="link" href="${safeHref(post.permalink)}" target="_blank" rel="noreferrer">開く</a>` : ""}</td><td>${m.views || 0}</td><td>${m.likes || 0}</td><td>${m.replies || 0}</td><td>${m.reposts || 0}</td></tr>`).join("")}</tbody></table>`
+    ? `<table><thead><tr><th>公開</th><th>カテゴリ</th><th>本文</th><th>閲覧</th><th>いいね</th><th>返信</th><th>再投稿</th></tr></thead><tbody>${pagedSlice("posts", rows).map(({ post, m }) => `<tr><td>${fmtDate(post.publishedAt)}</td><td>${escapeHtml(post.category)}</td><td class="cell-text">${escapeHtml(post.text.slice(0, 80))}${safeHref(post.permalink) ? ` <a class="link" href="${safeHref(post.permalink)}" target="_blank" rel="noreferrer">開く</a>` : ""}</td><td>${m.views || 0}</td><td>${m.likes || 0}</td><td>${m.replies || 0}</td><td>${m.reposts || 0}</td></tr>`).join("")}</tbody></table>${pagerHtml("posts", rows.length)}`
     : `<p class="notice">データなし</p>`;
 
-  $("#suggestionList").innerHTML = state.suggestions.length ? state.suggestions.map((s) => `
+  $("#suggestionList").innerHTML = state.suggestions.length ? pagedSlice("sugg", state.suggestions).map((s) => `
     <article class="post-card">
       <div class="post-meta">${fmtDate(s.at)} / インサイト付き${s.basedOn}投稿をもとに生成</div>
       <p>${nl2br(s.summary)}</p>
@@ -702,7 +782,7 @@ function renderAnalysis() {
         <div><h4>文体・構成</h4><ul>${(s.styleNotes || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div>
       </div>
     </article>
-  `).join("") : `<p class="notice">改善提案はまだありません。インサイト付きの公開投稿が3件以上になると生成できます。</p>`;
+  `).join("") + pagerHtml("sugg", state.suggestions.length) : `<p class="notice">改善提案はまだありません。インサイト付きの公開投稿が3件以上になると生成できます。</p>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -724,7 +804,10 @@ function renderSettings() {
   $("#geminiStatus").textContent = s.geminiApiKey ? `APIキー設定済み / モデル: ${s.geminiModel || "自動（初回呼び出し時に決定）"}` : "APIキー未設定";
   $("#researchProviderNote").textContent = (s.aiProvider || "gemini") === "claude-api" ? "Web参照元の検索は Claude API では使えません（Gemini または Claude Code に切り替えてください）。" : "";
   $("#threadsAppId").value = s.threadsAppId || "";
+  $("#expectedThreadsUsername").value = s.expectedThreadsUsername || "";
   $("#threadsAppSecret").value = s.threadsAppSecret || "";
+  $("#threadsOAuthExchangeUrl").value = s.threadsOAuthExchangeUrl || "";
+  $("#threadsOAuthClientToken").value = s.threadsOAuthClientToken || "";
   $("#threadsRedirectUri").value = s.threadsRedirectUri || "";
   $("#threadsScopes").value = s.threadsScopes || "";
   $("#threadsAccessToken").value = s.threadsAccessToken || "";
@@ -735,6 +818,9 @@ function renderSettings() {
   $("#profile").value = s.profile || "";
   $("#writingRules").value = s.writingRules || "";
   $("#scheduleTimes").value = (s.scheduleTimes || []).join(",");
+  $("#postsPerDay").value = s.postsPerDay || 0;
+  $("#scheduleFromHour").value = s.scheduleFromHour ?? 7;
+  $("#scheduleToHour").value = s.scheduleToHour ?? 21;
   $("#autoPublishEnabled").checked = Boolean(s.autoPublishEnabled);
   $("#autoFetchRepliesEnabled").checked = s.autoFetchRepliesEnabled !== false;
   $("#autoFetchRepliesMinutes").value = s.autoFetchRepliesMinutes || 5;
@@ -742,6 +828,9 @@ function renderSettings() {
   $("#autoReplyIntervalSec").value = s.autoReplyIntervalSec || 20;
   $("#autoReplyDailyCap").value = s.autoReplyDailyCap || 500;
   $("#autoInsightsEnabled").checked = s.autoInsightsEnabled !== false;
+  $("#autoDeleteLowLikesEnabled").checked = Boolean(s.autoDeleteLowLikesEnabled);
+  $("#autoDeleteMaxLikes").value = Number.isInteger(s.autoDeleteMaxLikes) ? s.autoDeleteMaxLikes : 9;
+  $("#autoDeleteMaxReplies").value = Number.isInteger(s.autoDeleteMaxReplies) ? s.autoDeleteMaxReplies : 9;
 }
 
 // 設定タブのうち、入力欄ではない表示（接続状態・注記）だけを更新する。未保存編集があっても呼んでよい
@@ -772,7 +861,10 @@ function collectSettings() {
     geminiModel: $("#geminiModel").value,
     geminiModelAuto: $("#geminiModelAuto").checked,
     threadsAppId: $("#threadsAppId").value,
+    expectedThreadsUsername: $("#expectedThreadsUsername").value,
     threadsAppSecret: $("#threadsAppSecret").value,
+    threadsOAuthExchangeUrl: $("#threadsOAuthExchangeUrl").value,
+    threadsOAuthClientToken: $("#threadsOAuthClientToken").value,
     threadsRedirectUri: $("#threadsRedirectUri").value,
     threadsScopes: $("#threadsScopes").value,
     threadsAccessToken: $("#threadsAccessToken").value,
@@ -782,13 +874,19 @@ function collectSettings() {
     profile: $("#profile").value,
     writingRules: $("#writingRules").value,
     scheduleTimes: $("#scheduleTimes").value,
+    postsPerDay: $("#postsPerDay").value,
+    scheduleFromHour: $("#scheduleFromHour").value,
+    scheduleToHour: $("#scheduleToHour").value,
     autoPublishEnabled: $("#autoPublishEnabled").checked,
     autoFetchRepliesEnabled: $("#autoFetchRepliesEnabled").checked,
     autoFetchRepliesMinutes: $("#autoFetchRepliesMinutes").value,
     autoReplyEnabled: $("#autoReplyEnabled").checked,
     autoReplyIntervalSec: $("#autoReplyIntervalSec").value,
     autoReplyDailyCap: $("#autoReplyDailyCap").value,
-    autoInsightsEnabled: $("#autoInsightsEnabled").checked
+    autoInsightsEnabled: $("#autoInsightsEnabled").checked,
+    autoDeleteLowLikesEnabled: $("#autoDeleteLowLikesEnabled").checked,
+    autoDeleteMaxLikes: $("#autoDeleteMaxLikes").value,
+    autoDeleteMaxReplies: $("#autoDeleteMaxReplies").value
   };
 }
 
@@ -841,7 +939,7 @@ function bindEvents() {
   $("#reloadBtn").addEventListener("click", (e) => busy(e.currentTarget, "読込中", loadState));
 
   // リサーチ
-  $("#refSearchBtn").addEventListener("click", (e) => busy(e.currentTarget, "検索中", async () => {
+  $("#refSearchBtn").addEventListener("click", (e) => busy(e.currentTarget, "検索中（最大5分・Threads APIで見つからない場合はWeb検索に切り替わります）", async () => {
     const keyword = $("#refKeyword").value.trim();
     if (!keyword) throw new Error("キーワードを入力してください。");
     const result = await api("/api/references/search", { method: "POST", body: { keyword, searchType: $("#refSearchType").value } });
@@ -852,6 +950,45 @@ function bindEvents() {
     const result = await api("/api/replies/draft-batch", { method: "POST" });
     await loadState();
     toast(`下書き${result.drafted}件・要確認${result.held}件（10件ずつ処理します。未対応が残っていればもう一度押してください）。`);
+  }));
+  // 下書きのまま残っているコメント返信を、1件ずつ順に送る（個別送信と同じ /respond を使い、間隔は自動返信の間隔に合わせる）
+  $("#sendDraftsBtn").addEventListener("click", (e) => busy(e.currentTarget, "送信中（1件ずつ順に送っています）", async () => {
+    const drafts = state.replies.filter((r) => r.status === "drafted" && String(r.responseText || "").trim());
+    if (!drafts.length) { toast("送信できる下書きはありません。"); return; }
+    const gapSec = Math.max(5, Number(state.settings.autoReplyIntervalSec) || 20);
+    const eta = Math.ceil(((drafts.length - 1) * gapSec) / 60);
+    if (!window.confirm(`下書き${drafts.length}件を、Threadsにそのまま送信します（${gapSec}秒間隔・約${eta}分）。送信すると取り消せません。よろしいですか。`)) return;
+    let sent = 0;
+    const failed = [];
+    for (const [i, reply] of drafts.entries()) {
+      try {
+        await api(`/api/replies/${encodeURIComponent(reply.id)}/respond`, { method: "POST", body: { text: reply.responseText } });
+        sent += 1;
+      } catch (error) {
+        failed.push(`@${reply.username || "名前不明"}: ${error.message}`);
+      }
+      if (i < drafts.length - 1) await new Promise((resolve) => setTimeout(resolve, gapSec * 1000));
+    }
+    await loadState();
+    toast(`${drafts.length}件中、${sent}件を送信しました。${failed.length ? `失敗${failed.length}件` : ""}`, failed.length ? "error" : "info", 8000, failed.join(String.fromCharCode(10)));
+  }));
+  // 「要確認」のコメントを全部「対応しない」にする（返信は送らない。後から1件ずつ「未対応」に戻せる）
+  $("#ignoreHeldBtn").addEventListener("click", (e) => busy(e.currentTarget, "処理中", async () => {
+    const held = heldReplies();
+    if (!held.length) { toast("「要確認」のコメントはありません。"); return; }
+    if (!window.confirm(`「要確認」のコメント${held.length}件を、すべて「対応しない」にします（返信は送りません）。よろしいですか。`)) return;
+    let done = 0;
+    const failed = [];
+    for (const reply of held) {
+      try {
+        await api(`/api/replies/${encodeURIComponent(reply.id)}`, { method: "PUT", body: { status: "ignored", responseText: reply.responseText || "" } });
+        done += 1;
+      } catch (error) {
+        failed.push(`@${reply.username || "名前不明"}: ${error.message}`);
+      }
+    }
+    await loadState();
+    toast(`${held.length}件中、${done}件を「対応しない」にしました。${failed.length ? `失敗${failed.length}件` : ""}`, failed.length ? "error" : "info", 8000, failed.join(String.fromCharCode(10)));
   }));
   $("#refManualAddBtn").addEventListener("click", (e) => busy(e.currentTarget, "追加中", async () => {
     await api("/api/references", { method: "POST", body: { text: $("#refManualText").value, username: $("#refManualUser").value.replace(/^@/, ""), permalink: $("#refManualUrl").value } });
@@ -1003,7 +1140,7 @@ function bindEvents() {
     await busy(button, "テスト中（最大3分）", async () => {
       const result = await api("/api/ai-check", { method: "POST" });
       toast(`${{ gemini: "Gemini", "claude-code": "Claude Code", "claude-api": "Claude API", codex: "Codex" }[result.provider] || result.provider} に接続できました（${(result.ms / 1000).toFixed(1)}秒・応答「${result.greeting}」）。`, "ok", 6000, result.command ? `使ったコマンド: ${result.command}` : "");
-      await load({ keepSettingsForm: true });
+      await loadState({ keepSettingsForm: true });
     });
   });
   $("#autoGeminiModelBtn").addEventListener("click", async (e) => {

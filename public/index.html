@@ -203,6 +203,8 @@
               <h3>コメント返信</h3>
               <button class="button" id="fetchRepliesBtn">コメントを取得</button>
                   <button class="button secondary" id="draftBatchBtn">AIでまとめて下書き</button>
+                  <button class="button" id="sendDraftsBtn">下書きをまとめて送信</button>
+                  <button class="button" id="ignoreHeldBtn">要確認をまとめて「対応しない」にする</button>
             </div>
             <div class="filter-row" id="replyFilters">
               <button class="chip active" data-status="open">未対応</button>
@@ -291,8 +293,10 @@
             <div class="panel-head"><h3>2. Threads連携</h3></div>
             <div id="threadsConnection" class="connection-box"></div>
             <div class="form-grid">
+              <label>連携先として期待するユーザー名（@は不要。入れると、別のアカウントでの連携と投稿を止めます。空のままだと投稿・連携とも動きません）<input id="expectedThreadsUsername" autocomplete="off" placeholder="例: example_user" /></label>
               <label>Threads App ID（「ユースケース → Threads API → 設定」のID。「アプリの設定 → ベーシック」のアプリIDとは別）<input id="threadsAppId" autocomplete="off" /></label>
-              <label>Threads App Secret（同じ画面のシークレット）<input id="threadsAppSecret" type="password" autocomplete="off" /></label>
+              <label>Threads App Secret（同じ画面のシークレット）<input id="threadsAppSecret" type="password" autocomplete="off" /></label>              <label class="wide">OAuth Host URL (App Secretを相手PCに置かない場合。例: https://example.com/oauth-host)<input id="threadsOAuthExchangeUrl" autocomplete="off" /></label>
+              <label class="wide">OAuth Client Token (林側ホストで発行した共有用トークン)<input id="threadsOAuthClientToken" type="password" autocomplete="off" /></label>
               <label class="wide">Redirect URI（Meta側の設定と完全一致させる）<input id="threadsRedirectUri" autocomplete="off" /></label>
               <label class="wide">Scopes<input id="threadsScopes" autocomplete="off" /></label>
               <label class="wide">アクセストークン（手動で貼る場合のみ）<input id="threadsAccessToken" type="password" autocomplete="off" /></label>
@@ -331,7 +335,10 @@
             <div class="panel-head"><h3>4. 運用</h3></div>
             <div class="form-grid">
               <label class="wide">この画面のアクセスキー（任意・8文字以上。同じPCの別ユーザーや、外から開くときの合言葉。空欄なら不要）<input id="accessKey" type="password" autocomplete="off" /></label>
-              <label class="wide">予約時刻（カンマ区切り・日本時間）<input id="scheduleTimes" placeholder="07:00,09:00,11:00" /></label>
+              <label>1日の投稿数（1以上なら下の予約時刻は使わず、時間帯の中でランダムな時刻にします。0=下の固定時刻）<input id="postsPerDay" type="number" min="0" max="100" /></label>
+              <label>投稿の開始時（日本時間・0〜23）<input id="scheduleFromHour" type="number" min="0" max="23" /></label>
+              <label>投稿の終了時（日本時間・1〜24）<input id="scheduleToHour" type="number" min="1" max="24" /></label>
+              <label class="wide">予約時刻（1日の投稿数が0のときだけ使う・カンマ区切り・日本時間）<input id="scheduleTimes" placeholder="07:00,09:00,11:00" /></label>
               <label class="toggle-row"><input id="autoPublishEnabled" type="checkbox" /> 予約投稿の自動送信をON（このサーバーが起動している間だけ動作）</label>
             </div>
             <p class="notice">自動送信をONにしても、送られるのは「予約済み」の投稿だけです。承認待ちの投稿は送られません。</p>
@@ -344,6 +351,9 @@
               <label>返信の間隔（秒）<input id="autoReplyIntervalSec" type="number" min="5" max="600" /></label>
               <label>1日の返信上限（件）<input id="autoReplyDailyCap" type="number" min="1" max="1000" /></label>
               <label class="toggle-row"><input id="autoInsightsEnabled" type="checkbox" /> インサイトを1日1回自動で取り込む</label>
+              <label class="toggle-row"><input id="autoDeleteLowLikesEnabled" type="checkbox" /> ONにした後に公開した投稿のうち、公開から24時間たって、いいねとコメントがどちらも下の数以下のものだけを、Threadsから自動で削除する（どちらかが下の数より多ければ削除しません）（取り消せません。ONにする前の投稿は消しません。削除には、連携し直して「投稿の削除」の権限を付ける必要があります）</label>
+              <label>自動削除の対象にする「いいね」の数（この数以下）<input id="autoDeleteMaxLikes" type="number" min="0" max="1000" /></label>
+              <label>自動削除の対象にする「コメント」の数（この数以下）<input id="autoDeleteMaxReplies" type="number" min="0" max="1000" /></label>
             </div>
             <p class="notice">自動返信がOFFのときも、コメント返信タブの「AIでまとめて下書き」で10件ずつ判定と下書きだけ作れます。送信は「この内容で返信する」を押したときだけです。ONにすると、AIが「返信する」と判定したものは間隔と上限の範囲で自動送信され、一覧に「自動返信」と表示されます。相手をユーザー名で呼ぶ書き方はしません。</p>
           </div>

@@ -175,6 +175,30 @@ if ($nodeExe -and (Test-Path $mcpJsonPath)) {
     } catch { Write-Host "注意: .mcp.json の書き換えに失敗しました。PATH の node で起動します: $_" }
 }
 
+# Codex（~/.codex がある PC だけ）にも同じ MCP を登録する。Claude Code と Codex のどちらからでも操作できるようにする。
+# 既存の登録は置き換える（更新で二重にならない）。書き換え前の config.toml は .bak-threads-ops に控える
+$codexDir = [IO.Path]::Combine($env:USERPROFILE, ".codex")
+if ($nodeExe -and (Test-Path $codexDir)) {
+    try {
+        $codexToml = [IO.Path]::Combine($codexDir, "config.toml")
+        $codexOld = ""
+        if (Test-Path $codexToml) {
+            $codexOld = [System.IO.File]::ReadAllText($codexToml, [System.Text.Encoding]::UTF8)
+            Copy-Item $codexToml ($codexToml + ".bak-threads-ops") -Force
+        }
+        $mcpScript = ([IO.Path]::Combine($InstallPath, "mcp", "server.mjs")) -replace '\\', '/'
+        $nodeFwd = $nodeExe -replace '\\', '/'
+        $dataFwd = $DataDir -replace '\\', '/'
+        $codexBlock = "[mcp_servers.threads-ops]`ncommand = `"$nodeFwd`"`nargs = [`"$mcpScript`"]`n`n[mcp_servers.threads-ops.env]`nTHREADS_DATA_DIR = `"$dataFwd`"`n"
+        $codexClean = [regex]::Replace($codexOld, '(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|\z)', '')
+        $codexNew = if ($codexClean.Trim()) { $codexClean.TrimEnd() + "`n`n" + $codexBlock } else { $codexBlock }
+        Write-Utf8NoBom -Path $codexToml -Content $codexNew
+        Write-Host "Codex にも登録しました: $codexToml（Codex を開き直すと使えます）"
+    } catch { Write-Host "注意: Codex への登録に失敗しました（Claude Code の方は使えます）: $_" }
+} else {
+    Write-Host "Codex が見つからないため、Codex への登録は飛ばしました（入れたあとにもう一度このスクリプトを実行すると登録されます）"
+}
+
 # --- 5. 本体を安定した場所へ配置。データは別フォルダに置き、更新で消えないようにする ---
 $appItems = @("server.js", "start.js", "package.json", "public", "start-hidden.vbs", "register-autostart.ps1", "stop.ps1", "uninstall.ps1", "README.md", "アンインストール.md", "relay")
 foreach ($item in $appItems) {
@@ -189,12 +213,34 @@ foreach ($item in $appItems) {
 $cp932 = [System.Text.Encoding]::GetEncoding(932)
 $cmdFiles = @{
     "起動.cmd" = "@echo off`r`nsetlocal`r`ncd /d `"%~dp0`"`r`nwhere node >nul 2>nul`r`nif errorlevel 1 (`r`n  echo Node.js が見つかりません。https://nodejs.org から LTS 版をインストールしてください。`r`n  pause`r`n  exit /b 1`r`n)`r`nnode start.js`r`necho.`r`npause`r`n"
+    # 画面を開く入口。サーバーが止まっていれば起動してから開くので、ブラウザで直接URLを叩いたときの
+    # 「接続できません」を見なくて済む。黒い画面も残らない（閉じてサーバーを殺す事故が起きない）。
+    "開く.cmd" = "@echo off`r`ncd /d `"%~dp0`"`r`nwhere node >nul 2>nul`r`nif errorlevel 1 (`r`n  echo Node.js が見つかりません。https://nodejs.org から LTS 版をインストールしてください。`r`n  pause`r`n  exit /b 1`r`n)`r`nstart `"`" wscript.exe //nologo `"%~dp0start-hidden.vbs`" open`r`nexit /b 0`r`n"
     "停止.cmd" = "@echo off`r`ncd /d `"%~dp0`"`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0stop.ps1`"`r`necho.`r`npause`r`n"
     "アンインストール.cmd" = "@echo off`r`ncd /d `"%~dp0`"`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0uninstall.ps1`"`r`ncd /d `"%TEMP%`"`r`necho.`r`npause`r`n"
     "自動起動を登録.cmd" = "@echo off`r`ncd /d `"%~dp0`"`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0register-autostart.ps1`"`r`necho.`r`necho 次のログオンから自動で起動します（黒い画面は出ません）。今すぐ使うなら 起動.cmd を実行してください。`r`npause`r`n"
     "自動起動を解除.cmd" = "@echo off`r`ncd /d `"%~dp0`"`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0register-autostart.ps1`" -Remove`r`necho.`r`necho 自動起動を解除しました。起動中のサーバーは 停止.cmd で止められます。`r`npause`r`n"
 }
 foreach ($name in $cmdFiles.Keys) { [System.IO.File]::WriteAllText([IO.Path]::Combine($AppDir, $name), $cmdFiles[$name], $cp932) }
+
+# デスクトップに入口を1つ置く。http://localhost:4173 をブックマークすると、サーバーが止まっている間
+# 「接続できません」しか出ない。ショートカット経由なら、止まっていても起動してから画面が出る。
+try {
+    $ws = New-Object -ComObject WScript.Shell
+    $lnkPath = [IO.Path]::Combine([Environment]::GetFolderPath("Desktop"), "Threads運用アシスタント.lnk")
+    $lnk = $ws.CreateShortcut($lnkPath)
+    $lnk.TargetPath = [IO.Path]::Combine($AppDir, "開く.cmd")
+    $lnk.WorkingDirectory = $AppDir
+    $lnk.IconLocation = "shell32.dll,14"
+    $lnk.Description = "Threads運用アシスタントの画面を開く（止まっていれば起動してから開きます）"
+    $lnk.WindowStyle = 7
+    $lnk.Save()
+    if (Test-Path $lnkPath) { Write-Host "デスクトップに『Threads運用アシスタント』を置きました" }
+} catch {
+    # 失敗しても致命ではない（開く.cmd を直接叩けば同じ）。原因は丸めずそのまま出す
+    Write-Host "デスクトップのショートカットは作れませんでした: $($_.Exception.Message)"
+    Write-Host "  画面を開くときは $AppDir\開く.cmd をダブルクリックしてください"
+}
 $envText = "# Threads運用アシスタントの起動設定。install.ps1 が作成。データの置き場所はここで決まる`nTHREADS_DATA_DIR=$DataDir`n"
 Write-Utf8NoBom -Path ([IO.Path]::Combine($AppDir, "threads-ops.env")) -Content $envText
 Write-Host "本体を配置しました: $AppDir"
@@ -236,6 +282,7 @@ foreach ($f in @(
     [IO.Path]::Combine($AppDir, "stop.ps1"),
     [IO.Path]::Combine($AppDir, "uninstall.ps1"),
     [IO.Path]::Combine($AppDir, "起動.cmd"),
+    [IO.Path]::Combine($AppDir, "開く.cmd"),
     [IO.Path]::Combine($AppDir, "停止.cmd"),
     [IO.Path]::Combine($AppDir, "アンインストール.cmd")
 )) {

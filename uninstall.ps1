@@ -21,6 +21,10 @@ if (-not $Force) {
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 Write-Host "自動起動を解除しました"
 
+# 1-B. デスクトップの入口を消す（install.ps1 が置いたもの。残すと押しても何も起きない）
+$lnkPath = [IO.Path]::Combine([Environment]::GetFolderPath("Desktop"), "Threads運用アシスタント.lnk")
+if (Test-Path $lnkPath) { Remove-Item $lnkPath -Force -ErrorAction SilentlyContinue; Write-Host "デスクトップのショートカットを消しました" }
+
 # 2. 本体の停止（stop.ps1 と同じ手順）
 $stop = [IO.Path]::Combine($AppDir, "stop.ps1")
 if (Test-Path $stop) { & powershell -NoProfile -ExecutionPolicy Bypass -File $stop }
