@@ -436,6 +436,7 @@ function renderQueue() {
       </div>
       <div class="post-text">${nl2br(post.text)}</div>
       ${post.copyOverlapWarning ? `<div class="error-box">参考投稿との一致率が${post.copyOverlapWarning.ratio}%あります（「${escapeHtml(post.copyOverlapWarning.sourceSnippet)}...」と近い）。承認は本文を見直すか、内容を確認したうえで進めてください。</div>` : ""}
+      ${post.styleWarnings && post.styleWarnings.length ? `<div class="notice">出す前の確認（機械チェック・承認は止めません）: ${post.styleWarnings.map(escapeHtml).join(" / ")}</div>` : ""}
       ${post.error ? `<div class="error-box">${escapeHtml(post.error)}</div>` : ""}
       ${post.rejectReason ? `<div class="notice">却下理由: ${escapeHtml(post.rejectReason)}</div>` : ""}
     </article>
@@ -817,6 +818,9 @@ function renderSettings() {
   $("#defaultCta").value = s.defaultCta || "";
   $("#profile").value = s.profile || "";
   $("#writingRules").value = s.writingRules || "";
+  $("#replyStyle").value = s.replyStyle || "";
+  $("#materials").value = s.materials || "";
+  $("#materialFolder").value = s.materialFolder || "";
   $("#scheduleTimes").value = (s.scheduleTimes || []).join(",");
   $("#postsPerDay").value = s.postsPerDay || 0;
   $("#scheduleFromHour").value = s.scheduleFromHour ?? 7;
@@ -873,6 +877,9 @@ function collectSettings() {
     defaultCta: $("#defaultCta").value,
     profile: $("#profile").value,
     writingRules: $("#writingRules").value,
+    replyStyle: $("#replyStyle").value,
+    materials: $("#materials").value,
+    materialFolder: $("#materialFolder").value,
     scheduleTimes: $("#scheduleTimes").value,
     postsPerDay: $("#postsPerDay").value,
     scheduleFromHour: $("#scheduleFromHour").value,

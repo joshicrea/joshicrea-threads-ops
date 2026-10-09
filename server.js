@@ -18,7 +18,7 @@ import { execFile } from "node:child_process";
 import { readFile, writeFile, mkdir, rename, stat, copyFile, unlink, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { existsSync, chmodSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, chmodSync, readFileSync, unlinkSync, readdirSync, statSync } from "node:fs";
 import { extname, join, normalize, sep, dirname, delimiter } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -113,6 +113,8 @@ const defaultSettings = {
   threadsUserId: "",
   threadsUsername: "",
   autoStoppedByIdentity: false, // 連携先を確認できず自動停止したとき true。補充が自動投稿を勝手にONに戻さないための印
+  materials: "", // 本人が見せられるもの・素材（作品・商品・日常・実績・こだわり。写真が無くてもよい）。投稿はここと過去の投稿に実在するものだけを題材にする
+  materialFolder: "", // 素材フォルダ（このPC上のパス）。中の .md/.txt を読んで素材にし、写真・動画はファイル名だけ使う
   replyStyle: "", // 返信だけの文体（口調・絵文字）。空なら writingRules に従う。投稿の生成には効かない（補充の絵文字ゲートと食い違わせないため）
   expectedThreadsUsername: "", // 連携先として期待するユーザー名。設定すると、別のアカウントでの連携を拒否する（運用代行で他人の口座へ投稿しない）
   threadsAppId: "",
@@ -1192,8 +1194,7 @@ async function searchThreadsPostsViaWeb(settings, keyword) {
         items: {
           type: "object",
           properties: {
-            url: { type: "string" }, username: { type: "string" }, text: { type: "string" },
-            likes: { type: "number" }, replies: { type: "number" }, timestamp: { type: "string" }
+            url: { type: "string" }, username: { type: "string" }, text: { type: "string" }, timestamp: { type: "string" }
           },
           required: ["url", "username", "text"]
         }
@@ -1204,14 +1205,14 @@ async function searchThreadsPostsViaWeb(settings, keyword) {
   const prompt = [
     "Threads（threads.com）の公開投稿から、次のキーワードに関する投稿を集めてください。",
     "手順: WebSearch を allowed_domains に threads.com を指定して2〜3回（言い回しを変えて）実行し、URL が https://www.threads.com/@ユーザー名/post/ID の形のものだけを候補にする（プロフィールURLは除外）。",
-    "候補のうち反応が多そうなものから最大8件を WebFetch で開き、本文（全文）、ユーザー名（@なし）、いいね数、返信数、投稿日（YYYY-MM-DD）を読み取る。",
-    "ログインが必要・本文が読めないページは除外する。本文はページに書かれているものをそのまま使い、要約や創作をしない。",
+    "候補のうち、検索結果の抜粋に本文が見えているものから最大8件を選び、検索結果に表示された抜粋を一字も変えずに text に入れる。ユーザー名（@なし）は URL から取る。投稿日は検索結果に書かれているときだけ入れる（YYYY-MM-DD）。",
+    "ページは開かない（Threads はログイン画面に遮られ、開くと本文やいいね数を創作してしまうため、WebFetch は使わない）。いいね数・返信数は取れないので出力しない。抜粋が見えない候補は除外する。要約・補完・創作をしない。",
     `キーワード: ${keyword}`
   ].join("\n");
   const { text } = provider === "codex"
     ? await codexSerial(() => callCodexText(settings, prompt.replace("WebSearch を allowed_domains に threads.com を指定して", "Web検索で「site:threads.com」を付けて"), { schema, search: true, timeoutMs: THREADS_WEB_SEARCH_TIMEOUT_MS }))
     : await claudeSerial(() => callClaudeCodeText(settings, prompt, {
-      system: jsonOnlySystemPrompt(schema), tools: "WebSearch,WebFetch", maxTurns: 24, timeoutMs: THREADS_WEB_SEARCH_TIMEOUT_MS
+      system: jsonOnlySystemPrompt(schema), tools: "WebSearch", maxTurns: 12, timeoutMs: THREADS_WEB_SEARCH_TIMEOUT_MS
     }));
   const parsed = parseJsonLoose(text);
   const seen = new Set();
@@ -1230,14 +1231,14 @@ async function searchThreadsPostsViaWeb(settings, keyword) {
       permalink: `https://www.threads.com/@${m[1]}/post/${m[2]}`,
       timestamp: String(p.timestamp || ""),
       mediaType: "TEXT",
-      metrics: { likes: Number(p.likes) || 0, replies: Number(p.replies) || 0 },
+      metrics: null, // 検索結果の抜粋だけを使うので、いいね数・返信数は取れない（0と表示して誤解させない）
       selected: false,
       analysis: null,
       // 2026-09-23: WebFetchはThreadsのようなJS必須ページの実データを取得できず、
       // もっともらしい値を創作することを対照実験で確認した（curlで実データ0件のページから
       // 具体的なフォロワー数・いいね数が返る再現性あり）。この経路で得た数値・本文は未検証として扱う。
       unverified: true,
-      unverifiedReason: "WebFetch経由のためいいね数・本文が実在するか未確認。採用前に本人アカウントで目視確認してください。",
+      unverifiedReason: "Web検索結果の抜粋のみ。全文といいね数は未取得で、途中で切れている場合があります。型の分析に使う前に、リンク先で全文を目視確認してください。",
       createdAt: nowIso()
     });
   }
@@ -1779,6 +1780,45 @@ function senderBlock(settings) {
   ].join("\n");
 }
 
+// 素材フォルダの読み取り。直下の .md/.txt を最大20件・1件1500字・合計6000字まで本文として、写真・動画はファイル名だけ（最大30件）を返す。
+// 読めない・存在しないときは空を返す（投稿の生成を止めない）。ドットで始まるファイルと、秘密らしい名前のファイルは読まない。
+const MATERIAL_TEXT_EXT = new Set([".md", ".txt"]);
+const MATERIAL_MEDIA_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".mp4", ".mov"]);
+const MATERIAL_SKIP_NAME = /(secret|password|passwd|token|credential|\.env|apikey|api_key|鍵|パスワード)/i;
+function readMaterialFolder(folder) {
+  const dir = String(folder || "").trim();
+  const out = { texts: [], media: [], error: "" };
+  if (!dir) return out;
+  try {
+    if (!statSync(dir).isDirectory()) { out.error = "素材フォルダがフォルダではありません"; return out; }
+    let budget = 6000;
+    for (const name of readdirSync(dir).sort()) {
+      if (name.startsWith(".") || MATERIAL_SKIP_NAME.test(name)) continue;
+      const ext = extname(name).toLowerCase();
+      if (MATERIAL_TEXT_EXT.has(ext) && out.texts.length < 20 && budget > 0) {
+        const body = readFileSync(join(dir, name), "utf8").replace(/\s+\n/g, "\n").trim().slice(0, Math.min(1500, budget));
+        if (body) { out.texts.push({ name, body }); budget -= body.length; }
+      } else if (MATERIAL_MEDIA_EXT.has(ext) && out.media.length < 30) {
+        out.media.push(name);
+      }
+    }
+  } catch (error) {
+    out.error = `素材フォルダを読めません: ${String(error.message || error).slice(0, 120)}`;
+  }
+  return out;
+}
+
+// 発信者が実際に見せられる素材。投稿案はここに書かれたものと過去の投稿に実在するものだけを題材にする。
+function materialsBlock(settings) {
+  const lines = [];
+  const free = String(settings?.materials || "").trim();
+  if (free) lines.push(`見せられるもの・素材（本人の記入）: ${free}`);
+  const folder = readMaterialFolder(settings?.materialFolder);
+  for (const t of folder.texts) lines.push(`素材ファイル ${t.name}: ${t.body.replace(/\n+/g, " / ")}`);
+  if (folder.media.length) lines.push(`写真・動画のファイル名（中身は見えない。名前から分かることだけ使う）: ${folder.media.join(", ")}`);
+  return lines;
+}
+
 function latestMetricsByPost(db) {
   const map = new Map();
   for (const item of db.insights) {
@@ -1808,6 +1848,7 @@ function buildDraftPrompt(db, request) {
     "",
     "## 発信者",
     senderBlock(settings),
+    ...materialsBlock(settings),
     "",
     "## 今回の条件",
     `目的: ${request.goal || "認知拡大"}`,
@@ -1854,11 +1895,13 @@ function buildDraftPrompt(db, request) {
   lines.push(...profilePromptLines());
   lines.push(
     "## 書き方",
-    "- カテゴリは Tips / 本音・共感 / 失敗談 / 問いかけ / ツール紹介 / 導線 / 実績 / 観察 から分散させる（同じカテゴリを3本以上続けない）。ただし、自然に質問できない内容を無理に「問いかけ」へ寄せない",
+    "- 型は 共感の問いかけ（「これわかる人いる？」のように、同じ立場の人が手を挙げたくなるもの）／ 作品・日常・好きなものを見せる（見てほしい、認められたい気持ちに応えるもの）／ 年代や立場への呼びかけ ／ 前向きな価値観の宣言 ／ 熱意・こだわり ／ 導線 から分散させる（同じ型を3本以上続けない）。自然に質問できない内容を無理に「問いかけ」へ寄せない",
+    "- 書かないもの: マウント（人と比べて上に立つ・自慢で見下す）／ 自虐（できない自分を責める・失敗を笑いにする）／ 愚痴・批判・不安をあおる話 ／ 手順や理由を細かく長く教える解説。読んだ人が少しでも嫌な気持ちになりそうなものは、型が合っていても出さない",
+    "- 話題は、上の発信者のプロフィール・事業内容に書かれた分野・人柄・好きなものから選ぶ。書かれていない分野の話、経験、資格、作品、数字は作らない。作品・商品・日常・実績を見せる投稿は、上の「見せられるもの・素材」「素材ファイル」、プロフィール、過去の投稿に実在が確認できるものだけにし、無ければ共感の問いかけにする（写真や作品が無い発信者も多い。素材が無いことを理由に、無い物を作らない）",
     request.language === "en"
-      ? `- 1投稿は自然な英語で120〜400文字（Threadsの上限${THREADS_TEXT_LIMIT}文字を超えない）。日本語の直訳にせず、海外の読者に向けて書く。改行で読みやすく。${emojiRule(db.settings)}`
-      : `- 1投稿は日本語で80〜350文字（Threadsの上限${THREADS_TEXT_LIMIT}文字を超えない）。改行で読みやすく。${emojiRule(db.settings)}`,
-    "- 順番は投稿順（朝はTips・ツール紹介、夜は共感・失敗談・問いかけ）",
+      ? `- 1投稿は自然な英語で60〜250文字（Threadsの上限${THREADS_TEXT_LIMIT}文字を超えない）。日本語の直訳にせず、海外の読者に向けて書く。短い行で改行。${emojiRule(db.settings)}`
+      : `- 1投稿は日本語で30〜150文字（Threadsの上限${THREADS_TEXT_LIMIT}文字を超えない）。1行は20字前後で改行し、短い行を重ねる。${emojiRule(db.settings)}`,
+    "- 順番は投稿順（朝は前向きな価値観・作品・日常、夜は共感の問いかけ・呼びかけ）",
     "- 質問で終える場合は、本文の流れから自然につながる、答えやすい質問を1つだけにする。疑問文を複数入れない",
     "- 「どう思いますか？」「何を感じますか？」「この話から何を持ち帰りますか？」のような、本文と関係が薄い汎用質問や翻訳調の質問で締めない",
     "- 質問が自然でない投稿は、疑問符を足さず、気づき・余韻・短い提案で終える",
@@ -1906,7 +1949,9 @@ function replyEmojiRule(settings) {
 }
 function replyStyleLines(settings) {
   const style = String(settings?.replyStyle || "").trim();
-  return style ? [`- 返信の文体（この発信者の声。他の書き方より優先して従う）:\n${style}`] : [];
+  return style
+    ? [`- 返信の文体（この発信者の声。上の「文体ルール」と同じ人の声として書き、食い違う点はこちらに従う。他の書き方より優先する）:\n${style}`]
+    : ["- 返信の文体: 上の「文体ルール」の口調・言葉づかいに合わせる（返信専用の指定はない）"];
 }
 
 function buildReferenceAnalysisPrompt(settings, references) {
@@ -1966,7 +2011,7 @@ function buildReplyDraftPrompt(settings, post, reply) {
     "## 書き方",
     "- 発信者自身の体験・実績・日常を作らない（「私も」「うちも」「レジュフラワーも〜することが多い」「作ることが多いので」など）。共感は、相手の話への感想で示す。相手の書いた内容（続柄・数・名前・物）を言い換えるときは、書かれたとおりに読む（例: grandniece は「姪の娘」で、「姪」ではない）。分からない言葉は言い換えずに、そのまま受ける",
     "- 返信は、コメントと同じ言語で書く。コメントが英語なら必ず英語で返し、日本語を混ぜない（日本語のコメントには日本語）。投稿が日本語でも、コメントの言語に合わせる",
-    `- 日本語は40〜120文字、英語は60〜240文字。売り込まない。${replyEmojiRule(settings)}`,
+    `- 長さと雰囲気は相手のコメントに合わせる。一言・短文なら返信も1〜2文（20〜50文字）、ふつうの長さなら40〜90文字、体験を語る長文で熱量が高いなら80〜150文字まで。相手の文字数の2倍を超えて書かない。敬語かくだけた口調か・感嘆符や絵文字の量・改行の有無も相手に寄せる（英語も同じ考え方で、上限は240文字）。売り込まない。${replyEmojiRule(settings)}`,
     ...replyStyleLines(settings),
     "- 返信は「相手が書いていないこと」を足す。コメントの言葉を言い換えて褒めるだけ・繰り返すだけの返信は書かない（例: 「ころんとしたシーサー」というコメントに「ころんとしたシーサー可愛いですね」は不可）。足せるのは、受け取って嬉しかった一言、発信者本人の立場からの短い補足、相手の活動への関心のどれか",
     "- 相手の投稿の画像・作品は、あなたには見えない。見えないものを褒めたり描写したりしない。作品や写真を見れば分かること（景色・色・形・雰囲気・何を作ったか）を、聞かない・説明させない・当てずっぽうで書かない（不可の例: 「どんな景色をイメージしたんですか?」「どんな雰囲気の作品か気になります」。相手の投稿に既に出ているため）",
@@ -2414,7 +2459,7 @@ function buildReplyBatchPrompt(settings, items) {
     "## 書き方（reply のとき）",
     "- 発信者自身の体験・実績・日常を作らない（「私も」「うちも」「レジュフラワーも〜することが多い」「作ることが多いので」など）。共感は、相手の話への感想で示す。相手の書いた内容（続柄・数・名前・物）を言い換えるときは、書かれたとおりに読む（例: grandniece は「姪の娘」で、「姪」ではない）。分からない言葉は言い換えずに、そのまま受ける",
     "- 返信は、コメントと同じ言語で書く。コメントが英語なら必ず英語で返し、日本語を混ぜない（日本語のコメントには日本語）。投稿が日本語でも、コメントの言語に合わせる",
-    `- 日本語は40〜120文字、英語は60〜240文字。売り込まない。${replyEmojiRule(settings)}`,
+    `- 長さと雰囲気は相手のコメントに合わせる。一言・短文なら返信も1〜2文（20〜50文字）、ふつうの長さなら40〜90文字、体験を語る長文で熱量が高いなら80〜150文字まで。相手の文字数の2倍を超えて書かない。敬語かくだけた口調か・感嘆符や絵文字の量・改行の有無も相手に寄せる（英語も同じ考え方で、上限は240文字）。売り込まない。${replyEmojiRule(settings)}`,
     ...replyStyleLines(settings),
     "- 返信は「相手が書いていないこと」を足す。コメントの言葉を言い換えて褒めるだけ・繰り返すだけの返信は書かない（例: 「ころんとしたシーサー」というコメントに「ころんとしたシーサー可愛いですね」は不可）。足せるのは、受け取って嬉しかった一言、発信者本人の立場からの短い補足、相手の活動への関心のどれか",
     "- 相手の投稿の画像・作品は、あなたには見えない。見えないものを褒めたり描写したりしない。作品や写真を見れば分かること（景色・色・形・雰囲気・何を作ったか）を、聞かない・説明させない・当てずっぽうで書かない（不可の例: 「どんな景色をイメージしたんですか?」「どんな雰囲気の作品か気になります」。相手の投稿に既に出ているため）",
@@ -3436,7 +3481,7 @@ function sanitizeSettings(current, input) {
       next[key] = Boolean(value);
       continue;
     }
-    const limit = { brandName: 100, defaultCta: 500, profile: 3000, writingRules: 3000, threadsScopes: 500, geminiModel: 100, anthropicModel: 100, threadsAppId: 64, threadsOAuthExchangeUrl: 500 }[key] || 2000;
+    const limit = { brandName: 100, defaultCta: 500, profile: 3000, writingRules: 3000, replyStyle: 3000, materials: 3000, materialFolder: 500, threadsScopes: 500, geminiModel: 100, anthropicModel: 100, threadsAppId: 64, threadsOAuthExchangeUrl: 500 }[key] || 2000;
     next[key] = String(value ?? "").trim().slice(0, limit);
   }
   if (next.threadsScopes && !next.threadsScopes.includes("threads_basic")) {
@@ -3451,10 +3496,37 @@ function findOr404(list, itemId, label) {
   return item;
 }
 
+// 出す前の機械チェック（警告のみ・承認は止めない）。マイナスに働く型（自虐・マウント・愚痴・長すぎ・解説っぽい）を拾う。
+// 守備範囲: キーワードと文字数だけ。言い換えられた自虐や、文脈で成り立つマウントは拾えない（見ていない層）。
+const STYLE_WARNING_MAX_CHARS = 150; // 日本語の目安
+const STYLE_WARNING_MAX_CHARS_EN = 250; // 英語の投稿の目安（日本語文字が3割未満のとき）
+const STYLE_WARNING_RULES = [
+  { name: "自虐に読める言い回し", regex: /(自分|私|僕|俺)(なんて|は|には)(どうせ)?(ダメ|だめ|無能|無理|何もできない|才能がない)|どうせ(私|自分|僕)|ポンコツ|情けない|ダメな(私|自分|僕)|才能(が|は)ない(?!から(じゃ|では)|じゃなく|ではなく)/ },
+  { name: "マウントに読める言い回し", regex: /情弱|底辺|格差|(知らない|できない|やらない)(人|やつ)(は|が)(損|遅れ|終わ)|上位\d+%|(年収|月収|収入)\d+|\d+万円(稼|達成|突破)|フォロワー\d+万|(まだ|いまだに).{0,10}(してるの|使ってるの)/ },
+  { name: "愚痴・批判に読める言い回し", regex: /最悪|うんざり|ムカつ|腹が立|許せない|ふざけ(るな|んな)|いい加減にして/ }
+];
+function styleWarnings(text) {
+  const t = String(text || "").trim();
+  if (!t) return [];
+  const out = [];
+  const chars = [...t];
+  const n = chars.length;
+  const jaRatio = chars.filter((c) => /[぀-ヿ㐀-鿿]/.test(c)).length / n;
+  const limit = jaRatio < 0.3 ? STYLE_WARNING_MAX_CHARS_EN : STYLE_WARNING_MAX_CHARS;
+  if (n > limit) out.push(`長すぎます（${n}字。短く伝わる型は${limit}字以内）`);
+  const steps = t.split("\n").filter((line) => /^\s*(\d+[.．)）]|[①-⑩]|[-・●]\s*)/.test(line)).length;
+  if (steps >= 3) out.push(`手順や項目が${steps}つ並んでいます（解説っぽい。詳しく教える型は避ける）`);
+  for (const rule of STYLE_WARNING_RULES) {
+    const m = t.match(rule.regex);
+    if (m) out.push(`${rule.name}があります（「${m[0].slice(0, 20)}」）`);
+  }
+  return out;
+}
+
 function statePayload(db) {
   return {
     settings: publicSettings(db.settings),
-    posts: db.posts,
+    posts: db.posts.map((p) => (p.status === "published" || p.replyToId ? p : { ...p, styleWarnings: styleWarnings(p.text) })),
     replies: db.replies,
     insights: db.insights,
     research: db.research,
@@ -4288,6 +4360,7 @@ const server = createServer(async (req, res) => {
 // テスト用に内部関数を公開する（購入者が使うAPIではない）
 export { appendErrorLog };
 export const _internals = {
+  styleWarnings,
   recoverPublishing, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, sanitizeLogMeta, isTransientThreadsError, isThreadsMissingObjectError, boundedBackoffMs, applyReplyFetchFailures, recordAutoDeleteFailureForTest: recordAutoDeleteFailure, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
   toStrictSchema,
   REPLY_TEXT_BLOCKLIST,
