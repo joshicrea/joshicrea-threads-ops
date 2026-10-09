@@ -21,6 +21,7 @@ const START_HINT = process.platform === "win32" ? "起動.cmd" : "起動.command
 // threads_update_settings が受け付けるキー。ここに無いもの（accessKey・トークン・API キー等の秘密）は本体へ送らない
 const SETTINGS_PROPS = {
   brandName: { type: "string" }, profile: { type: "string" }, writingRules: { type: "string" }, defaultCta: { type: "string" },
+  replyStyle: { type: "string", description: "返信だけの文体（任意）。空なら投稿の文体ルールに合わせる" }, materials: { type: "string", description: "見せられるもの・素材（作品・商品・日常・実績・こだわり。任意）" }, materialFolder: { type: "string", description: "素材フォルダ（このPC上のパス。任意）。中の .md/.txt を読む" },
   scheduleTimes: { type: "string", description: "例: 07:00,12:00,20:00（日本時間）" },
   aiProvider: { type: "string", enum: ["claude-code", "codex", "gemini", "claude-api"] }, claudeModel: { type: "string", enum: ["sonnet", "opus", "haiku"] },
   autoPublishEnabled: { type: "boolean" }, autoFetchRepliesEnabled: { type: "boolean" }, autoFetchRepliesMinutes: { type: "integer" },
