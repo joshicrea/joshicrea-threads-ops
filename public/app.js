@@ -329,11 +329,16 @@ function renderReferences() {
   } else {
     box.hidden = true;
   }
-  $("#refList").innerHTML = refs.length ? refs.map((ref) => `
+  // 並べ替え: 反応の多い順は、いいね数が取れている投稿を先に（多い順）、反応数なしは追加した順のまま後ろへ
+  const likesOf = (r) => (r.metrics && Number.isFinite(Number(r.metrics.likes)) && r.metrics.likes !== null ? Number(r.metrics.likes) : null);
+  const sorted = $("#refSort") && $("#refSort").value === "likes"
+    ? [...refs].sort((a, b) => (likesOf(b) ?? -1) - (likesOf(a) ?? -1))
+    : refs;
+  $("#refList").innerHTML = refs.length ? sorted.map((ref) => `
     <article class="ref-card ${ref.selected ? "selected" : ""}">
       <label class="ref-head">
         <input type="checkbox" data-ref-toggle="${ref.id}" ${ref.selected ? "checked" : ""} />
-        <span class="post-meta">${ref.username ? `@${escapeHtml(ref.username)}` : "手動追加"}${ref.keyword ? ` / 「${escapeHtml(ref.keyword)}」` : ""}${ref.timestamp ? ` / ${fmtDate(ref.timestamp)}` : ""}${ref.metrics ? ` / いいね ${Number(ref.metrics.likes) || 0} / 返信 ${Number(ref.metrics.replies) || 0}` : ""}${ref.unverified ? ` / <strong style="color:#c0392b">未検証（AI取得・要目視確認）</strong>` : ""}</span>
+        <span class="post-meta">${ref.username ? `@${escapeHtml(ref.username)}` : "手動追加"}${ref.keyword ? ` / 「${escapeHtml(ref.keyword)}」` : ""}${ref.timestamp ? ` / ${fmtDate(ref.timestamp)}` : ""}${likesOf(ref) !== null ? ` / いいね ${likesOf(ref)}${ref.metrics.replies !== null && ref.metrics.replies !== undefined ? ` / 返信 ${Number(ref.metrics.replies) || 0}` : ""}` : " / 反応数なし"}${ref.unverified ? ` / <strong style="color:#c0392b">未検証（AI取得・要目視確認）</strong>` : ""}</span>
         <span class="spacer"></span>
         ${safeHref(ref.permalink) ? `<a class="link" href="${safeHref(ref.permalink)}" target="_blank" rel="noreferrer">元投稿</a>` : ""}
         <button class="small-button ghost" data-ref-delete="${ref.id}" type="button">削除</button>
@@ -823,6 +828,14 @@ function renderSettings() {
   $("#materialFolder").value = s.materialFolder || "";
   $("#scheduleTimes").value = (s.scheduleTimes || []).join(",");
   $("#postsPerDay").value = s.postsPerDay || 0;
+  $("#rebuzzEnabled").checked = Boolean(s.rebuzzEnabled);
+  $("#rebuzzPerDay").value = s.rebuzzPerDay ?? 5;
+  $("#rebuzzMinViews").value = s.rebuzzMinViews ?? 500;
+  $("#rebuzzCooldownDays").value = s.rebuzzCooldownDays ?? 7;
+  $("#repostEnabled").checked = Boolean(s.repostEnabled);
+  $("#repostPerDay").value = s.repostPerDay ?? 3;
+  $("#repostMinViews").value = s.repostMinViews ?? 500;
+  $("#repostCooldownDays").value = s.repostCooldownDays ?? 14;
   $("#scheduleFromHour").value = s.scheduleFromHour ?? 7;
   $("#scheduleToHour").value = s.scheduleToHour ?? 21;
   $("#autoPublishEnabled").checked = Boolean(s.autoPublishEnabled);
@@ -882,6 +895,14 @@ function collectSettings() {
     materialFolder: $("#materialFolder").value,
     scheduleTimes: $("#scheduleTimes").value,
     postsPerDay: $("#postsPerDay").value,
+    rebuzzEnabled: $("#rebuzzEnabled").checked,
+    rebuzzPerDay: $("#rebuzzPerDay").value,
+    rebuzzMinViews: $("#rebuzzMinViews").value,
+    rebuzzCooldownDays: $("#rebuzzCooldownDays").value,
+    repostEnabled: $("#repostEnabled").checked,
+    repostPerDay: $("#repostPerDay").value,
+    repostMinViews: $("#repostMinViews").value,
+    repostCooldownDays: $("#repostCooldownDays").value,
     scheduleFromHour: $("#scheduleFromHour").value,
     scheduleToHour: $("#scheduleToHour").value,
     autoPublishEnabled: $("#autoPublishEnabled").checked,
@@ -949,9 +970,22 @@ function bindEvents() {
   $("#refSearchBtn").addEventListener("click", (e) => busy(e.currentTarget, "検索中（最大5分・Threads APIで見つからない場合はWeb検索に切り替わります）", async () => {
     const keyword = $("#refKeyword").value.trim();
     if (!keyword) throw new Error("キーワードを入力してください。");
-    const result = await api("/api/references/search", { method: "POST", body: { keyword, searchType: $("#refSearchType").value } });
+    const result = await api("/api/references/search", { method: "POST", body: { keyword, searchType: $("#refSearchType").value, minLikes: $("#refMinLikes").value } });
     await loadState();
-    toast(`${result.via === "web" ? "Web検索経由で" : "Threads APIで"}${result.found}件見つかり、${result.added}件を候補に追加しました。`);
+    const note = result.minLikes > 0 ? `（いいね${result.minLikes}未満の${result.belowMin}件は除きました。反応数が取れた投稿は${result.withMetrics}件）` : (result.withMetrics === 0 ? "（反応数は取れませんでした）" : "");
+    toast(`${result.via === "web" ? "Web検索経由で" : "Threads APIで"}${result.found}件見つかり、${result.added}件を候補に追加しました。${note}`);
+  }));
+  $("#refSort").addEventListener("change", renderReferences);
+  $("#refAccountBtn").addEventListener("click", (e) => busy(e.currentTarget, "集めています", async () => {
+    const username = $("#refAccount").value.trim().replace(/^@/, "");
+    if (!username) throw new Error("アカウント名を入力してください。");
+    const minLikes = Math.max(0, Math.floor(Number($("#refMinLikes").value) || 0));
+    const result = await api("/api/profile-posts", { method: "POST", body: { username, limit: 100, save: true } });
+    await loadState();
+    const hit = (result.posts || []).filter((p) => p.likes !== null && p.likes >= minLikes).length;
+    toast(result.withMetrics
+      ? `@${result.username}の投稿${result.count}件のうち、${result.saved}件を候補に追加しました（いいね${minLikes}以上は${hit}件。並べ替えで上に出ます）。`
+      : `@${result.username}の投稿${result.count}件を候補に追加しました。反応数は取れませんでした。`);
   }));
   $("#draftBatchBtn").addEventListener("click", (e) => busy(e.currentTarget, "AIがまとめて判定中", async () => {
     const result = await api("/api/replies/draft-batch", { method: "POST" });
@@ -998,7 +1032,9 @@ function bindEvents() {
     toast(`${held.length}件中、${done}件を「対応しない」にしました。${failed.length ? `失敗${failed.length}件` : ""}`, failed.length ? "error" : "info", 8000, failed.join(String.fromCharCode(10)));
   }));
   $("#refManualAddBtn").addEventListener("click", (e) => busy(e.currentTarget, "追加中", async () => {
-    await api("/api/references", { method: "POST", body: { text: $("#refManualText").value, username: $("#refManualUser").value.replace(/^@/, ""), permalink: $("#refManualUrl").value } });
+    await api("/api/references", { method: "POST", body: { text: $("#refManualText").value, username: $("#refManualUser").value.replace(/^@/, ""), permalink: $("#refManualUrl").value, likes: $("#refManualLikes").value, replies: $("#refManualReplies").value } });
+    $("#refManualLikes").value = "";
+    $("#refManualReplies").value = "";
     $("#refManualText").value = "";
     $("#refManualUser").value = "";
     $("#refManualUrl").value = "";

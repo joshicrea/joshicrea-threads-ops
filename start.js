@@ -4,8 +4,13 @@
 // プラグイン配布ではデータの置き場所（THREADS_DATA_DIR）をここで渡す。
 import { exec } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { setPriority, constants as osConstants } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+// タスクスケジューラ経由の起動は低優先度（BelowNormal）を引き継ぎ、PCが忙しいと画面が10秒超かかった（2026-10-18）。通常に戻す。
+// 上げられない環境（権限など）では今の優先度のまま動かす。
+try { setPriority(0, osConstants.priority.PRIORITY_NORMAL); } catch { /* 優先度を変えられなくても起動は続ける */ }
 
 const here = dirname(fileURLToPath(import.meta.url));
 const envFile = join(here, "threads-ops.env");
@@ -15,6 +20,15 @@ if (existsSync(envFile)) {
     if (!m || line.trim().startsWith("#")) continue;
     if (process.env[m[1]] === undefined || process.env[m[1]] === "") process.env[m[1]] = m[2].replace(/^"(.*)"$/, "$1");
   }
+}
+
+// データ置き場の検査（2026-10-10: THREADS_DATA_DIR が「アプリのフォルダ\」で渡され、空のデータのまま 5173/6173 が正常起動したように見えた）。
+// 末尾の区切り文字は外し（resolve）、アプリのフォルダそのものを指していたら起動しない。
+if (process.env.THREADS_DATA_DIR) process.env.THREADS_DATA_DIR = resolve(process.env.THREADS_DATA_DIR);
+if (process.env.THREADS_DATA_DIR && resolve(process.env.THREADS_DATA_DIR).toLowerCase() === resolve(here).toLowerCase()) {
+  console.error(`THREADS_DATA_DIR がアプリのフォルダを指しているため起動しません: ${process.env.THREADS_DATA_DIR}`);
+  console.error("data-<アカウント名> のようなデータ用のフォルダを指定してください。");
+  process.exit(2);
 }
 
 const { startServer, appendErrorLog } = await import("./server.js");
@@ -56,11 +70,26 @@ function openBrowser() {
   exec(opener);
 }
 
+async function writeStartupErrorLog(originalError) {
+  try {
+    await appendErrorLog(originalError);
+    return true;
+  } catch (logError) {
+    appendLifecycle("start-error-log-failed", {
+      code: logError.code || "",
+      originalCode: originalError.code || ""
+    });
+    console.error("Failed to write startup error log:", logError.code || "UNKNOWN");
+    return false;
+  }
+}
+
 try {
   appendLifecycle("start-attempt");
   await startServer(port);
   appendLifecycle("start-listening");
 } catch (error) {
+  process.exitCode = 1;
   appendLifecycle("start-error", { code: error.code || "", message: String(error.message || "").slice(0, 200) });
   if (error.code === "EADDRINUSE") {
     if (await alreadyRunningHere()) {
@@ -69,14 +98,14 @@ try {
       openBrowser();
     } else {
       console.log(`ポート${port}を別のプログラムが使っています。そのプログラムを終了するか、環境変数 PORT で別の番号を指定してください。`);
-      await appendErrorLog(error);
+      await writeStartupErrorLog(error);
     }
   } else {
     console.error("起動に失敗しました:", error.message);
-    await appendErrorLog(error);
-    console.error("詳細は data/server-error.log に記録しました。");
+    if (await writeStartupErrorLog(error)) {
+      console.error("詳細は data/server-error.log に記録しました。");
+    }
   }
-  process.exitCode = 1;
 } finally {
   if (!process.exitCode) {
     console.log("Threads運用アシスタントを起動しました。");

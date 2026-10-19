@@ -159,7 +159,18 @@ const defaultSettings = {
   scheduleTimes: ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"],
   postsPerDay: 0, // 1以上なら scheduleTimes ではなく、開始時〜終了時を本数ぶんに等分し、各枠の中でランダムな時刻にする
   scheduleFromHour: 7,
-  scheduleToHour: 21
+  scheduleToHour: 21,
+  // バズ投稿の再投稿: 過去に反応が大きかった投稿を、同じ文面のまま新しい投稿として予約する
+  rebuzzEnabled: false,
+  rebuzzPerDay: 5, // 1日に再投稿する本数（0〜50）。開始時〜終了時（postsPerDayと同じ時間帯）に散らす
+  rebuzzMinViews: 500, // 閲覧数がこの数以上の投稿だけを再投稿の候補にする
+  // 自分の投稿の自動リポスト: 反応の大きい自分の投稿を、Threadsのリポスト機能で1日N回、時間帯の中に散らして再露出する（投稿の複製ではない）
+  repostEnabled: false,
+  repostPerDay: 3, // 1日のリポスト回数（0〜50）
+  repostMinViews: 500, // 閲覧数がこの数以上の投稿だけを対象にする
+  repostCooldownDays: 14, // 同じ投稿を次にリポストするまで空ける日数
+  nextRepostAt: "", // 次にリポストしてよい時刻（内部用）
+  rebuzzCooldownDays: 7 // 同じ投稿を再投稿してから、次に再投稿するまで空ける日数（公開から3日未満の投稿は数字が育っていないので対象にしない）
 };
 
 const SCHEMA_VERSION = 2; // db.json の形式番号。上げたら loadDb の移行処理に追記する
@@ -366,6 +377,175 @@ function sanitizeLogMeta(value, key = "") {
   return String(value).slice(0, 200);
 }
 
+
+const DIAGNOSTIC_AREAS = new Set([
+  "threads_api", "reply_fetch_post", "reply_fetch_followup", "reply_fetch_me", "reply_fetch_followup_batch",
+  "ai_reply_draft", "post_publish", "post_publish_rate_limit", "post_publish_maybe_published"
+]);
+const DIAGNOSTIC_ENDPOINTS = new Set([
+  "unknown", "ai_provider", "/me", "/me/threads", "/me/threads_publish", "/me/replies", "/keyword_search", "/profile_posts",
+  "/{id}", "/{id}/replies", "/{id}/insights", "/{id}/manage_reply", "/oauth/access_token", "/refresh_access_token"
+]);
+const DIAGNOSTIC_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+const DIAGNOSTIC_RESPONSE_STAGES = new Set(["unknown", "local_before_request", "network_no_response", "http_error_response", "api_response", "ai_provider_no_response"]);
+
+function diagnosticToken(value, fallback = "unknown") {
+  const s = String(value || "").trim();
+  return /^[A-Za-z0-9_.-]{1,64}$/.test(s) ? s : fallback;
+}
+
+function diagnosticMethod(value) {
+  const method = String(value || "GET").toUpperCase();
+  return DIAGNOSTIC_METHODS.has(method) ? method : "GET";
+}
+
+function endpointKindForThreadsPath(path) {
+  let pathname = String(path || "").split("?")[0];
+  if (/^https?:/i.test(pathname)) {
+    try { pathname = new URL(pathname).pathname; } catch { return "unknown"; }
+  }
+  pathname = pathname.replace(/^\/v\d+\.\d+(?=\/)/, "");
+  if (pathname.endsWith("/oauth/access_token") || pathname.endsWith("/access_token")) return "/oauth/access_token";
+  if (pathname.endsWith("/refresh_access_token")) return "/refresh_access_token";
+  if (DIAGNOSTIC_ENDPOINTS.has(pathname)) return pathname;
+  if (/^\/[^/]+\/replies$/.test(pathname)) return "/{id}/replies";
+  if (/^\/[^/]+\/insights$/.test(pathname)) return "/{id}/insights";
+  if (/^\/[^/]+\/manage_reply$/.test(pathname)) return "/{id}/manage_reply";
+  if (/^\/[^/]+$/.test(pathname)) return "/{id}";
+  return "unknown";
+}
+
+function diagnosticHash(value) {
+  const raw = String(value || "");
+  if (!raw) return "";
+  return createHash("sha256").update("diag:v1:" + raw).digest("hex").slice(0, 12);
+}
+
+function diagnosticHttpStatus(error) {
+  const n = Number(error?.status || error?.httpStatus || 0);
+  return Number.isInteger(n) && n >= 100 && n <= 599 ? n : 0;
+}
+
+function diagnosticErrorClass(error, area = "") {
+  const status = diagnosticHttpStatus(error);
+  const code = `${error?.cause?.code || error?.cause?.name || error?.code || error?.diagnostic?.causeCode || error?.name || ""}`.toUpperCase();
+  const text = `${error?.message || ""} ${error?.apiMessage || ""}`;
+  if (/CERT|SELF_SIGNED|UNABLE_TO_VERIFY|DEPTH_ZERO_SELF_SIGNED/.test(code) || /certificate|self-signed/i.test(text)) return "tls_certificate";
+  if (/ENOTFOUND|EAI_AGAIN/.test(code)) return "dns_error";
+  if (/TIMEOUT|TIMEDOUT|ABORT/.test(code) || /timeout/i.test(text)) return "network_timeout";
+  if (error?.network) return "network_error";
+  if (status === 429 || isRateLimitError(error)) return "rate_limit";
+  if (status === 401) return "auth_token";
+  if (status === 403) return "permission";
+  if (isThreadsMissingObjectError(error) || status === 404) return "missing_object";
+  if (status >= 500) return "server_error";
+  if (status >= 400) return "api_error";
+  if (error instanceof HttpError) return "local_validation";
+  if (area.startsWith("ai_")) return "ai_provider_error";
+  return "unknown";
+}
+
+function diagnosticResponseStage(error, explicit = "") {
+  if (DIAGNOSTIC_RESPONSE_STAGES.has(explicit)) return explicit;
+  if (error?.network) return "network_no_response";
+  if (diagnosticHttpStatus(error)) return "http_error_response";
+  if (error instanceof HttpError) return "local_before_request";
+  return "unknown";
+}
+
+function diagnosticMeta({ area = "unknown", endpointKind = "", method = "", error = null, targetId = "", transient, terminal, maybePublished, responseStage = "" } = {}) {
+  const rawBase = error?.diagnostic && typeof error.diagnostic === "object" ? error.diagnostic : {};
+  const baseArea = DIAGNOSTIC_AREAS.has(rawBase.area) ? rawBase.area : "unknown";
+  const baseEndpoint = DIAGNOSTIC_ENDPOINTS.has(rawBase.endpointKind) ? rawBase.endpointKind : "unknown";
+  const baseResponseStage = DIAGNOSTIC_RESPONSE_STAGES.has(rawBase.responseStage) ? rawBase.responseStage : "";
+  const safeArea = DIAGNOSTIC_AREAS.has(area) ? area : baseArea;
+  const safeEndpoint = DIAGNOSTIC_ENDPOINTS.has(endpointKind) ? endpointKind : baseEndpoint;
+  const safeMethod = diagnosticMethod(method || rawBase.method || "GET");
+  const out = {
+    v: 1,
+    area: safeArea,
+    endpointKind: safeEndpoint,
+    method: safeMethod,
+    errorClass: diagnosticErrorClass(error, safeArea),
+    responseStage: diagnosticResponseStage(error, responseStage || baseResponseStage),
+    errorName: diagnosticToken(error?.name || rawBase.errorName || ""),
+    causeName: diagnosticToken(error?.cause?.name || rawBase.causeName || ""),
+    causeCode: diagnosticToken(error?.cause?.code || error?.code || rawBase.causeCode || "")
+  };
+  const status = diagnosticHttpStatus(error) || Number(rawBase.httpStatus || 0);
+  if (Number.isInteger(status) && status >= 100 && status <= 599) out.httpStatus = status;
+  if (targetId) out.targetHash = diagnosticHash(targetId);
+  if (typeof transient === "boolean") out.transient = transient;
+  if (typeof terminal === "boolean") out.terminal = terminal;
+  if (typeof maybePublished === "boolean") out.maybePublished = maybePublished;
+  return out;
+}
+
+// 送信診断は本文・URL・API原文を持たない。旧エラーの自動復帰には使わない。
+const SEND_STAGES = new Set(["identity", "content_gate", "container_create", "media_status", "publish", "reconcile", "complete", "unknown"]);
+const SEND_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EPIPE", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET", "TimeoutError", "AbortError", "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNSPECIFIED"]);
+function classifySendFailure(error) {
+  const stage = SEND_STAGES.has(error?.stage) ? error.stage : "unknown";
+  const rawCode = String(error?.cause?.code || error?.cause?.name || error?.code || error?.diagnostic?.causeCode || error?.name || "");
+  const causeCode = SEND_CODES.has(rawCode) ? rawCode : "unknown";
+  const httpStatus = diagnosticHttpStatus(error);
+  const tls = /CERT|TLS|SELF_SIGNED|UNABLE_TO_VERIFY/.test(rawCode) || error?.diagnostic?.errorClass === "tls_certificate";
+  let kind = tls ? "tls_validation" : /ENOTFOUND|EAI_AGAIN/.test(causeCode) ? "dns_error"
+    : /TIMEOUT|TIMEDOUT|Timeout|Abort/.test(causeCode) ? "network_timeout"
+    : error?.network ? "network_error" : httpStatus >= 500 ? "server_error"
+    : isRateLimitError(error) ? "rate_limit" : error?.identityMismatch ? "identity_mismatch" : "other";
+  const unknown = !!error?.maybePublished || error?.outcome === "unknown" || stage === "reconcile"
+    || (stage === "publish" && (!!error?.network || httpStatus >= 500)) || stage === "unknown";
+  const outcome = unknown ? "unknown" : "not_sent";
+  const temporary = ["dns_error", "network_timeout", "server_error", "rate_limit"].includes(kind)
+    || (kind === "network_error" && ["ECONNRESET", "ECONNREFUSED", "EPIPE", "UND_ERR_SOCKET"].includes(causeCode));
+  const retryable = !tls && !error?.identityMismatch && outcome === "not_sent"
+    && ((["identity", "container_create", "media_status"].includes(stage) && temporary)
+      || (kind === "rate_limit" && stage === "publish"));
+  return { stage, kind, outcome, retryable, ...(httpStatus ? { httpStatus } : {}), causeCode };
+}
+
+function recordSendAttempt(item, error, { result = "failed", operation = "post" } = {}) {
+  const success = result === "success";
+  const failure = success ? { stage: "complete", kind: "none", outcome: "sent", retryable: false, causeCode: "unknown" } : classifySendFailure(error);
+  const entry = { attemptedAt: nowIso(), operation: operation === "reply" ? "reply" : "post", result: success ? "success" : "failed", ...failure };
+  // retryableも構造化された判定結果。自由文は一切コピーしない。
+  item.sendAttempts = [...(Array.isArray(item.sendAttempts) ? item.sendAttempts.slice(-19) : []), entry];
+  item.sendAttemptCount = (Number.isSafeInteger(item.sendAttemptCount) && item.sendAttemptCount >= 0 ? item.sendAttemptCount : 0) + 1;
+  if (success) { delete item.sendFailure; delete item.sendUncertainAt; }
+  else { item.sendFailure = { ...entry }; if (failure.outcome === "unknown") item.sendUncertainAt ||= entry.attemptedAt; }
+  return entry;
+}
+
+// このアプリ自身が書いた固定文（外部APIの本文を含まない）は、そのまま画面に出してよい。印は own() で付ける
+function own(message) {
+  const e = new Error(message);
+  e.safeToShow = true;
+  return e;
+}
+
+function safeSendError(error) {
+  if (error && error.safeToShow === true) return new Error(String(error.message));
+  const f = classifySendFailure(error);
+  return new Error("送信処理を停止しました（段階: " + f.stage + " / 分類: " + f.kind + " / 結果: " + f.outcome + "）");
+}
+
+function sanitizeSendFailure(error) {
+  const failure = classifySendFailure(error);
+  error.retryable = failure.retryable;
+  error.outcome = failure.outcome;
+  error.sendRateLimited = failure.kind === "rate_limit";
+  error.diagnostic = diagnosticMeta({ error, endpointKind: error?.diagnostic?.endpointKind || "unknown", method: error?.diagnostic?.method || "POST" });
+  error.code = failure.causeCode;
+  error.cause = undefined;
+  error.apiMessage = "";
+  error.apiStatus = "";
+  error.detail = "";
+  error.message = safeSendError(error).message;
+  error.stack = new Error(error.message).stack;
+  return error;
+}
+
 function maskSecret(value) {
   return value ? "*".repeat(String(value).length) : "";
 }
@@ -467,6 +647,7 @@ class ExternalApiError extends Error {
 // Threads（Graph API）のレート制限: HTTP 429 のほか、HTTP 400 + error.code 4 / 17 / 32 / 613 で返ることがある
 function isRateLimitError(error) {
   if (!(error instanceof ExternalApiError)) return false;
+  if (error.sendRateLimited === true) return true;
   return error.status === 429 || [4, 17, 32, 613].includes(error.apiCode) || /rate limit|too many|request limit/i.test(error.apiMessage || "");
 }
 
@@ -1249,8 +1430,10 @@ async function searchThreadsPostsViaWeb(settings, keyword) {
 // Threads API
 // ---------------------------------------------------------------------------
 async function threadsFetch(path, { method = "GET", params = {}, token } = {}) {
+  const endpointKind = endpointKindForThreadsPath(path);
+  const safeMethod = diagnosticMethod(method);
   const url = new URL(path.startsWith("http") ? path : `${THREADS_API}${path}`);
-  const body = method === "POST" ? new URLSearchParams() : null;
+  const body = safeMethod === "POST" ? new URLSearchParams() : null;
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null || value === "") continue;
     if (body) body.set(key, String(value));
@@ -1262,14 +1445,19 @@ async function threadsFetch(path, { method = "GET", params = {}, token } = {}) {
   }
   let res;
   try {
-    res = await fetch(url, { method, body, signal: AbortSignal.timeout(30_000) });
+    res = await fetch(url, { method: safeMethod, body, signal: AbortSignal.timeout(30_000) });
   } catch (error) {
     const code = error?.cause?.code || error?.cause?.name || error?.name || "";
     const failure = new Error(`Threadsへ通信できませんでした（${code || "原因不明"}）`);
     failure.network = true;
+    failure.diagnostic = diagnosticMeta({ area: "threads_api", endpointKind, method: safeMethod, error, responseStage: "network_no_response" });
     throw failure;
   }
-  if (!res.ok) throw new ExternalApiError("Threads", res.status, await res.text());
+  if (!res.ok) {
+    const failure = new ExternalApiError("Threads", res.status, await res.text());
+    failure.diagnostic = diagnosticMeta({ area: "threads_api", endpointKind, method: safeMethod, error: failure, responseStage: "http_error_response" });
+    throw failure;
+  }
   return res.json();
 }
 
@@ -1595,8 +1783,12 @@ async function assertContentGate(post) {
 }
 
 async function publishThreadsPost(settings, post, { onContainer } = {}) {
+  if (post.sendUncertainAt) { const e = new HttpError(409, "以前の公開結果が未確認のため送信を止めています。"); e.stage = "reconcile"; throw e; }
+  let stage = "identity";
+  try {
   const token = requireToken(settings);
   await assertPublishIdentity(settings, token);
+  stage = "content_gate";
   await assertContentGate(post);
   if (!post.text?.trim() && post.format === "TEXT") throw new HttpError(400, "本文が空です。");
   if (post.format !== "TEXT" && !post.mediaUrl) throw new HttpError(400, "IMAGE/VIDEO投稿にはメディアURL（公開URL）が必要です。");
@@ -1609,9 +1801,12 @@ async function publishThreadsPost(settings, post, { onContainer } = {}) {
     topic_tag: post.topicTag ? post.topicTag.replace(/^#/, "") : undefined,
     reply_to_id: post.replyToId || undefined
   };
+  stage = "container_create";
   const created = await threadsFetch("/me/threads", { method: "POST", params, token });
+  if (!created?.id) throw new HttpError(502, "作成結果を読み取れないため公開を停止しました。");
   if (onContainer) await onContainer(String(created.id || "")).catch((error) => appendErrorLog(error));
 
+  stage = "media_status";
   if (post.format !== "TEXT") {
     // メディアは処理に時間がかかる。status が FINISHED になるまで最大60秒待つ。
     for (let i = 0; i < 20; i += 1) {
@@ -1623,20 +1818,24 @@ async function publishThreadsPost(settings, post, { onContainer } = {}) {
     }
   }
 
+  stage = "publish";
   let lastError;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const published = await threadsFetch("/me/threads_publish", { method: "POST", params: { creation_id: created.id }, token });
+      if (!published?.id) throw Object.assign(new Error("公開結果を読み取れないため送信を停止しました。"), { maybePublished: true });
       let permalink = "";
       try {
         const detail = await threadsFetch(`/${published.id}`, { params: { fields: "permalink" }, token });
         permalink = detail.permalink || "";
       } catch (error) {
-        await appendErrorLog(error);
+        await appendErrorLog(safeSendError(error));
       }
       return { id: String(published.id || ""), permalink };
     } catch (error) {
       lastError = error;
+      // 公開リクエストの通信が切れた（送信中のスリープ→復帰時の ECONNRESET 等）。Threads は受け付けている可能性がある（2026-10-06 実測）
+      if (error?.maybePublished || error?.network || diagnosticHttpStatus(error) >= 500 || !diagnosticHttpStatus(error)) { error.maybePublished = true; throw error; }
       // テキスト投稿でも作成直後の publish が「準備中」「resource does not exist」で失敗することがある（2026-09-20 返信で実測）。少し待って再試行。
       if (attempt < 2 && /not ready|media id is not available|try again|does not exist/i.test(error.apiMessage || "")) {
         await sleep(5_000);
@@ -1646,6 +1845,11 @@ async function publishThreadsPost(settings, post, { onContainer } = {}) {
     }
   }
   throw lastError;
+  } catch (error) {
+    error.stage = stage;
+    // API原文には入力本文が含まれることがある。以降のログ/例外は匿名分類だけにする。
+    throw sanitizeSendFailure(error);
+  }
 }
 
 async function fetchThreadsInsights(settings, post) {
@@ -1700,15 +1904,21 @@ async function fetchThreadsReplies(settings, post, knownIds = new Set()) {
 // キーワード検索: scope threads_keyword_search が必要。1ユーザー 24時間あたり2,200クエリ（公式ドキュメント 2026-09-19確認）。
 async function searchThreadsPosts(settings, keyword, searchType = "TOP") {
   const token = requireToken(settings);
-  const data = await threadsFetch("/keyword_search", {
-    params: {
-      q: keyword,
-      search_type: searchType === "RECENT" ? "RECENT" : "TOP",
-      fields: "id,text,media_type,permalink,timestamp,username,has_replies",
-      limit: 25
-    },
-    token
-  });
+  // 反応数（like_count 等）の項目名は公式で未確認のため、最初は反応数つきで試し、項目名の誤りで拒否されたら本文系だけで取り直す（listProfilePosts と同じ）
+  const baseFields = "id,text,media_type,permalink,timestamp,username,has_replies";
+  let data;
+  for (const fields of [`${baseFields},like_count,reply_count,repost_count,quote_count`, baseFields]) {
+    try {
+      data = await threadsFetch("/keyword_search", {
+        params: { q: keyword, search_type: searchType === "RECENT" ? "RECENT" : "TOP", fields, limit: 25 },
+        token
+      });
+      break;
+    } catch (error) {
+      const fieldRejected = error instanceof ExternalApiError && error.apiCode === 100 && /field/i.test(error.apiMessage || "");
+      if (!fieldRejected || fields === baseFields) throw error;
+    }
+  }
   return (data.data || [])
     .filter((item) => item.text)
     .map((item) => ({
@@ -1721,10 +1931,18 @@ async function searchThreadsPosts(settings, keyword, searchType = "TOP") {
       permalink: item.permalink || "",
       timestamp: item.timestamp || "",
       mediaType: item.media_type || "TEXT",
+      metrics: metricsFrom(item.like_count, item.reply_count, item.repost_count, item.quote_count),
       selected: false,
       analysis: null,
       createdAt: nowIso()
     }));
+}
+
+// 反応数を { likes, replies, reposts, quotes } にそろえる。1つも数値でなければ null（0と表示して誤解させない）
+function metricsFrom(likes, replies, reposts, quotes) {
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : (typeof v === "string" && /^\d{1,9}$/.test(v.trim()) ? Number(v) : null));
+  const m = { likes: num(likes), replies: num(replies), reposts: num(reposts), quotes: num(quotes) };
+  return Object.values(m).every((v) => v === null) ? null : m;
 }
 
 // 特定ユーザー1アカウントの公開投稿を一覧する: scope threads_profile_discovery が必要（公開アカウントのみ・公式の説明は Meta アプリ画面）。
@@ -1963,7 +2181,9 @@ function buildReferenceAnalysisPrompt(settings, references) {
     senderBlock(settings),
     "",
     "## 投稿一覧（id と本文）",
-    ...references.map((ref) => `[${ref.id}] ${ref.text.replace(/\s+/g, " ").slice(0, 500)}`),
+    ...references.map((ref) => `[${ref.id}]${ref.metrics && ref.metrics.likes !== null ? ` (いいね${ref.metrics.likes}${ref.metrics.replies !== null ? `・返信${ref.metrics.replies}` : ""})` : ""} ${ref.text.replace(/\s+/g, " ").slice(0, 500)}`),
+    "",
+    "（括弧の数字は、その投稿の実際の反応数です。数字がある投稿は、数字の大きさの違いを踏まえて、反応を集めた投稿に共通する型を挙げてください。数字の無い投稿の反応数を推測しないでください）",
     "",
     "## 出力の指示",
     "- items: 各投稿について hook（冒頭1行で注意を引いている仕掛け）・structure（本文の構造を3〜5語の並びで）・whyItWorks（反応を集める理由）・howToAdapt（この発信者ならどう置き換えるか、具体的に1〜2文）",
@@ -2124,6 +2344,7 @@ function normalizePost(input) {
     threadsId: input.threadsId || "",
     permalink: input.permalink || "",
     origin: input.origin || "manual",
+    rebuzzOf: input.rebuzzOf || "",
     strategyMemo: input.strategyMemo || "",
     createdAt: input.createdAt || nowIso(),
     updatedAt: nowIso(),
@@ -2311,11 +2532,16 @@ function assignSchedule(settings, dateStr, count) {
 }
 
 async function markPublished(db, post, result, message) {
+  if (post.sendUncertainAt) {
+    post.sendConfirmedAt = nowIso();
+    delete post.sendUncertainAt;
+    delete post.sendFailure;
+  } else recordSendAttempt(post, null, { result: "success" });
   post.status = "published";
   post.threadsId = result.id;
   post.permalink = result.permalink || "";
-  post.publishedAt = nowIso();
-  post.updatedAt = post.publishedAt;
+  post.publishedAt = result.publishedAt || nowIso(); // 照合で直すときは Threads 側の公開時刻（24時間判定を照合時刻から数え直さない）
+  post.updatedAt = nowIso();
   post.error = "";
   delete post.publishing;
   delete post.publishFailedAt;
@@ -2326,14 +2552,14 @@ async function markPublished(db, post, result, message) {
 
 function markPublishError(db, post, error, message) {
   post.status = "error";
-  post.error = error.message;
+  recordSendAttempt(post, error);
+  post.error = safeSendError(error).message;
   post.updatedAt = nowIso();
   post.publishFailedAt = nowIso();
   delete post.publishing;
   delete post.retryAfter;
-  delete post.retryCount;
   recordMonitoringEvent(db, "safe_error", { error, area: "post_publish" });
-  log(db, "error", message, { postId: post.id, error: error.message, detail: error.detail || "" });
+  log(db, "error", message, { postId: post.id, failure: post.sendFailure, diagnostic: diagnosticMeta({ area: "post_publish", endpointKind: error?.diagnostic?.endpointKind || "unknown", method: error?.diagnostic?.method || "POST", error, targetId: post.id, transient: isTransientThreadsError(error), terminal: isThreadsMissingObjectError(error), maybePublished: !!error?.maybePublished }) });
 }
 
 // 直近の自分の投稿に同じ本文があるか（送信中に落ちた投稿・失敗扱いの投稿を送り直す前の二重投稿検査）
@@ -2344,10 +2570,51 @@ async function findRecentSameText(settings, text, sinceMs) {
   return (data.data || []).find((item) => String(item.text || "").trim() === wanted && (!sinceMs || Date.parse(item.timestamp || "") >= sinceMs)) || null;
 }
 
+function threadsTimestampIso(value) {
+  const ms = Date.parse(String(value || ""));
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+}
+
+// 失敗扱い（error・Threads ID なし）の投稿が、実は Threads に出ていないかを本文で照合する（6時間ごと・失敗から7日以内）。
+// 起きる場面: 公開の通信中に PC がスリープ→復帰時に ECONNRESET（2026-10-06 実測）。送り直さない限り照合されず、自動削除・インサイトの対象から外れていた。
+// 一致が1件なら公開済みに直す（公開時刻は Threads の timestamp）。2件以上は二重投稿の可能性があるので直さずログへ。
+const RECONCILE_FAILED_INTERVAL_MS = 6 * 60 * 60_000;
+const RECONCILE_FAILED_WINDOW_MS = 7 * 24 * 60 * 60_000;
+let lastReconcileFailedAt = 0;
+async function reconcileFailedPublishes(snapshot) {
+  if (Date.now() - lastReconcileFailedAt < RECONCILE_FAILED_INTERVAL_MS) return;
+  const pending = snapshot.posts.filter((p) => p.status === "error" && p.sendFailure && !p.threadsId && p.publishFailedAt && !p.textChangedAfterFailure
+    && String(p.text || "").trim() && Date.now() - Date.parse(p.publishFailedAt) < RECONCILE_FAILED_WINDOW_MS);
+  if (!pending.length) return;
+  lastReconcileFailedAt = Date.now();
+  const data = await threadsFetch("/me/threads", { params: { fields: "id,text,permalink,timestamp", limit: 50 }, token: requireToken(snapshot.settings) });
+  const linked = new Set(snapshot.posts.map((p) => String(p.threadsId || "")).filter(Boolean));
+  for (const item of pending) {
+    const failedMs = Date.parse(item.publishFailedAt);
+    const createdMs = Date.parse(item.createdAt || "") || 0;
+    // 失敗を記録した時刻より後の公開や、この投稿を作る前の公開は、この投稿のものではない
+    const hits = (data.data || []).filter((it) => String(it.text || "").trim() === String(item.text).trim() && !linked.has(String(it.id))
+      && Date.parse(it.timestamp || "") <= failedMs + 5 * 60_000 && Date.parse(it.timestamp || "") >= createdMs - 5 * 60_000);
+    if (!hits.length) continue;
+    await withDb(async (db) => {
+      const post = db.posts.find((x) => x.id === item.id);
+      if (!post || post.status !== "error" || post.threadsId) return { save: false };
+      if (hits.length > 1) {
+        log(db, "error", `失敗扱いの投稿と同じ本文が Threads に ${hits.length} 件あります。二重投稿の可能性があるため、自動では直していません。`, { postId: post.id, threadsIds: hits.map((h) => String(h.id)) });
+        return;
+      }
+      const hit = hits[0];
+      if (db.posts.some((x) => String(x.threadsId || "") === String(hit.id))) return { save: false }; // 同じ本文の失敗投稿が2件あり、先の1件に紐付け済み
+      await markPublished(db, post, { id: String(hit.id), permalink: hit.permalink || "", publishedAt: threadsTimestampIso(hit.timestamp) },
+        "失敗扱いだった投稿がThreads側で公開済みだったため、公開済みに直しました。");
+    });
+  }
+}
+
 // 送信中（publishing）のまま残った投稿を Threads 側の実状態に合わせる。
 // 起きる場面: 送信中にサーバーが落ちた／公開後の DB 保存に失敗した。
 async function recoverPublishing(snapshot) {
-  const stuck = snapshot.posts.filter((post) => post.publishing && !inFlight.has(post.id));
+  const stuck = snapshot.posts.filter((post) => post.publishing && !inFlight.has(post.id) && (!post.publishing.reconcileAfter || Date.parse(post.publishing.reconcileAfter) <= Date.now()));
   for (const item of stuck) {
     const startedAt = Date.parse(item.publishing.startedAt || "") || 0;
     if (Date.now() - startedAt < 2 * 60 * 1000) continue; // 送信中かもしれない（別プロセスの猶予）
@@ -2356,7 +2623,7 @@ async function recoverPublishing(snapshot) {
     try {
       // 先に本文一致で探す（公開後のメディアIDと permalink がそのまま取れる）。無ければコンテナの状態で判定する
       const found = await findRecentSameText(snapshot.settings, item.text, startedAt - 5 * 60 * 1000);
-      if (found) published = { id: String(found.id), permalink: found.permalink || "" };
+      if (found) published = { id: String(found.id), permalink: found.permalink || "", publishedAt: threadsTimestampIso(found.timestamp) };
       if (!published && item.publishing.containerId) {
         const container = await threadsFetch(`/${item.publishing.containerId}`, { params: { fields: "status,permalink" }, token: requireToken(snapshot.settings) });
         if (container.status === "PUBLISHED") published = { id: item.publishing.containerId, permalink: container.permalink || "" };
@@ -2372,17 +2639,13 @@ async function recoverPublishing(snapshot) {
         return;
       }
       if (checkError) {
-        log(db, "error", "送信中に中断した投稿の状態を確認できませんでした。次回もう一度確認します。", { postId: post.id, error: checkError.message });
-        return { save: false };
+        log(db, "error", "送信中に中断した投稿の状態を確認できませんでした。次回もう一度確認します。", { postId: post.id, diagnostic: diagnosticMeta({ area: "post_publish", error: checkError }) });
+        post.publishing.reconcileAfter = new Date(Date.now() + SCHEDULE_RETRY_INTERVAL_MS).toISOString();
+        return;
       }
-      const prev = post.publishing.prevStatus || "approved";
-      delete post.publishing;
-      if (prev === "scheduled") {
-        post.status = "scheduled";
-        log(db, "info", "送信中に中断した予約投稿はThreads側に無かったため、予約に戻して送り直します。", { postId: post.id });
-      } else {
-        markPublishError(db, post, new Error("送信中に中断しました。Threads側には見つからなかったので、承認し直してから公開してください。"), "送信中に中断した投稿を失敗扱いにしました。");
-      }
+      post.sendUncertainAt ||= nowIso();
+      post.publishing.reconcileAfter = new Date(Date.now() + SCHEDULE_RETRY_INTERVAL_MS).toISOString();
+      log(db, "error", "公開結果を確定できないため送信を停止したまま照合を待ちます。", { postId: post.id });
     });
   }
   // 返信も同じ: sendingAt のまま残ったものは、既に自分の返信が付いていれば返信済み、無ければ要確認へ
@@ -2392,7 +2655,7 @@ async function recoverPublishing(snapshot) {
     try {
       owned = await alreadyRepliedByMe(snapshot.settings, item.id);
     } catch (error) {
-      await appendErrorLog(error);
+      await appendErrorLog(safeSendError(error));
       continue;
     }
     await withDb(async (db) => {
@@ -2554,7 +2817,11 @@ async function fetchFollowUpReplies(snapshot, knownIds) {
       });
     } catch (error) {
       if (/does not exist|Unsupported get request|cannot be loaded/i.test(`${error.message} ${error.detail || ""}`)) found.deadParentIds.push(parent.id);
-      else found.failures.push({ postId: "", error: `返信への返信の取得に失敗: ${error.message}`, detail: error.detail || "" });
+      else {
+        const transient = isTransientThreadsError(error);
+        const terminal = isThreadsMissingObjectError(error);
+        found.failures.push({ postId: "", error: `返信への返信の取得に失敗: ${error.message}`, detail: error.detail || "", diagnostic: diagnosticMeta({ area: "reply_fetch_followup", endpointKind: "/{id}/replies", method: "GET", error, targetId: parent.id, transient, terminal }) });
+      }
       continue;
     }
     for (const item of data.data || []) {
@@ -2615,7 +2882,9 @@ async function collectNewReplies(snapshot) {
     try {
       fetched.push(...await fetchThreadsReplies(snapshot.settings, post, knownIds));
     } catch (error) {
-      failures.push({ postId: post.id, transient: isTransientThreadsError(error), terminal: isThreadsMissingObjectError(error), error: error.message, detail: error.detail || "" });
+      const transient = isTransientThreadsError(error);
+      const terminal = isThreadsMissingObjectError(error);
+      failures.push({ postId: post.id, transient, terminal, error: error.message, detail: error.detail || "", diagnostic: diagnosticMeta({ area: "reply_fetch_post", endpointKind: "/{id}/replies", method: "GET", error, targetId: post.id, transient, terminal }) });
     }
   }
   try {
@@ -2629,13 +2898,17 @@ async function collectNewReplies(snapshot) {
       });
     }
   } catch (error) {
-    failures.push({ postId: "", error: `返信への返信の取得に失敗: ${error.message}`, detail: error.detail || "" });
+    const transient = isTransientThreadsError(error);
+    const terminal = isThreadsMissingObjectError(error);
+    failures.push({ postId: "", error: `返信への返信の取得に失敗: ${error.message}`, detail: error.detail || "", diagnostic: diagnosticMeta({ area: "reply_fetch_followup_batch", endpointKind: "/{id}/replies", method: "GET", error, transient, terminal }) });
   }
   let repliedByMe = new Map();
   try {
     repliedByMe = await fetchMyRepliedToIds(snapshot.settings);
   } catch (error) {
-    failures.push({ postId: "", error: `自分の返信一覧の取得に失敗: ${error.message}`, detail: error.detail || "" });
+    const transient = isTransientThreadsError(error);
+    const terminal = isThreadsMissingObjectError(error);
+    failures.push({ postId: "", error: `自分の返信一覧の取得に失敗: ${error.message}`, detail: error.detail || "", diagnostic: diagnosticMeta({ area: "reply_fetch_me", endpointKind: "/me/replies", method: "GET", error, transient, terminal }) });
   }
   const added = await withDb(async (d) => {
     const known = new Set(d.replies.map((reply) => reply.id));
@@ -2775,7 +3048,7 @@ async function draftRepliesBatch(snapshot) {
           heldNow += 1;
         }
       }
-      log(d, "error", `コメントの自動下書きに失敗しました（${pending.length}件・要確認へ${heldNow}件）。`, { error: error.message, detail: error.detail || "" });
+      log(d, "error", `コメントの自動下書きに失敗しました（${pending.length}件・要確認へ${heldNow}件）。`, { error: error.message, detail: error.detail || "", diagnostic: diagnosticMeta({ area: "ai_reply_draft", endpointKind: "ai_provider", method: "POST", error, targetId: pending.map((item) => item.id).sort().join("|") }) });
     });
     return { drafted: 0, held: 0, failed: true };
   }
@@ -2832,18 +3105,29 @@ async function draftRepliesBatch(snapshot) {
 async function alreadyRepliedByMe(settings, commentId) {
   const token = requireToken(settings);
   let after = "";
+  const seen = new Set();
+  const unknown = () => Object.assign(new Error("Reply reconciliation incomplete; resend blocked."), { stage: "reconcile", maybePublished: true });
   for (let page = 0; page < 5; page += 1) {
-    const data = await threadsFetch(`/${commentId}/replies`, { params: { fields: "id,is_reply_owned_by_me", limit: 100, after }, token });
-    if ((data.data || []).some((item) => item.is_reply_owned_by_me)) return true;
-    after = data.paging?.cursors?.after || "";
-    if (!after || !(data.data || []).length) break;
+    let data;
+    try {
+      data = await threadsFetch(`/${commentId}/replies`, { params: { fields: "id,is_reply_owned_by_me", limit: 100, after }, token });
+    } catch (error) { error.stage = "reconcile"; throw sanitizeSendFailure(error); }
+    if (!data || !Array.isArray(data.data) || data.data.some((item) => !item || typeof item.is_reply_owned_by_me !== "boolean")) throw unknown();
+    if (data.data.some((item) => item.is_reply_owned_by_me === true)) return true;
+    if (data.paging != null && (typeof data.paging !== "object" || Array.isArray(data.paging))) throw unknown();
+    const next = data.paging?.next;
+    if (next != null && typeof next !== "string") throw unknown();
+    if (!next) return false;
+    const cursor = data.paging?.cursors?.after;
+    if (!data.data.length || typeof cursor !== "string" || !cursor || seen.has(cursor)) throw unknown();
+    seen.add(cursor);
+    after = cursor;
   }
-  return false;
+  throw unknown();
 }
-
 // 1件送る（手動・自動の共通経路）。ロックは呼び出し側が取る
 async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false } = {}) {
-  const { settings } = await withDb(async (d) => ({ save: false, value: { settings: d.settings } }));
+  const { settings, previous } = await withDb(async (d) => ({ save: false, value: { settings: d.settings, previous: { ...d.replies.find((r) => r.id === replyId) } } }));
   let result;
   let failure;
   try {
@@ -2861,6 +3145,9 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
       });
       return updated;
     }
+    if (previous.sendUncertainAt || (previous.status === "error" && !previous.sendFailure)) {
+      throw Object.assign(new Error("Reply outcome requires review; resend blocked."), { stage: "reconcile", maybePublished: true });
+    }
     await withDb(async (d) => { findOr404(d.replies, replyId, "コメント").sendingAt = nowIso(); });
     result = await publishThreadsPost(settings, { format: "TEXT", text, replyToId: replyId });
   } catch (error) {
@@ -2868,7 +3155,9 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
   }
   // 通信失敗は「送れたか」が分からない。返信が付いたかを直接見て、付いていれば返信済み・付いていなければ未送信と確定させる
   let confirmedSent = null; // true=付いている / false=付いていない / null=確認できなかった
-  if (!result && failure?.network) {
+  const failureInfo = failure ? classifySendFailure(failure) : null;
+  if (failureInfo && previous.sendUncertainAt) Object.assign(failureInfo, { outcome: "unknown", retryable: false });
+  if (!result && failureInfo?.outcome === "unknown") {
     for (let k = 0; k < 2 && confirmedSent === null; k += 1) {
       try {
         confirmedSent = await alreadyRepliedByMe(settings, replyId);
@@ -2879,29 +3168,36 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
   }
   const updated = await withDb(async (d) => {
     const found = findOr404(d.replies, replyId, "コメント");
+    if (failure) {
+      found.sendFailure = { ...failureInfo, at: nowIso() };
+      recordSendAttempt(found, failure, { result: "failed", operation: "reply" });
+      if (failureInfo.outcome === "unknown") found.sendUncertainAt ||= nowIso();
+    }
     const wasAuto = !!found.autoQueued;
     found.responseText = text;
     found.sendingAt = "";
-    const rateLimited = !result && isRateLimitError(failure);
+    const rateLimited = !result && failureInfo?.outcome === "not_sent" && failureInfo.retryable && isRateLimitError(failure);
     if (!rateLimited) found.autoQueued = false; // 成否不明の失敗は自動再送しない（429 だけは未送信が確定しているので下書きのまま残す）
     if (!result && confirmedSent === true) {
       found.status = "responded";
       found.external = true;
       found.respondedAt = found.respondedAt || nowIso();
       found.error = "";
+      delete found.sendUncertainAt;
       recordMonitoringEvent(d, "reply_success");
       log(d, "info", "通信は失敗しましたが、返信は付いていたため返信済みにしました。", { replyId: found.id });
       return { value: found };
     }
-    if (!result && confirmedSent === false && wasAuto && (found.retryCount || 0) < MAX_REPLY_RETRIES) {
+    if (!result && failureInfo?.outcome === "not_sent" && failureInfo.retryable && !["publish", "reconcile"].includes(failureInfo.stage) && !found.sendUncertainAt && wasAuto && (found.retryCount || 0) < MAX_REPLY_RETRIES) {
       found.status = "drafted";
       found.autoQueued = true;
       found.retryCount = (found.retryCount || 0) + 1;
       found.error = "";
-      log(d, "info", "通信に失敗しましたが、返信は付いていないことを確認したので、次の巡回で再送します。", { replyId: found.id, retryCount: found.retryCount, error: failure.message });
+      log(d, "info", "Reply prepublish failure queued for bounded retry.", { diagnostic: failureInfo, retryCount: found.retryCount });
       return { value: found };
     }
     if (result) {
+      recordSendAttempt(found, null, { result: "success", operation: "reply" });
       found.status = "responded";
       found.respondedThreadsId = result.id;
       found.respondedAt = nowIso();
@@ -2911,15 +3207,15 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
       recordMonitoringEvent(d, "reply_success");
       log(d, "info", auto ? "コメントへ自動返信しました。" : "コメントへ返信しました。", { replyId: found.id, threadsId: result.id });
     } else {
-      recordMonitoringEvent(d, "safe_error", { error: failure, area: "reply_send" });
+      recordMonitoringEvent(d, "safe_error", { error: safeSendError(failure), area: "reply_send" });
       if (rateLimited) {
         d.settings.autoReplyPausedUntil = new Date(Date.now() + (failure.retryAfterMs || 10 * 60 * 1000)).toISOString();
         found.error = "";
-        log(d, "error", "Threads の返信回数の上限に触れたため、自動返信を一時停止しました（下書きは残しています）。", { replyId: found.id, error: failure.message, pausedUntil: d.settings.autoReplyPausedUntil });
+        log(d, "error", "Reply rate limit pause.", { diagnostic: failureInfo, pausedUntil: d.settings.autoReplyPausedUntil });
       } else {
         found.status = "error";
-        found.error = `${failure.message}（送れているかは次回のコメント取得で確認します。送り直す場合は「未対応に戻す」→「この内容で返信する」）`;
-        log(d, "error", auto ? "コメントの自動返信に失敗しました。" : "コメント返信に失敗しました。", { replyId: found.id, error: failure.message, detail: failure.detail || "" });
+        found.error = failureInfo.outcome === "unknown" ? "Reply outcome unknown; resend blocked." : "Reply failed; inspect structured diagnostic.";
+        log(d, "error", "Reply sending stopped.", { diagnostic: failureInfo });
       }
     }
     return { value: found };
@@ -2950,7 +3246,7 @@ async function requeueNetworkFailedReplies(snapshot) {
   const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
   const targets = snapshot.replies
     .filter((r) => r.status === "error" && r.autoDrafted && r.responseText && !r.sendingAt && !inFlight.has(`reply:${r.id}`)
-      && (r.retryCount || 0) < MAX_REPLY_RETRIES && /fetch failed|通信できませんでした/.test(r.error || "")
+      && (r.retryCount || 0) < MAX_REPLY_RETRIES && r.sendFailure?.outcome === "not_sent" && r.sendFailure.retryable === true && !["publish", "reconcile"].includes(r.sendFailure.stage) && !r.sendUncertainAt
       && (Date.parse(r.timestamp || "") || 0) > weekAgo)
     .slice(0, 5);
   let requeued = 0;
@@ -2964,7 +3260,7 @@ async function requeueNetworkFailedReplies(snapshot) {
     }
     await withDb(async (d) => {
       const found = d.replies.find((x) => x.id === r.id);
-      if (!found || found.status !== "error") return { save: false };
+      if (!found || found.status !== "error" || found.sendUncertainAt || found.sendFailure?.outcome !== "not_sent" || !found.sendFailure.retryable || ["publish", "reconcile"].includes(found.sendFailure.stage)) return { save: false };
       if (sent) {
         found.status = "responded";
         found.external = true;
@@ -3256,6 +3552,110 @@ async function autoReplyTick() {
   }
 }
 
+// バズ投稿の再投稿: 反応の大きかった過去投稿を、同じ文面で今日の残り時間に予約する。
+// 1日の本数は JST の日付で数える。同じ投稿は rebuzzCooldownDays 日あける。元の投稿は消さない。
+async function rebuzzTopUp() {
+  const snapshot = await readDb();
+  const st = snapshot.settings;
+  const perDay = Math.floor(Number(st.rebuzzPerDay)) || 0;
+  if (!st.rebuzzEnabled || perDay < 1) return;
+  const fmt = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo" });
+  const today = fmt.format(new Date());
+  const toHour = Number.isFinite(Number(st.scheduleToHour)) ? Number(st.scheduleToHour) : 21;
+  const fromHour = Number.isFinite(Number(st.scheduleFromHour)) ? Number(st.scheduleFromHour) : 7;
+  const windowStart = Math.max(Date.now() + 5 * 60_000, Date.parse(`${today}T00:00:00${JST_OFFSET}`) + fromHour * 3_600_000);
+  const windowEnd = Date.parse(`${today}T00:00:00${JST_OFFSET}`) + toHour * 3_600_000;
+  if (windowEnd - windowStart < 10 * 60_000) return;
+  const alreadyToday = snapshot.posts.filter((p) => p.origin === "rebuzz" && p.status !== "rejected" && p.scheduledAt && fmt.format(new Date(p.scheduledAt)) === today).length;
+  const need = perDay - alreadyToday;
+  if (need < 1) return;
+  const cooldownMs = Math.max(1, Number(st.rebuzzCooldownDays) || 7) * 86_400_000;
+  const minViews = Math.max(0, Number(st.rebuzzMinViews) || 0);
+  const metrics = latestMetricsByPost(snapshot);
+  const lastRebuzzAt = new Map();
+  for (const p of snapshot.posts) {
+    if (p.origin !== "rebuzz" || !p.rebuzzOf || p.status === "rejected") continue;
+    const t = Date.parse(p.createdAt) || 0;
+    if (t > (lastRebuzzAt.get(p.rebuzzOf) || 0)) lastRebuzzAt.set(p.rebuzzOf, t);
+  }
+  const candidates = snapshot.posts
+    .filter((p) => p.status === "published" && p.origin !== "rebuzz" && p.format === "TEXT" && !p.replyToId && String(p.text || "").trim() && metrics.has(p.id))
+    .filter((p) => (metrics.get(p.id).views || 0) >= minViews)
+    .filter((p) => Date.now() - (Date.parse(p.publishedAt) || 0) >= 3 * 86_400_000 && Date.now() - (lastRebuzzAt.get(p.id) || 0) >= cooldownMs)
+    .sort((a, b) => (metrics.get(b.id).views || 0) - (metrics.get(a.id).views || 0))
+    .slice(0, need);
+  if (!candidates.length) return;
+  const width = (windowEnd - windowStart) / candidates.length;
+  await withDb(async (db) => {
+    const fresh = db.settings;
+    if (!fresh.rebuzzEnabled) return { save: false };
+    candidates.forEach((source, i) => {
+      const at = new Date(windowStart + width * i + Math.random() * width * 0.9);
+      db.posts.push(normalizePost({
+        status: "scheduled",
+        origin: "rebuzz",
+        rebuzzOf: source.id,
+        text: source.text,
+        category: source.category,
+        topicTag: source.topicTag,
+        format: "TEXT",
+        scheduledAt: at.toISOString(),
+        strategyMemo: `バズ再投稿（元: ${source.id}・閲覧${metrics.get(source.id).views || 0}）`
+      }));
+    });
+    log(db, "info", `バズ投稿を${candidates.length}本、再投稿として予約しました。`, { sources: candidates.map((c) => c.id) });
+  });
+}
+
+// 自分の投稿の自動リポスト: Threads の /{id}/repost を、閲覧数の多い自分の投稿に対して1日 repostPerDay 回まで、時間帯の中で間隔をあけて呼ぶ。
+// 失敗してもほかの処理は止めず、ログに原文を残して数時間あける。同じ投稿は repostCooldownDays 日あける。
+async function autoRepostTick() {
+  const snapshot = await readDb();
+  const st = snapshot.settings;
+  const perDay = Math.floor(Number(st.repostPerDay)) || 0;
+  if (!st.repostEnabled || perDay < 1) return;
+  if (Date.parse(st.nextRepostAt || "") > Date.now()) return;
+  const fmt = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo" });
+  const today = fmt.format(new Date());
+  const dayStart = Date.parse(`${today}T00:00:00${JST_OFFSET}`);
+  const fromHour = Number.isFinite(Number(st.scheduleFromHour)) ? Number(st.scheduleFromHour) : 7;
+  const toHour = Number.isFinite(Number(st.scheduleToHour)) ? Number(st.scheduleToHour) : 21;
+  const windowStart = dayStart + fromHour * 3_600_000;
+  const windowEnd = dayStart + toHour * 3_600_000;
+  if (Date.now() < windowStart || Date.now() >= windowEnd) return;
+  const doneToday = snapshot.posts.filter((p) => p.lastRepostAt && fmt.format(new Date(p.lastRepostAt)) === today).length;
+  if (doneToday >= perDay) return;
+  const cooldownMs = Math.max(1, Number(st.repostCooldownDays) || 14) * 86_400_000;
+  const minViews = Math.max(0, Number(st.repostMinViews) || 0);
+  const metrics = latestMetricsByPost(snapshot);
+  const target = snapshot.posts
+    .filter((p) => p.status === "published" && p.threadsId && !p.replyToId && !p.deletedFromThreadsAt && metrics.has(p.id))
+    .filter((p) => (metrics.get(p.id).views || 0) >= minViews)
+    .filter((p) => Date.now() - (Date.parse(p.publishedAt) || 0) >= 3 * 86_400_000 && Date.now() - (Date.parse(p.lastRepostAt || "") || 0) >= cooldownMs)
+    .sort((a, b) => (metrics.get(b.id).views || 0) - (metrics.get(a.id).views || 0))[0];
+  if (!target) return;
+  const remaining = perDay - doneToday;
+  const gap = Math.max(10 * 60_000, (windowEnd - Date.now()) / remaining);
+  let failure;
+  try {
+    await threadsFetch(`/${target.threadsId}/repost`, { method: "POST", token: requireToken(st) });
+  } catch (error) {
+    failure = error;
+  }
+  await withDb(async (db) => {
+    const post = db.posts.find((p) => p.id === target.id);
+    if (failure) {
+      db.settings.nextRepostAt = new Date(Date.now() + 3 * 3_600_000).toISOString();
+      if (post) post.repostFailCount = (post.repostFailCount || 0) + 1;
+      log(db, "error", "自動リポストに失敗しました。3時間後にもう一度試します。", { postId: target.id, error: String(failure?.message || failure).slice(0, 300), detail: String(failure?.detail || "").slice(0, 300) });
+      return;
+    }
+    if (post) { post.lastRepostAt = nowIso(); post.repostCount = (post.repostCount || 0) + 1; }
+    db.settings.nextRepostAt = new Date(Date.now() + gap * (0.5 + Math.random())).toISOString();
+    log(db, "info", "自分の投稿を自動でリポストしました。", { postId: target.id, views: metrics.get(target.id).views || 0 });
+  });
+}
+
 async function schedulerTick() {
   if (schedulerRunning) return;
   schedulerRunning = true;
@@ -3273,13 +3673,16 @@ async function schedulerTick() {
       }
     }
     if (snapshot.settings.threadsAccessToken && !tokenExpired) await recoverPublishing(snapshot);
+    if (snapshot.settings.threadsAccessToken && !tokenExpired) {
+      await reconcileFailedPublishes(snapshot).catch((error) => withDb(async (db) => { log(db, "error", "失敗扱いの投稿をThreads側と照合できませんでした。6時間後にもう一度確認します。", { diagnostic: diagnosticMeta({ area: "post_publish", error }) }); }));
+    }
     // スリープ・電源オフ明けに古い予約をそのまま出さない（24時間以上過ぎた予約は止めて知らせる）
     const isStale = (post) => post.status === "scheduled" && post.scheduledAt && Date.now() - Date.parse(post.scheduledAt) > SCHEDULE_STALE_MS && !post.publishing;
     for (const stale of snapshot.posts.filter(isStale)) {
       await withDb(async (db) => {
         const post = db.posts.find((p) => p.id === stale.id);
         if (!post || !isStale(post) || inFlight.has(post.id)) return { save: false };
-        markPublishError(db, post, new Error("予約時刻を24時間以上過ぎていたため送りませんでした（PC が止まっていた間の予約）。内容を確認して予約し直してください。"), "期限を過ぎた予約投稿を止めました。");
+        markPublishError(db, post, own("予約時刻を24時間以上過ぎていたため送りませんでした（PC が止まっていた間の予約）。内容を確認して予約し直してください。"), "期限を過ぎた予約投稿を止めました。");
       });
     }
     // 承認待ち・承認済み（未予約）のまま予約時刻を過ぎた投稿は、公開処理にも期限切れ処理にも掛からず、誰にも知らされない
@@ -3301,7 +3704,7 @@ async function schedulerTick() {
     }
     if (snapshot.settings.autoPublishEnabled && snapshot.settings.threadsAccessToken && !tokenExpired) {
       const isDue = (post) => post.status === "scheduled" && post.scheduledAt && Date.parse(post.scheduledAt) <= Date.now()
-        && (!post.retryAfter || Date.parse(post.retryAfter) <= Date.now());
+        && !post.sendUncertainAt && (!post.retryAfter || Date.parse(post.retryAfter) <= Date.now());
       const dueIds = snapshot.posts.filter(isDue).map((post) => post.id);
       for (const postId of dueIds) {
         // 前の送信中に状態が変わっていることがあるので、送る直前にロック内で確認し直す
@@ -3346,16 +3749,23 @@ async function schedulerTick() {
             log(db, "error", "予約投稿の送信後に投稿がDBから消えていました。", { postId, threadsId: result?.id || "", error: failure?.message || "" });
             return;
           }
+          // 公開の応答を受け取れなかった＝届いたかどうか分からない。送信中の印を残し、recoverPublishing に Threads 側と照合させる
+          if (!result && failure?.maybePublished) {
+            recordSendAttempt(post, failure);
+            log(db, "error", "予約投稿の公開の応答を受け取れませんでした。Threads側に出ているかを自動で確認します。", { postId: post.id, failure: post.sendFailure, diagnostic: diagnosticMeta({ area: "post_publish_maybe_published", endpointKind: failure?.diagnostic?.endpointKind || "unknown", method: failure?.diagnostic?.method || "POST", error: failure, targetId: post.id, transient: isTransientThreadsError(failure), terminal: isThreadsMissingObjectError(failure), maybePublished: true }) });
+            return;
+          }
           delete post.publishing;
           if (result) {
             await markPublished(db, post, result, "予約投稿を公開しました。");
             delete post.retryAfter;
             delete post.retryCount;
-          } else if ((isRateLimitError(failure) || failure?.retryable) && (post.retryCount || 0) < SCHEDULE_RETRY_MAX) {
+          } else if (classifySendFailure(failure).retryable && !post.sendUncertainAt && (post.retryCount || 0) < SCHEDULE_RETRY_MAX) {
+            recordSendAttempt(post, failure);
             post.retryCount = (post.retryCount || 0) + 1;
             post.retryAfter = new Date(Date.now() + SCHEDULE_RETRY_INTERVAL_MS).toISOString();
-            post.error = `${failure.message}（${post.retryCount}回目・10分後に再送します）`;
-            log(db, "error", "予約投稿がThreadsの利用上限で送れませんでした。10分後に再送します。", { postId: post.id, retryCount: post.retryCount, detail: failure.detail || "" });
+            post.error = `${safeSendError(failure).message}（${post.retryCount}回目・10分後に再試行します）`;
+            log(db, "error", "予約投稿が一時的に送れませんでした。10分後に限定再試行します。", { postId: post.id, retryCount: post.retryCount, failure: post.sendFailure, diagnostic: diagnosticMeta({ area: "post_publish_rate_limit", endpointKind: failure?.diagnostic?.endpointKind || "unknown", method: failure?.diagnostic?.method || "POST", error: failure, targetId: post.id, transient: true, terminal: false, maybePublished: false }) });
           } else markPublishError(db, post, failure, "予約投稿に失敗しました。");
         }).finally(() => inFlight.delete(postId));
       }
@@ -3381,6 +3791,8 @@ async function schedulerTick() {
         }
       });
     }
+    if (snapshot.settings.threadsAccessToken && !tokenExpired) await rebuzzTopUp().catch((error) => appendErrorLog(error));
+    if (snapshot.settings.threadsAccessToken && !tokenExpired) await autoRepostTick().catch((error) => appendErrorLog(error));
     if (!tokenExpired) await autoReplyTick();
   } catch (error) {
     await appendErrorLog(error);
@@ -3464,8 +3876,8 @@ function sanitizeSettings(current, input) {
       continue;
     }
     if ((key === "autoDeleteMaxLikes" || key === "autoDeleteMaxReplies") && !/^\d{1,4}$/.test(String(value ?? "").trim())) throw new HttpError(400, "自動削除のいいね数・コメント数のしきい値は 0〜1000 の整数で入力してください。");
-    if (key === "autoFetchRepliesMinutes" || key === "autoReplyIntervalSec" || key === "autoReplyDailyCap" || key === "autoDeleteMaxLikes" || key === "autoDeleteMaxReplies" || key === "autoReplyJaFromHour" || key === "autoReplyJaToHour" || key === "postsPerDay" || key === "scheduleFromHour" || key === "scheduleToHour" || key === "monitoringRetentionDays") {
-      const bounds = { postsPerDay: [0, 100, "1日の投稿数"], scheduleFromHour: [0, 23, "投稿の開始時"], scheduleToHour: [1, 24, "投稿の終了時"], autoReplyJaFromHour: [0, 23, "日本語返信の開始時"], autoReplyJaToHour: [1, 24, "日本語返信の終了時"], autoFetchRepliesMinutes: [1, 60, "コメント取得の間隔（分）"], autoReplyIntervalSec: [5, 600, "自動返信の間隔（秒）"], autoReplyDailyCap: [1, THREADS_REPLY_DAILY_LIMIT, "自動返信の1日上限"], autoDeleteMaxLikes: [0, 1000, "自動削除のいいね数のしきい値"], autoDeleteMaxReplies: [0, 1000, "自動削除のコメント数のしきい値"], monitoringRetentionDays: [1, 90, "監視状態の保持日数"] }[key];
+    if (key === "autoFetchRepliesMinutes" || key === "autoReplyIntervalSec" || key === "autoReplyDailyCap" || key === "autoDeleteMaxLikes" || key === "autoDeleteMaxReplies" || key === "autoReplyJaFromHour" || key === "autoReplyJaToHour" || key === "postsPerDay" || key === "rebuzzPerDay" || key === "repostPerDay" || key === "repostMinViews" || key === "repostCooldownDays" || key === "rebuzzMinViews" || key === "rebuzzCooldownDays" || key === "scheduleFromHour" || key === "scheduleToHour" || key === "monitoringRetentionDays") {
+      const bounds = { postsPerDay: [0, 100, "1日の投稿数"], rebuzzPerDay: [0, 50, "バズ再投稿の1日の本数"], repostPerDay: [0, 50, "自動リポストの1日の回数"], repostMinViews: [0, 1000000, "自動リポストの閲覧数のしきい値"], repostCooldownDays: [1, 365, "自動リポストの間隔（日）"], rebuzzMinViews: [0, 1000000, "バズ再投稿の閲覧数のしきい値"], rebuzzCooldownDays: [1, 365, "バズ再投稿の間隔（日）"], scheduleFromHour: [0, 23, "投稿の開始時"], scheduleToHour: [1, 24, "投稿の終了時"], autoReplyJaFromHour: [0, 23, "日本語返信の開始時"], autoReplyJaToHour: [1, 24, "日本語返信の終了時"], autoFetchRepliesMinutes: [1, 60, "コメント取得の間隔（分）"], autoReplyIntervalSec: [5, 600, "自動返信の間隔（秒）"], autoReplyDailyCap: [1, THREADS_REPLY_DAILY_LIMIT, "自動返信の1日上限"], autoDeleteMaxLikes: [0, 1000, "自動削除のいいね数のしきい値"], autoDeleteMaxReplies: [0, 1000, "自動削除のコメント数のしきい値"], monitoringRetentionDays: [1, 90, "監視状態の保持日数"] }[key];
       const n = Number(value);
       if (!Number.isFinite(n) || n < bounds[0] || n > bounds[1]) throw new HttpError(400, `${bounds[2]}は ${bounds[0]}〜${bounds[1]} の数字で入力してください。`);
       next[key] = Math.floor(n);
@@ -3523,10 +3935,23 @@ function styleWarnings(text) {
   return out;
 }
 
-function statePayload(db) {
+// /api/state の重い部分（db読み込み・統計・字面チェック）は読み取り専用なので、db.json の更新時刻＋サイズが同じ間は使い回す。
+// 書き込みがあれば更新時刻が変わって作り直す。統計に「公開から24時間」の経過判定があるため、1分でも作り直す（2026-10-18: CPU飽和下で /api/state が10秒超かかった対策）
+let stateCache = { stamp: "", db: null, posts: null, stats: null };
+async function readDbForState() {
+  const st = await stat(DB_PATH).catch(() => null);
+  const stamp = st ? `${st.mtimeMs}:${st.size}:${Math.floor(Date.now() / 60_000)}` : "";
+  if (stamp && stateCache.stamp === stamp && stateCache.db) return stateCache;
+  const db = await readDb(); // stat は読む前に取るので、間に書き込みが入っても次回は stamp が変わって読み直す
+  const posts = db.posts.map((p) => (p.status === "published" || p.replyToId ? p : { ...p, styleWarnings: styleWarnings(p.text) }));
+  stateCache = { stamp, db, posts, stats: buildStats(db) };
+  return stateCache;
+}
+
+function statePayload(db, derived = {}) {
   return {
     settings: publicSettings(db.settings),
-    posts: db.posts.map((p) => (p.status === "published" || p.replyToId ? p : { ...p, styleWarnings: styleWarnings(p.text) })),
+    posts: derived.posts || db.posts.map((p) => (p.status === "published" || p.replyToId ? p : { ...p, styleWarnings: styleWarnings(p.text) })),
     replies: db.replies,
     insights: db.insights,
     research: db.research,
@@ -3534,7 +3959,7 @@ function statePayload(db) {
     referenceAnalysis: db.referenceAnalysis,
     suggestions: db.suggestions,
     logs: db.logs,
-    stats: buildStats(db),
+    stats: derived.stats || buildStats(db),
     monitoring: monitoringStatusPayload(db),
     https: httpsStatus,
     publicOrigin: PUBLIC_ORIGIN,
@@ -3549,7 +3974,7 @@ function route(method, pattern, handler) {
   routes.push({ method, pattern, handler });
 }
 
-route("GET", "/api/state", async () => readDb().then((db) => ({ status: 200, body: statePayload(db) })));
+route("GET", "/api/state", async () => readDbForState().then((entry) => ({ status: 200, body: statePayload(entry.db, entry) })));
 
 route("GET", "/api/monitoring/status", async () => {
   const db = await readDb();
@@ -3674,7 +4099,8 @@ route("POST", "/api/profile-posts", async ({ body }) => {
       const known = new Set(d.references.map((ref) => ref.threadsId).filter(Boolean));
       const fresh = result.posts.filter((p) => p.text && !known.has(p.threadsId)).map((p) => ({
         id: id("ref"), threadsId: p.threadsId, source: "profile", keyword: `@${result.username}の投稿${p.likes === null ? "" : `（いいね${p.likes}）`}`,
-        text: p.text, username: p.username, permalink: p.permalink, timestamp: p.timestamp, mediaType: p.mediaType, selected: false, analysis: null, createdAt: nowIso()
+        text: p.text, username: p.username, permalink: p.permalink, timestamp: p.timestamp, mediaType: p.mediaType,
+        metrics: metricsFrom(p.likes, p.replies, p.reposts, p.quotes), selected: false, analysis: null, createdAt: nowIso()
       }));
       d.references.unshift(...fresh);
       d.references = d.references.slice(0, 300);
@@ -3703,6 +4129,11 @@ route("POST", "/api/references/search", async ({ body }) => {
     via = "web";
     found = await searchThreadsPostsViaWeb(db.settings, keyword);
   }
+  // いいねの下限: 反応数が取れた投稿だけを絞る。反応数が取れない投稿（Web検索経由など）は、下限で捨てず「反応数なし」のまま残す
+  const minLikes = Math.max(0, Math.floor(Number(body.minLikes) || 0));
+  const withMetrics = found.filter((ref) => ref.metrics && ref.metrics.likes !== null).length;
+  const belowMin = minLikes > 0 ? found.filter((ref) => ref.metrics && ref.metrics.likes !== null && ref.metrics.likes < minLikes) : [];
+  found = found.filter((ref) => !belowMin.includes(ref));
   const added = await withDb(async (d) => {
     const known = new Set(d.references.map((ref) => ref.threadsId).filter(Boolean));
     const fresh = found.filter((ref) => !known.has(ref.threadsId));
@@ -3711,7 +4142,7 @@ route("POST", "/api/references/search", async ({ body }) => {
     log(d, "info", via === "api" ? "Threads APIで参考投稿を検索しました。" : "Threads APIでは見つからなかったため、Web検索経由で公開投稿を集めました。", { keyword, found: found.length, added: fresh.length, apiError: apiError ? String(apiError.message).slice(0, 200) : "" });
     return { value: fresh };
   });
-  return { status: 200, body: { found: found.length, added: added.length, via } };
+  return { status: 200, body: { found: found.length + belowMin.length, added: added.length, via, withMetrics, belowMin: belowMin.length, minLikes } };
 });
 
 route("POST", "/api/references", async ({ body }) => {
@@ -3721,7 +4152,7 @@ route("POST", "/api/references", async ({ body }) => {
     const item = {
       id: id("ref"), threadsId: "", source: "manual", keyword: String(body.keyword || "").trim(),
       text: text.slice(0, 3000), username: String(body.username || "").trim().slice(0, 80), permalink: safeUrl(body.permalink, "URL"),
-      timestamp: "", mediaType: "TEXT", selected: true, analysis: null, createdAt: nowIso()
+      timestamp: "", mediaType: "TEXT", metrics: metricsFrom(body.likes, body.replies, null, null), selected: true, analysis: null, createdAt: nowIso()
     };
     d.references.unshift(item);
     return { value: item };
@@ -3979,11 +4410,19 @@ route("POST", "/api/posts/:id/publish", async ({ params }) => {
       onContainer: (containerId) => withDb(async (d) => { const p = d.posts.find((x) => x.id === params.id); if (p?.publishing) p.publishing.containerId = containerId; else return { save: false }; })
     });
   } catch (error) {
-    failure = error;
+    if (!error.stage) { error.stage = "reconcile"; error.maybePublished = true; }
+    failure = sanitizeSendFailure(error);
   }
   try {
     const post = await withDb(async (d) => {
       const found = findOr404(d.posts, params.id, "投稿");
+      if (!result && failure?.maybePublished) {
+        recordSendAttempt(found, failure);
+        // 届いたかどうか分からない。送信中の印を残し、recoverPublishing に Threads 側と照合させる
+        log(d, "error", "手動公開の応答を受け取れませんでした。Threads側に出ているかを自動で確認します。", { postId: found.id, failure: found.sendFailure });
+        failure = new HttpError(502, "公開の応答を受け取れませんでした（通信が切れました）。Threads側に出ている可能性があるため、1〜2分後に自動で確認します。送り直さないでください。");
+        return { value: found };
+      }
       delete found.publishing;
       if (result) await markPublished(d, found, result, "手動で公開しました。");
       else markPublishError(d, found, failure, "手動公開に失敗しました。");
@@ -4360,11 +4799,13 @@ const server = createServer(async (req, res) => {
 // テスト用に内部関数を公開する（購入者が使うAPIではない）
 export { appendErrorLog };
 export const _internals = {
+  classifySendFailure, recordSendAttempt, safeSendError, alreadyRepliedByMe, requeueNetworkFailedReplies, sendReplyNow, publishThreadsPost,
   styleWarnings,
   recoverPublishing, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, sanitizeLogMeta, isTransientThreadsError, isThreadsMissingObjectError, boundedBackoffMs, applyReplyFetchFailures, recordAutoDeleteFailureForTest: recordAutoDeleteFailure, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
   toStrictSchema,
   REPLY_TEXT_BLOCKLIST,
   autoReplyTick, classifySafeError, monitoringStatusPayload, buildDraftPrompt, questionQualityIssue,
+  diagnosticMeta, endpointKindForThreadsPath,
   draftRepliesBatch, pickAiFailedForRecovery, recoverAiFailedReplies, REPLY_AI_RECOVERY_EVERY_MS, schedulerTick, assignSchedule, sanitizeSettings, applyTransition, normalizePost, readDb, withDb };
 
 // 自己署名証明書（localhost・10年）。openssl が無ければ https は立てず、手動トークン運用を案内する。

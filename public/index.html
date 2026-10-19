@@ -106,7 +106,11 @@
               </div>
               <div class="form-grid">
                 <label class="wide">キーワード<input id="refKeyword" placeholder="例: ハンドメイド 起業" /></label>
+                <label>いいねの下限（任意）<input id="refMinLikes" type="number" min="0" step="1" placeholder="例: 100" /></label>
+                <label>アカウントから集める（任意）<input id="refAccount" placeholder="@username" /></label>
               </div>
+              <div class="row-actions"><button class="button secondary" id="refAccountBtn">そのアカウントの投稿を集める</button></div>
+              <p class="notice">反応数（いいね・返信）は、Threads の権限が付いているときだけ自動で取れます。取れない投稿は「反応数なし」と表示し、0とは扱いません。下限を入れると、反応数が取れた投稿のうち、下限に届かないものを候補に入れません。</p>
               <p class="notice">Threads上の投稿をキーワードで検索して候補に追加します。Threads API の検索はアプリ審査前は自分の投稿しか返さないため、0件のときは自動で Web検索経由（Claude Code）に切り替えて公開投稿を最大8件集めます（1〜3分かかります）。それでも見つからない場合は、下の「手動で貼り付け」を使ってください。</p>
               <details class="details">
                 <summary>手動で貼り付けて追加する</summary>
@@ -114,6 +118,8 @@
                   <label class="wide">投稿本文<textarea id="refManualText" rows="4" placeholder="参考にしたい投稿の本文を貼り付け"></textarea></label>
                   <label>投稿者（任意）<input id="refManualUser" placeholder="@username" /></label>
                   <label>URL（任意）<input id="refManualUrl" placeholder="https://www.threads.net/..." /></label>
+                  <label>いいね数（任意）<input id="refManualLikes" type="number" min="0" step="1" placeholder="画面に出ている数" /></label>
+                  <label>返信数（任意）<input id="refManualReplies" type="number" min="0" step="1" placeholder="画面に出ている数" /></label>
                 </div>
                 <div class="row-actions"><button class="button secondary" id="refManualAddBtn">候補に追加</button></div>
               </details>
@@ -122,6 +128,10 @@
               <div class="panel-head">
                 <h3>参考投稿の候補 <span class="count-chip" id="refSelectedCount"></span></h3>
                 <div class="row-actions">
+                  <select id="refSort" class="select-inline">
+                    <option value="likes">反応の多い順</option>
+                    <option value="added">追加した順</option>
+                  </select>
                   <button class="button secondary" id="refClearBtn">選択を全解除</button>
                   <button class="button" id="refAnalyzeBtn">選んだ投稿の型を分析</button>
                 </div>
@@ -342,6 +352,14 @@
               <label>1日の投稿数（1以上なら下の予約時刻は使わず、時間帯の中でランダムな時刻にします。0=下の固定時刻）<input id="postsPerDay" type="number" min="0" max="100" /></label>
               <label>投稿の開始時（日本時間・0〜23）<input id="scheduleFromHour" type="number" min="0" max="23" /></label>
               <label>投稿の終了時（日本時間・1〜24）<input id="scheduleToHour" type="number" min="1" max="24" /></label>
+              <label class="toggle-row wide"><input id="rebuzzEnabled" type="checkbox" /> バズ投稿の再投稿をON（過去に閲覧数が多かった投稿を、同じ文面で毎日自動で予約します。予約投稿の自動送信がONなら、そのまま公開されます）</label>
+              <label>バズ再投稿の1日の本数（0〜50・上の投稿の開始時〜終了時に散らします）<input id="rebuzzPerDay" type="number" min="0" max="50" /></label>
+              <label>バズ再投稿の対象にする閲覧数の下限<input id="rebuzzMinViews" type="number" min="0" max="1000000" /></label>
+              <label>同じ投稿を再投稿するまで空ける日数（1〜365）<input id="rebuzzCooldownDays" type="number" min="1" max="365" /></label>
+              <label class="toggle-row wide"><input id="repostEnabled" type="checkbox" /> 自分の投稿の自動リポストをON（閲覧数の多い自分の投稿を、Threadsのリポスト機能で1日に決めた回数まで、投稿の開始時〜終了時のあいだに自動で行います。取り消しはThreads側で行います）</label>
+              <label>自動リポストの1日の回数（0〜50）<input id="repostPerDay" type="number" min="0" max="50" /></label>
+              <label>自動リポストの対象にする閲覧数の下限<input id="repostMinViews" type="number" min="0" max="1000000" /></label>
+              <label>同じ投稿をリポストするまで空ける日数（1〜365）<input id="repostCooldownDays" type="number" min="1" max="365" /></label>
               <label class="wide">予約時刻（1日の投稿数が0のときだけ使う・カンマ区切り・日本時間）<input id="scheduleTimes" placeholder="07:00,09:00,11:00" /></label>
               <label class="toggle-row"><input id="autoPublishEnabled" type="checkbox" /> 予約投稿の自動送信をON（このサーバーが起動している間だけ動作）</label>
             </div>

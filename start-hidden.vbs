@@ -50,6 +50,23 @@ End If
 Err.Clear
 On Error GoTo 0
 
+' Slow but listening? Under heavy load the server can miss the 3s window above; starting a second node would only hit EADDRINUSE
+' (seen on 2026-10-18). If something already listens on the port, treat the server as up and do not spawn.
+If Not alive Then
+  lsFile = fso.GetSpecialFolder(2) & "\threads_listen_" & port & ".txt"
+  On Error Resume Next
+  sh.Run "cmd /c netstat -ano -p tcp | findstr LISTENING > """ & lsFile & """", 0, True
+  If Err.Number = 0 And fso.FileExists(lsFile) Then
+    Set lf = fso.OpenTextFile(lsFile, 1)
+    If Not lf.AtEndOfStream Then lsText = lf.ReadAll
+    lf.Close
+    If InStr(lsText, ":" & port & " ") > 0 Then alive = True
+    fso.DeleteFile lsFile
+  End If
+  Err.Clear
+  On Error GoTo 0
+End If
+
 If alive Then
   If wantBrowser Then sh.Run "cmd /c start """" ""http://localhost:" & port & """", 0, False
   WScript.Quit 0
