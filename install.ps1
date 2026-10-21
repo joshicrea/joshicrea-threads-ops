@@ -37,6 +37,9 @@ $BaseDir    = [IO.Path]::Combine($ClaudeDir, "threads-ops")
 $AppDir     = [IO.Path]::Combine($BaseDir, "app")
 $DataDir    = [IO.Path]::Combine($BaseDir, "data")
 $Repo       = "joshicrea/joshicrea-threads-ops"
+# 検証用: THREADS_PORT で本体のポートを変える。THREADS_INSTALL_NO_AUTOSTART=1 で自動起動とデスクトップの入口を作らない
+$Port       = if ("$env:THREADS_PORT" -match "^\d{2,5}$") { "$env:THREADS_PORT" } else { "4173" }
+$SkipAutostart = ("$env:THREADS_INSTALL_NO_AUTOSTART" -eq "1")
 
 New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
@@ -79,7 +82,8 @@ if ($LocalSource) {
             exit 1
         }
         if (Test-Path $ExtTemp) { Remove-Item $ExtTemp -Recurse -Force }
-        Expand-Archive -Path $ZipPath -DestinationPath $ExtTemp -Force
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtTemp, [System.Text.Encoding]::UTF8)
         $ExtractedFolder = Get-ChildItem $ExtTemp | Select-Object -First 1
         Move-Item $ExtractedFolder.FullName $InstallPath -Force
         Remove-Item $ExtTemp -Force -ErrorAction SilentlyContinue
@@ -99,7 +103,10 @@ $existingVersions | Select-Object -Skip 2 | ForEach-Object { Remove-Item $_.Full
 # --- 2. installed_plugins.json を更新 ---
 $InstalledPath = [IO.Path]::Combine($PluginsDir, "installed_plugins.json")
 if (Test-Path $InstalledPath) {
-    $Installed = [System.IO.File]::ReadAllText($InstalledPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    try { $Installed = [System.IO.File]::ReadAllText($InstalledPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {
+        Write-Host "$InstalledPath が読めないため、上書きせずに止めました。このファイルを直すか、提供元に連絡してください。"
+        exit 1
+    }
 } else {
     New-Item -ItemType Directory -Force -Path $PluginsDir | Out-Null
     $Installed = [PSCustomObject]@{ version = 2; plugins = [PSCustomObject]@{} }
@@ -122,7 +129,10 @@ Write-Utf8NoBom -Path $InstalledPath -Content ($Installed | ConvertTo-Json -Dept
 # --- 3. settings.json の enabledPlugins を更新 ---
 $SettingsPath = [IO.Path]::Combine($ClaudeDir, "settings.json")
 if (Test-Path $SettingsPath) {
-    $Settings = [System.IO.File]::ReadAllText($SettingsPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    try { $Settings = [System.IO.File]::ReadAllText($SettingsPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {
+        Write-Host "$SettingsPath が読めないため、上書きせずに止めました。このファイルを直すか、提供元に連絡してください。"
+        exit 1
+    }
 } else {
     $Settings = [PSCustomObject]@{}
 }
@@ -135,6 +145,68 @@ if ($Settings.enabledPlugins.PSObject.Properties[$PluginKey]) {
     $Settings.enabledPlugins | Add-Member -Name $PluginKey -Value $true -MemberType NoteProperty
 }
 Write-Utf8NoBom -Path $SettingsPath -Content ($Settings | ConvertTo-Json -Depth 10)
+# --- 3-B. マーケットプレイス joshicrea を登録 ---
+# Claude Code は、プラグインの属するマーケットプレイスが known_marketplaces.json に無いと
+# 「Marketplace joshicrea not found」で読み込まない（まっさらなPCで実測）。
+# すでに joshicrea がフォルダ型で登録されている（AI秘書など）なら、そのフォルダの一覧に1行足すだけにして、他の行は触らない
+$KnownPath = [IO.Path]::Combine($PluginsDir, "known_marketplaces.json")
+if (Test-Path $KnownPath) {
+    try { $Known = [System.IO.File]::ReadAllText($KnownPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {
+        Write-Host "$KnownPath が読めないため、上書きせずに止めました。このファイルを直すか、提供元に連絡してください。"
+        exit 1
+    }
+} else {
+    $Known = [PSCustomObject]@{}
+}
+$KnownProp = $Known.PSObject.Properties["joshicrea"]
+$MarketDir = [IO.Path]::Combine($BaseDir, "marketplace")
+if ($KnownProp) {
+    $ks = $KnownProp.Value.source
+    if ($ks -and $ks.source -ne "directory") {
+        Write-Host "マーケットプレイス joshicrea が別の形で登録されているため、変更せずに止めました。提供元に連絡してください。"
+        exit 1
+    }
+    $loc = $KnownProp.Value.installLocation
+    if ($loc -and (Test-Path ([IO.Path]::Combine($loc, ".claude-plugin", "marketplace.json")))) { $MarketDir = $loc }
+}
+$ManifestPath = [IO.Path]::Combine($MarketDir, ".claude-plugin", "marketplace.json")
+if (Test-Path $ManifestPath) {
+    try { $Manifest = [System.IO.File]::ReadAllText($ManifestPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {
+        Write-Host "$ManifestPath が読めないため、上書きせずに止めました。提供元に連絡してください。"
+        exit 1
+    }
+} else {
+    New-Item -ItemType Directory -Force -Path ([IO.Path]::Combine($MarketDir, ".claude-plugin")) | Out-Null
+    $Manifest = [PSCustomObject]@{
+        '$schema'   = "https://anthropic.com/claude-code/marketplace.schema.json"
+        name        = "joshicrea"
+        description = "JoshiCrea plugins"
+        owner       = [PSCustomObject]@{ name = "JoshiCrea"; email = "info@joshicrea.com" }
+        plugins     = @()
+    }
+}
+$ThreadsPlugin = [PSCustomObject]@{
+    name        = "joshicrea-threads-ops"
+    description = "Threads運用アシスタント。投稿案づくり・承認・予約投稿・返信の下書きまで、Claude Code から操作する"
+    author      = [PSCustomObject]@{ name = "JoshiCrea"; email = "info@joshicrea.com" }
+    category    = "productivity"
+    source      = [PSCustomObject]@{ source = "url"; url = "https://github.com/$Repo.git" }
+}
+$OtherPlugins = @($Manifest.plugins | Where-Object { $_ -and $_.name -ne "joshicrea-threads-ops" })
+if ($Manifest.PSObject.Properties["plugins"]) {
+    $Manifest.plugins = @($OtherPlugins + $ThreadsPlugin)
+} else {
+    $Manifest | Add-Member -Name "plugins" -Value @($ThreadsPlugin) -MemberType NoteProperty
+}
+Write-Utf8NoBom -Path $ManifestPath -Content ($Manifest | ConvertTo-Json -Depth 10)
+$KnownEntry = [PSCustomObject]@{
+    source          = [PSCustomObject]@{ source = "directory"; path = $MarketDir }
+    installLocation = $MarketDir
+    lastUpdated     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+}
+if ($KnownProp) { $KnownProp.Value = $KnownEntry } else { $Known | Add-Member -Name "joshicrea" -Value $KnownEntry -MemberType NoteProperty }
+New-Item -ItemType Directory -Force -Path $PluginsDir | Out-Null
+Write-Utf8NoBom -Path $KnownPath -Content ($Known | ConvertTo-Json -Depth 10)
 Write-Host "プラグインを登録しました"
 
 # --- 4. Node.js を確認。無ければ winget で入れる ---
@@ -190,7 +262,7 @@ if ($nodeExe -and (Test-Path $codexDir)) {
         $nodeFwd = $nodeExe -replace '\\', '/'
         $dataFwd = $DataDir -replace '\\', '/'
         $codexBlock = "[mcp_servers.threads-ops]`ncommand = `"$nodeFwd`"`nargs = [`"$mcpScript`"]`n`n[mcp_servers.threads-ops.env]`nTHREADS_DATA_DIR = `"$dataFwd`"`n"
-        $codexClean = [regex]::Replace($codexOld, '(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|\z)', '')
+        $codexClean = [regex]::Replace($codexOld, '(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|^#|\z)', '')
         $codexNew = if ($codexClean.Trim()) { $codexClean.TrimEnd() + "`n`n" + $codexBlock } else { $codexBlock }
         Write-Utf8NoBom -Path $codexToml -Content $codexNew
         Write-Host "Codex にも登録しました: $codexToml（Codex を開き直すと使えます）"
@@ -225,7 +297,7 @@ foreach ($name in $cmdFiles.Keys) { [System.IO.File]::WriteAllText([IO.Path]::Co
 
 # デスクトップに入口を1つ置く。http://localhost:4173 をブックマークすると、サーバーが止まっている間
 # 「接続できません」しか出ない。ショートカット経由なら、止まっていても起動してから画面が出る。
-try {
+if (-not $SkipAutostart) { try {
     $ws = New-Object -ComObject WScript.Shell
     $lnkPath = [IO.Path]::Combine([Environment]::GetFolderPath("Desktop"), "Threads運用アシスタント.lnk")
     $lnk = $ws.CreateShortcut($lnkPath)
@@ -240,13 +312,17 @@ try {
     # 失敗しても致命ではない（開く.cmd を直接叩けば同じ）。原因は丸めずそのまま出す
     Write-Host "デスクトップのショートカットは作れませんでした: $($_.Exception.Message)"
     Write-Host "  画面を開くときは $AppDir\開く.cmd をダブルクリックしてください"
-}
+} }
 $envText = "# Threads運用アシスタントの起動設定。install.ps1 が作成。データの置き場所はここで決まる`nTHREADS_DATA_DIR=$DataDir`n"
+if ($Port -ne "4173") { $envText += "PORT=$Port`n" }
 Write-Utf8NoBom -Path ([IO.Path]::Combine($AppDir, "threads-ops.env")) -Content $envText
 Write-Host "本体を配置しました: $AppDir"
 
 # --- 6. 自動起動を登録し、動いている旧版があれば止めて、新版を起動する ---
 $verifyOk = $true
+if ($SkipAutostart) {
+    Write-Host "検証用の指定のため、自動起動の登録は飛ばしました"
+} else {
 & powershell -NoProfile -ExecutionPolicy Bypass -File ([IO.Path]::Combine($AppDir, "register-autostart.ps1")) | Out-Null
 $taskName = if ($env:THREADS_TASK_NAME) { $env:THREADS_TASK_NAME } else { "ThreadsOpsAssistant" }
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
@@ -254,6 +330,7 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
 } else {
     Write-Host "自動起動の登録に失敗しました。あとで 自動起動を登録.cmd を実行してください。"
     $verifyOk = $false
+}
 }
 # 更新のとき: 旧版のプロセスが残っていると server.js を差し替えても新版にならない。pid は DataDir にある
 $pidFile = [IO.Path]::Combine($DataDir, "server.pid")
@@ -269,7 +346,36 @@ if (Test-Path $pidFile) {
     }
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
 }
-Start-Process -FilePath "wscript.exe" -ArgumentList @("//nologo", ([IO.Path]::Combine($AppDir, "start-hidden.vbs"))) -WorkingDirectory $AppDir | Out-Null
+$busy = $false
+try {
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/api/state")
+        $req.Timeout = 2000
+        $req.Headers.Add("x-threads-ops", "1")
+        try { $res = $req.GetResponse(); $res.Close(); $busy = $true } catch [System.Net.WebException] { if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 401) { $busy = $true } }
+    } catch {}
+if (-not $busy) {
+    $listen = (netstat -ano -p tcp | Select-String -Pattern (":$Port\s.*LISTENING")) 
+    if ($listen) { $busy = $true }
+}
+# 登録したばかりの自動起動が先に本体を立ち上げていることがある。そのときは自分のデータ置き場に server.pid がある
+# 本体は待ち受けを始めてから server.pid を書くので、その一瞬に当たると自分の本体を他人と見誤る。最大10秒、2秒おきに確かめ直す
+$ours = $false
+if ($busy) {
+    for ($w = 0; $w -lt 6 -and -not $ours; $w++) {
+        if ($w -gt 0) { Start-Sleep -Seconds 2 }
+        if (Test-Path $pidFile) {
+            $ownPid = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ("$ownPid" -match "^\d+$" -and (Get-Process -Id ([int]$ownPid) -ErrorAction SilentlyContinue)) { $ours = $true }
+        }
+    }
+}
+if ($busy -and -not $ours) {
+    Write-Host ""
+    Write-Host "ポート $Port を、別のプログラムがすでに使っています（以前に ZIP で入れた運用アシスタントが動いている、など）。"
+    Write-Host "そのプログラムを止めてから、同じ1行をもう一度貼ってください。ZIP 版なら、起動したときに出た黒い画面を閉じると止まります。"
+    exit 1
+}
+if (-not $ours) { Start-Process -FilePath "wscript.exe" -ArgumentList @("//nologo", ([IO.Path]::Combine($AppDir, "start-hidden.vbs"))) -WorkingDirectory $AppDir | Out-Null }
 
 # --- 7. 検証: 必須ファイルと本体の疎通 ---
 foreach ($f in @(
@@ -289,9 +395,9 @@ foreach ($f in @(
     if (-not (Test-Path $f)) { Write-Host "エラー: $f が作成されませんでした"; $verifyOk = $false }
 }
 $up = $false
-for ($i = 0; $i -lt 15; $i++) {
+for ($i = 0; $i -lt 40; $i++) {
     try {
-        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:4173/api/state")
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/api/state")
         $req.Timeout = 2000
         $req.Headers.Add("x-threads-ops", "1")
         try { $res = $req.GetResponse(); $res.Close(); $up = $true } catch [System.Net.WebException] { if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 401) { $up = $true } }
@@ -317,5 +423,5 @@ Write-Host "次の手順:"
 Write-Host "  1. Claude Code を完全に閉じる（Node.js を今回入れた場合は、Claude Code を動かしているターミナルやエディタごと閉じる）"
 Write-Host "  2. Claude Code を再度開く"
 Write-Host "  3. チャットに「はじめまして」と送るとセットアップが始まります"
-Write-Host "  画面: http://localhost:4173"
+Write-Host "  画面: http://localhost:$Port"
 Write-Host ""

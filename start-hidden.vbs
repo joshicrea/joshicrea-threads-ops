@@ -9,7 +9,8 @@ dir = fso.GetParentFolderName(WScript.ScriptFullName)
 Set sh = CreateObject("WScript.Shell")
 sh.CurrentDirectory = dir
 Set env = sh.Environment("PROCESS")
-sh.Run "wscript //nologo """ & dir & "\start-hidden-gateway.vbs""", 0, False
+' The gateway (multi-account front door) exists only on the provider PC. Customer installs do not ship it.
+If fso.FileExists(dir & "\start-hidden-gateway.vbs") Then sh.Run "wscript //nologo """ & dir & "\start-hidden-gateway.vbs""", 0, False
 
 wantBrowser = (WScript.Arguments.Count > 0)
 If Not wantBrowser Then env("THREADS_NO_BROWSER") = "1"
@@ -18,9 +19,22 @@ logDir = dir & "/data"
 port = "4173"
 envPath = dir & "\threads-ops.env"
 If fso.FileExists(envPath) Then
-  Set f = fso.OpenTextFile(envPath, 1)
-  Do Until f.AtEndOfStream
-    line = Trim(f.ReadLine)
+  ' threads-ops.env is written as UTF-8 by the installers. FSO reads ANSI and breaks non-ASCII paths
+  ' (a Japanese Windows user name), so read it with ADODB.Stream as UTF-8 and split the lines here.
+  Set st = CreateObject("ADODB.Stream")
+  st.Type = 2
+  st.Charset = "utf-8"
+  st.Open
+  st.LoadFromFile envPath
+  envText = st.ReadText
+  st.Close
+  envText = Replace(envText, vbCr, "")
+  If Len(envText) > 0 Then
+    If AscW(Left(envText, 1)) = &HFEFF Then envText = Mid(envText, 2)
+  End If
+  envLines = Split(envText, vbLf)
+  For Each rawLine In envLines
+    line = Trim(rawLine)
     If Len(line) > 0 And Left(line, 1) <> "#" Then
       p = InStr(line, "=")
       If p > 1 Then
@@ -31,8 +45,7 @@ If fso.FileExists(envPath) Then
         If k = "PORT" And Len(v) > 0 Then port = v
       End If
     End If
-  Loop
-  f.Close
+  Next
 End If
 
 ' Already running? 200 = no access key, 401 = access key set. Either way the server is alive.

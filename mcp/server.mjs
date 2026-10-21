@@ -25,7 +25,30 @@ const SETTINGS_PROPS = {
   scheduleTimes: { type: "string", description: "例: 07:00,12:00,20:00（日本時間）" },
   aiProvider: { type: "string", enum: ["claude-code", "codex", "gemini", "claude-api"] }, claudeModel: { type: "string", enum: ["sonnet", "opus", "haiku"] },
   autoPublishEnabled: { type: "boolean" }, autoFetchRepliesEnabled: { type: "boolean" }, autoFetchRepliesMinutes: { type: "integer" },
-  autoReplyEnabled: { type: "boolean" }, autoReplyIntervalSec: { type: "integer" }, autoReplyDailyCap: { type: "integer" }, autoInsightsEnabled: { type: "boolean" }
+  autoReplyEnabled: { type: "boolean" }, autoReplyIntervalSec: { type: "integer" }, autoReplyDailyCap: { type: "integer" }, autoInsightsEnabled: { type: "boolean" },
+  // アカバン防止ガード（出す前の安全確認）。数値は公式上限以外すべて暫定の目安
+  safetyGuardEnabled: { type: "boolean", description: "出す前の安全確認。新規は既定ON・以前から使っているアカウントは既定OFF（推奨はON）。OFFでも公式上限の手前（G1 投稿・G11 返信の24時間件数）は止める。利用者が明示したときだけ変える" },
+  safetyMaxPostsPer24h: { type: "integer", description: "G1 24時間の公開数の上限（公式250の手前・既定200）" },
+  safetyDailyPostLimit: { type: "integer", description: "G2 1日（直近24時間）の投稿の上限。超えるなら止める（既定10・1〜250）。Meta は基準を公開していません。多くするほど止められやすくなる目安" },
+  safetySurgeRatio: { type: "number", description: "G3 急増の倍率（注意・既定2・1〜10・小数第1位まで。例: 1.5）" },
+  safetyMinIntervalMinutes: { type: "integer", description: "G4 投稿の最小間隔（分・既定10）" },
+  safetySimilarBlockPct: { type: "integer", description: "G5 自分の過去投稿との一致率で止める%（既定70）" },
+  safetySimilarWarnPct: { type: "integer", description: "G5 注意する%（既定45）" },
+  safetyLinkWarnCount: { type: "integer", description: "G6 直近10本中のURL入り本数で注意（既定3）" },
+  safetyBannedWords: { type: "string", description: "G9 アカウントごとの追加の禁止語（改行・カンマ区切り）。例（ペット）: お譲りします, 里親募集, 生体販売" },
+  safetyReplySimilarPct: { type: "integer", description: "G10 自動返信の一致率で止める%（既定80）" },
+  safetyReplyMaxPer24h: { type: "integer", description: "G11 24時間の返信数の上限（公式1,000の80%・既定800）" },
+  // 発信テーマと宣伝。配列ごと置き換わる（1つ足すときも、threads_get_settings の今の配列に足して全部を渡す）
+  themes: {
+    type: "array",
+    description: "発信テーマ（10個まで）。テーマを指定せずに投稿案を作ると、ここから割り当てる。空の配列なら今までどおり",
+    items: { type: "object", properties: { id: { type: "string" }, name: { type: "string", description: "テーマ名（例: 温活）" }, audience: { type: "string", description: "誰に向けて（任意）" }, note: { type: "string", description: "補足（任意）" }, weight: { type: "integer", enum: [1, 2, 3], description: "出す量 1=たまに 2=ときどき 3=よく" }, everyDays: { type: "integer", minimum: 0, maximum: 30, description: "N日に1回は必ず（0=指定なし）" }, topicTag: { type: "string", description: "トピックタグ1つ（任意・#なし）" }, enabled: { type: "boolean" } }, required: ["name"], additionalProperties: false }
+  },
+  campaigns: {
+    type: "array",
+    description: "期間つきの宣伝したいもの（10件まで）。保存しただけでは投稿は作らない。作るのは threads_generate_campaign_posts",
+    items: { type: "object", properties: { id: { type: "string" }, title: { type: "string", description: "宣伝したいもの（例: 電子書籍の無料ダウンロード）" }, detail: { type: "string", description: "何を・どう受け取れるか（本人の言葉。ここに無い事実は書かれない）" }, url: { type: "string", description: "URL（任意）" }, startDate: { type: "string", description: "始まり YYYY-MM-DD" }, endDate: { type: "string", description: "終わり YYYY-MM-DD（その日も含む・31日まで）" }, perDay: { type: "integer", enum: [1, 2, 3], description: "1日の本数（既定1）" }, linkInBody: { type: "boolean", description: "本文にURLを入れる（既定false。false ならプロフィールのリンクへ促す）" }, enabled: { type: "boolean" } }, required: ["title", "startDate", "endDate"], additionalProperties: false }
+  }
 };
 
 // データ置き場（アクセスキーを読むため）。THREADS_DATA_DIR → プラグイン標準の置き場 → 本体フォルダの data/ の順
@@ -74,10 +97,28 @@ const STATUS_LABEL = { review: "承認待ち", approved: "承認済み", schedul
 const REPLY_LABEL = { unhandled: "未対応", drafted: "下書きあり", held: "要確認", responded: "返信済み", ignored: "対応しない", error: "エラー" };
 
 function briefPost(p) {
-  return { id: p.id, status: STATUS_LABEL[p.status] || p.status, category: p.category || "", scheduledAt: p.scheduledAt || "", publishedAt: p.publishedAt || "", permalink: p.permalink || "", error: p.error || "", text: p.text };
+  return { id: p.id, status: STATUS_LABEL[p.status] || p.status, category: p.category || "", ...(p.theme ? { theme: p.theme } : {}), ...(p.campaignId ? { campaignId: p.campaignId } : {}), scheduledAt: p.scheduledAt || "", publishedAt: p.publishedAt || "", permalink: p.permalink || "", error: p.error || "", text: p.text };
 }
 function briefReply(r) {
   return { id: r.id, status: REPLY_LABEL[r.status] || r.status, from: r.username || "", comment: r.text, draft: r.responseText || "", holdReason: r.holdReason || "", autoQueued: Boolean(r.autoQueued), timestamp: r.timestamp || "" };
+}
+
+// 利用者が次にやることを1つだけ返す（上から順に、最初に当てはまったもの）
+function nextStep(s, tokenExpired) {
+  const st = s.settings;
+  const hosted = Boolean(st.threadsOAuthExchangeUrl);
+  const local = Boolean(st.threadsAppId);
+  const review = s.posts.filter((p) => p.status === "review").length;
+  if (!hosted && !local) return `連携コードが未入力です。画面（http://localhost:${PORT}）の設定タブ「2. Threads連携」の連携コード欄に、提供元から届いた TOPS1. で始まるコードを貼って保存してください。チャットには貼らないでください。`;
+  if (hosted && (!st.threadsOAuthClientToken || !st.expectedThreadsUsername)) return "連携コードの中身が足りません。提供元から届いた連携コードを、画面の設定タブにもう一度そのまま貼って保存してください。";
+  if (!st.threadsAccessToken) return "Threads と連携します。threads_auth_url で連携用のページを開き、Threads の画面で許可してください（先に Threads アプリで、届いたテスター招待を承認しておく）。";
+  if (tokenExpired) return "Threads の連携が期限切れです。threads_auth_url でもう一度連携してください。";
+  if (st.aiProvider === "gemini" && !st.geminiApiKey) return "文章を作る AI が使えない設定です。threads_update_settings で aiProvider を claude-code にしてから、threads_ai_check で確かめてください。";
+  if (!st.lastAiCheckAt) return "文章を作る AI がこの PC で動くか、threads_ai_check で確かめてください（最大3分）。";
+  if (!st.brandName || !st.profile) return "発信者情報が空です。初回セットアップ（名前・何をしている人か・文体）を1問ずつ聞いて、threads_update_settings で保存してください。";
+  if (review) return `承認待ちの投稿が ${review} 件あります。threads_list_posts（status=review）で本文を見せて、承認するか聞いてください。`;
+  if ((st.themes || []).some((t) => t.enabled !== false)) return "投稿案を作れます。発信テーマが設定済みなので、テーマは聞かずに、目的だけ聞いて threads_generate_posts を topic なしで呼んでください（テーマは設定から自動で割り当てます）。";
+  return "投稿案を作れます。目的とテーマを1つずつ聞いてから threads_generate_posts を呼んでください。";
 }
 
 const tools = [
@@ -90,8 +131,18 @@ const tools = [
       const count = (list, key) => list.reduce((acc, item) => { acc[key(item)] = (acc[key(item)] || 0) + 1; return acc; }, {});
       const settings = s.settings;
       const tokenExpired = settings.threadsTokenExpiresAt && Date.parse(settings.threadsTokenExpiresAt) < Date.now();
+      let safety = "";
+      try {
+        const g = await api("/api/safety");
+        safety = g.enabled
+          ? `安全確認ON: 直近24時間 ${g.posts.last24h}本（1日の上限${g.posts.dailyLimit}本・超えたら止める／今の設定の1日の投稿数${g.plannedPostsPerDay}本／公式上限250）・返信${g.replies.last24h}件・止めている投稿${g.blocked.posts}件/返信${g.blocked.replies}件。${g.disclaimer}`
+          : "安全確認OFF（出す前の確認をしていません）";
+      } catch (error) {
+        safety = `安全確認の状態を読めませんでした（${error.message}）`;
+      }
       return {
         dashboardUrl: `http://localhost:${PORT}`,
+        safety,
         version: s.version,
         threads: { connected: Boolean(settings.threadsAccessToken) && !tokenExpired, username: settings.threadsUsername || "", tokenExpiresAt: settings.threadsTokenExpiresAt || "", expired: Boolean(tokenExpired) },
         ai: { provider: settings.aiProvider, lastCheckAt: settings.lastAiCheckAt || "" },
@@ -99,7 +150,9 @@ const tools = [
         sender: { brandName: settings.brandName || "", profileFilled: Boolean(settings.profile), writingRulesFilled: Boolean(settings.writingRules) },
         posts: count(s.posts, (p) => STATUS_LABEL[p.status] || p.status),
         replies: count(s.replies, (r) => REPLY_LABEL[r.status] || r.status),
-        recentLogs: s.logs.slice(0, 5).map((l) => `${l.at} [${l.level}] ${l.message}`)
+        recentLogs: s.logs.slice(0, 5).map((l) => `${l.at} [${l.level}] ${l.message}`),
+        link: { expectedUsername: settings.expectedThreadsUsername || "", hostSet: Boolean(settings.threadsOAuthExchangeUrl), codeSet: Boolean(settings.threadsOAuthClientToken) },
+        next: nextStep(s, Boolean(tokenExpired))
       };
     }
   },
@@ -115,11 +168,20 @@ const tools = [
   },
   {
     name: "threads_generate_posts",
-    description: "投稿案を AI で生成して「承認待ち」に入れる（外部には出ない）。goal=投稿の目的、topic=テーマ、count=本数（1〜12・既定8）、date=投稿日（YYYY-MM-DD・省略なら明日以降の予約枠）。生成後は threads_list_posts で本文を確認し、利用者に承認を求める。",
-    inputSchema: { type: "object", properties: { goal: { type: "string" }, topic: { type: "string" }, count: { type: "integer", minimum: 1, maximum: 12 }, date: { type: "string" } }, required: ["goal", "topic"], additionalProperties: false },
+    description: "投稿案を AI で生成して「承認待ち」に入れる（外部には出ない）。goal=投稿の目的、topic=テーマ（省略可。設定に発信テーマがあり topic を省略すると、テーマを比率と「N日に1回」どおりに自動で割り当てる。発信テーマが無ければ聞いてから渡す）、count=本数（1〜12・既定8）、date=投稿日（YYYY-MM-DD・省略なら明日以降の予約枠）。生成後は threads_list_posts で本文を確認し、利用者に承認を求める。",
+    inputSchema: { type: "object", properties: { goal: { type: "string" }, topic: { type: "string" }, count: { type: "integer", minimum: 1, maximum: 12 }, date: { type: "string" } }, required: ["goal"], additionalProperties: false },
     run: async (args) => {
       const r = await api("/api/generate-posts", { method: "POST", body: args });
-      return { created: (r.posts || []).map(briefPost) };
+      return { created: (r.posts || []).map(briefPost), ...(r.themePlan ? { themes: r.themePlan } : {}) };
+    }
+  },
+  {
+    name: "threads_generate_campaign_posts",
+    description: "設定の「宣伝したいもの」1件から、期間の日数×1日の本数ぶんの宣伝投稿を作り「承認待ち」に入れる（外部には出ない・自動で承認や予約はしない）。予約日時は期間内の各日にばらして入る。期間外の日時には承認・予約・公開できない。campaignId は threads_get_settings の campaigns[].id。宣伝の投稿は伸びにくいので、本数は少なめを勧める。作ったあとは threads_list_posts で全文を見せて、承認を求める。",
+    inputSchema: { type: "object", properties: { campaignId: { type: "string" } }, required: ["campaignId"], additionalProperties: false },
+    run: async ({ campaignId }) => {
+      const r = await api(`/api/campaigns/${encodeURIComponent(campaignId)}/generate`, { method: "POST", body: {} });
+      return { created: (r.posts || []).map(briefPost), planned: r.planned, missing: r.missing, skipped: r.skipped || [], skippedDays: r.skippedDays || [] };
     }
   },
   {
@@ -169,6 +231,29 @@ const tools = [
     run: async ({ id, text }) => ({ reply: briefReply((await api(`/api/replies/${encodeURIComponent(id)}/respond`, { method: "POST", body: { text } })).reply) })
   },
   {
+    name: "threads_safety_override",
+    description: "出す前の安全確認で止まった投稿（type=post）またはコメント返信（type=reply）を、理由を確認したうえで出せるようにする（画面の「理由を確認して出す」と同じ）。必ず先に confirm を付けずに呼んで、返ってきた本文と止めた理由（規則名・日本語の理由）を利用者にそのまま全文見せ、利用者が「理由を確認した、出してよい」と明示したときだけ confirm=true で呼ぶ。利用者の同意なしに confirm=true で呼ばない。これ自体は公開・返信をしない（公開・予約・返信は別の操作）。本文を変えると解除は無効になり、本数・間隔の理由（G2・G4）の解除は24時間で切れる。公式上限（G1・G11）は解除できない。",
+    inputSchema: { type: "object", properties: { type: { type: "string", enum: ["post", "reply"] }, id: { type: "string" }, confirm: { type: "boolean", description: "利用者が本文と理由を見て明示的に同意したときだけ true" } }, required: ["type", "id"], additionalProperties: false },
+    run: async ({ type, id, confirm }) => {
+      if (confirm !== true) {
+        const s = await api("/api/state");
+        const item = type === "post" ? s.posts.find((p) => p.id === id) : s.replies.find((r) => r.id === id);
+        if (!item) throw new Error(`${type === "post" ? "投稿" : "コメント"}が見つかりません: ${id}`);
+        const reasons = (item.safety?.reasons || []).map((r) => ({ rule: r.rule, name: r.name, level: r.level === "blocked" ? "止めた" : "注意", message: r.message }));
+        return {
+          confirmed: false,
+          text: type === "post" ? item.text : item.responseText || "",
+          reasons,
+          disclaimer: s.safety?.disclaimer || "",
+          next: reasons.some((r) => r.level === "止めた") ? "この本文と理由を利用者にそのまま見せ、同意を得てから confirm=true で呼んでください。" : "安全確認で止まっていません。"
+        };
+      }
+      const path = type === "post" ? `/api/posts/${encodeURIComponent(id)}/safety-override` : `/api/replies/${encodeURIComponent(id)}/safety-override`;
+      const result = await api(path, { method: "POST", body: { confirm: true } });
+      return type === "post" ? { confirmed: true, post: briefPost(result.post) } : { confirmed: true, reply: briefReply(result.reply) };
+    }
+  },
+  {
     name: "threads_set_reply",
     description: "コメントの下書きを書き換える／対応しないにする／未対応に戻す。status: ignored=対応しない, unhandled=未対応に戻す（下書きがあれば下書きありに戻る）。responseText で下書きを差し替え。",
     inputSchema: { type: "object", properties: { id: { type: "string" }, status: { type: "string", enum: ["ignored", "unhandled"] }, responseText: { type: "string" } }, required: ["id"], additionalProperties: false },
@@ -176,7 +261,7 @@ const tools = [
   },
   {
     name: "threads_insights",
-    description: "インサイト（閲覧・いいね・返信）を取り込み、カテゴリ別・時間帯別・投稿別の集計を返す。refresh=false なら取り込まず集計だけ。",
+    description: "インサイト（閲覧・いいね・返信）を取り込み、カテゴリ別・時間帯別・テーマ別（byTheme）・投稿別の集計を返す。テーマ別は閲覧数・反応の平均で、フォロワーがどのテーマで増えたかは分からない。refresh=false なら取り込まず集計だけ。",
     inputSchema: { type: "object", properties: { refresh: { type: "boolean", default: true } }, additionalProperties: false },
     run: async ({ refresh = true }) => {
       const fetched = refresh ? await api("/api/refresh-insights", { method: "POST" }) : null;
@@ -196,7 +281,7 @@ const tools = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     run: async () => {
       const s = (await api("/api/state")).settings;
-      const pick = ["aiProvider", "claudeModel", "brandName", "profile", "writingRules", "defaultCta", "scheduleTimes", "autoPublishEnabled", "autoFetchRepliesEnabled", "autoFetchRepliesMinutes", "autoReplyEnabled", "autoReplyIntervalSec", "autoReplyDailyCap", "autoInsightsEnabled", "threadsUsername", "threadsTokenExpiresAt", "threadsRedirectUri"];
+      const pick = ["expectedThreadsUsername", "threadsOAuthExchangeUrl", "aiProvider", "claudeModel", "brandName", "profile", "writingRules", "defaultCta", "scheduleTimes", "autoPublishEnabled", "autoFetchRepliesEnabled", "autoFetchRepliesMinutes", "autoReplyEnabled", "autoReplyIntervalSec", "autoReplyDailyCap", "autoInsightsEnabled", "threadsUsername", "threadsTokenExpiresAt", "threadsRedirectUri"];
       return Object.fromEntries(pick.map((k) => [k, s[k]]));
     }
   },
@@ -252,7 +337,7 @@ async function handle(msg) {
     return reply(id, {
       protocolVersion: "2025-06-18",
       capabilities: { tools: {} },
-      serverInfo: { name: "threads-ops-assistant", version: "0.3.1" },
+      serverInfo: { name: "threads-ops-assistant", version: "0.4.0" },
       instructions: "Threads運用アシスタント（ローカル常駐サーバー）を操作するツール群。接続したら最初に threads_guide を呼んで指示書を読み、その順で利用者を案内する。続けて threads_status を呼ぶ。承認・公開・返信の送信は利用者が本文を見て明示したときだけ行う。"
     });
   }

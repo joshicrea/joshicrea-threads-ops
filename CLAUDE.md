@@ -20,7 +20,8 @@
 
 | 利用者の言葉 | やること |
 |---|---|
-| 「投稿案を作って」 | 目的とテーマを1問ずつ確認 → `threads_generate_posts` → 本文を番号付きで見せる → 承認・却下・修正を聞く |
+| 「投稿案を作って」 | 目的とテーマを1問ずつ確認（設定に発信テーマがあればテーマは聞かず topic を省く） → `threads_generate_posts` → 本文を番号付きで見せる → 承認・却下・修正を聞く |
+| 「〇〇を宣伝したい」 | 何を・期間・1日の本数・URLを本文に入れるかを1問ずつ確認 → 設定の campaigns に足す → `threads_generate_campaign_posts` → 全文を見せて承認を聞く（自動では承認しない） |
 | 「承認待ちを見せて」 | `threads_list_posts` status=review |
 | 「コメントを見て」「返信して」 | `threads_fetch_replies` → `threads_list_replies` → 未対応があれば `threads_draft_replies` → 下書きを見せる → 指示があったものだけ `threads_reply` |
 | 「反応はどう」「分析して」 | `threads_insights` → 数字を短く要約 → 3件以上あれば `threads_suggestions` を提案 |

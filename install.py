@@ -9,7 +9,8 @@
 # やること: プラグインを ~/.claude/plugins/cache に置き、本体を ~/.claude/threads-ops/app に配置、
 #           Node.js を確認し、ログイン時の自動起動（macOS は launchd、Linux は systemd --user）を登録し、本体を起動して疎通を確かめる。
 # 検証用: 引数 --local-source <フォルダ> で GitHub からではなく手元のフォルダから入れる。
-import sys, os, json, urllib.request, zipfile, shutil, tempfile, pathlib, datetime, subprocess, time, platform, signal
+import sys, os, json, urllib.request, urllib.error, zipfile, shutil, tempfile, pathlib, datetime, subprocess, time, platform, signal
+from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -101,8 +102,10 @@ installed = {"version": 2, "plugins": {}}
 if INSTALLED_JSON.exists():
     try:
         installed = json.loads(INSTALLED_JSON.read_text(encoding="utf-8"))
-    except Exception:
-        pass
+    except Exception as e:
+        # 壊れたファイルを空で上書きすると、他のプラグインの登録が消える。止めて直し方を伝える
+        print(f"{INSTALLED_JSON} が読めないため、上書きせずに止めました（{e}）。このファイルを直すか、提供元に連絡してください。")
+        sys.exit(1)
 now = datetime.datetime.now().astimezone().isoformat()
 installed.setdefault("plugins", {})[KEY] = [{
     "scope": "user", "installPath": str(install_path), "version": short_sha,
@@ -116,10 +119,59 @@ settings = {}
 if SETTINGS_JSON.exists():
     try:
         settings = json.loads(SETTINGS_JSON.read_text(encoding="utf-8"))
-    except Exception:
-        settings = {}
+    except Exception as e:
+        # Claude Code の設定が壊れているときに空で上書きすると、利用者の設定がすべて消える。止める
+        print(f"{SETTINGS_JSON} が読めないため、上書きせずに止めました（{e}）。このファイルを直すか、提供元に連絡してください。")
+        sys.exit(1)
 settings.setdefault("enabledPlugins", {})[KEY] = True
 SETTINGS_JSON.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+
+# --- 3-B. マーケットプレイス joshicrea を登録 ---
+# Claude Code は、プラグインの属するマーケットプレイスが known_marketplaces.json に無いと
+# 「Marketplace joshicrea not found」で読み込まない（まっさらな環境で実測）。
+# すでに joshicrea がフォルダ型で登録されている（AI秘書など）なら、そのフォルダの一覧に1行足すだけにして、他の行は触らない
+def read_json_or_stop(path, what):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"{path} が読めないため、上書きせずに止めました（{e}）。{what}")
+        sys.exit(1)
+
+KNOWN_JSON = PLUGINS_DIR / "known_marketplaces.json"
+known = read_json_or_stop(KNOWN_JSON, "このファイルを直すか、提供元に連絡してください。") if KNOWN_JSON.exists() else {}
+market_dir = BASE_DIR / "marketplace"
+current = known.get("joshicrea")
+if current:
+    if (current.get("source") or {}).get("source") not in (None, "directory"):
+        print("マーケットプレイス joshicrea が別の形で登録されているため、変更せずに止めました。提供元に連絡してください。")
+        sys.exit(1)
+    loc = current.get("installLocation")
+    if loc and (Path(loc) / ".claude-plugin" / "marketplace.json").exists():
+        market_dir = Path(loc)
+manifest_path = market_dir / ".claude-plugin" / "marketplace.json"
+if manifest_path.exists():
+    manifest = read_json_or_stop(manifest_path, "提供元に連絡してください。")
+else:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+        "name": "joshicrea", "description": "JoshiCrea plugins",
+        "owner": {"name": "JoshiCrea", "email": "info@joshicrea.com"}, "plugins": [],
+    }
+manifest["plugins"] = [p for p in manifest.get("plugins") or [] if p.get("name") != "joshicrea-threads-ops"] + [{
+    "name": "joshicrea-threads-ops",
+    "description": "Threads運用アシスタント。投稿案づくり・承認・予約投稿・返信の下書きまで、Claude Code から操作する",
+    "author": {"name": "JoshiCrea", "email": "info@joshicrea.com"},
+    "category": "productivity",
+    "source": {"source": "url", "url": f"https://github.com/{REPO}.git"},
+}]
+manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+known["joshicrea"] = {
+    "source": {"source": "directory", "path": str(market_dir)},
+    "installLocation": str(market_dir),
+    "lastUpdated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+}
+KNOWN_JSON.write_text(json.dumps(known, indent=2, ensure_ascii=False), encoding="utf-8")
 print("プラグインを登録しました")
 
 # --- 4. Node.js ---
@@ -162,7 +214,7 @@ def register_codex(home, node_exe, mcp_script, data_dir):
     if toml.exists():
         shutil.copy2(toml, str(toml) + ".bak-threads-ops")
     block = f'[mcp_servers.threads-ops]\ncommand = "{Path(node_exe).as_posix()}"\nargs = ["{Path(mcp_script).as_posix()}"]\n\n[mcp_servers.threads-ops.env]\nTHREADS_DATA_DIR = "{Path(data_dir).as_posix()}"\n'
-    clean = _re.sub(r"(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|\Z)", "", old)
+    clean = _re.sub(r"(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|^#|\Z)", "", old)
     toml.write_text((clean.rstrip() + "\n\n" + block) if clean.strip() else block, encoding="utf-8")
     print(f"Codex にも登録しました: {toml}（Codex を開き直すと使えます）")
     return True
@@ -208,6 +260,25 @@ if pid_file.exists():
     except Exception:
         pass
     pid_file.unlink(missing_ok=True)
+
+# 起動の前に、ポート 4173 を別の本体が使っていないか確かめる（以前に ZIP で入れた版が動いていると、
+# 新版は起動できず、古い版の応答を見て成功と出てしまう）。自分の旧版は上で止めたので、待ち受けが残っていれば他人
+import socket
+def port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_:
+        s_.settimeout(1)
+        return s_.connect_ex(("127.0.0.1", port)) == 0
+busy = port_in_use(4173)
+for _ in range(5):
+    if not busy:
+        break
+    time.sleep(1)
+    busy = port_in_use(4173)
+if busy:
+    print()
+    print("ポート 4173 を、別のプログラムがすでに使っています（以前に ZIP で入れた運用アシスタントが動いている、など）。")
+    print("そのプログラムを止めてから、同じ1行をもう一度貼ってください。ZIP 版なら、起動したときに出た画面を閉じると止まります。")
+    sys.exit(1)
 
 # --- 6. ログイン時の自動起動 ---
 log_path = DATA_DIR / "autostart.log"
@@ -271,8 +342,9 @@ def server_up():
         return False
 
 up = False
-for _ in range(15):
-    if server_up():
+for _ in range(40):
+    # 応答したのが今入れた本体か（自分のデータ置き場に server.pid がある）も確かめる
+    if server_up() and (DATA_DIR / "server.pid").exists():
         up = True
         break
     time.sleep(1)

@@ -48,6 +48,54 @@ foreach ($f in @([IO.Path]::Combine($ClaudeDir, "plugins", "installed_plugins.js
 }
 if (Test-Path $CacheDir) { Remove-Item $CacheDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Host "プラグイン本体を消しました: $CacheDir" }
 
+# 3-B. マーケットプレイス joshicrea から自分の行を外す。AI秘書など他の行は残す。
+# install.ps1 が作った置き場（threads-ops\marketplace）なら、登録ごと外す（フォルダは 4 で消える）
+$KnownPath = [IO.Path]::Combine($ClaudeDir, "plugins", "known_marketplaces.json")
+if (Test-Path $KnownPath) {
+    try {
+        $Known = [System.IO.File]::ReadAllText($KnownPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        $kp = $Known.PSObject.Properties["joshicrea"]
+        if ($kp -and $kp.Value.installLocation) {
+            $loc = [string]$kp.Value.installLocation
+            $ownDir = [IO.Path]::Combine($BaseDir, "marketplace")
+            if ($loc.TrimEnd('\') -ieq $ownDir.TrimEnd('\')) {
+                $Known.PSObject.Properties.Remove("joshicrea")
+                [System.IO.File]::WriteAllText($KnownPath, ($Known | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding $false))
+                Write-Host "マーケットプレイスの登録を外しました"
+            } else {
+                $mf = [IO.Path]::Combine($loc, ".claude-plugin", "marketplace.json")
+                if (Test-Path $mf) {
+                    $m = [System.IO.File]::ReadAllText($mf, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                    $rest = @($m.plugins | Where-Object { $_ -and $_.name -ne "joshicrea-threads-ops" })
+                    if ($rest.Count -ne @($m.plugins).Count) {
+                        $m.plugins = $rest
+                        [System.IO.File]::WriteAllText($mf, ($m | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding $false))
+                        Write-Host "マーケットプレイスの一覧から外しました: $mf"
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Host "マーケットプレイスの登録の削除に失敗しました: $_"
+    }
+}
+
+# 3-C. Codex の登録を外す（install.ps1 が足した [mcp_servers.threads-ops] だけを消す。控えを .bak-threads-ops-uninstall に残す）
+$codexToml = [IO.Path]::Combine($env:USERPROFILE, ".codex", "config.toml")
+if (Test-Path $codexToml) {
+    try {
+        $old = [System.IO.File]::ReadAllText($codexToml, [System.Text.Encoding]::UTF8)
+        $new = [regex]::Replace($old, '(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|^#|\z)', '')
+        if ($new -ne $old) {
+            Copy-Item $codexToml ($codexToml + ".bak-threads-ops-uninstall") -Force
+            [System.IO.File]::WriteAllText($codexToml, $new.TrimEnd() + "`n", (New-Object System.Text.UTF8Encoding $false))
+            Write-Host "Codex の登録を外しました: $codexToml"
+        }
+    } catch {
+        Write-Host "Codex の登録の削除に失敗しました: $_"
+    }
+}
+
 # 4. フォルダ削除（このスクリプト自身が入っているので、少し待ってから別プロセスで消す）
 # 自分と消す側の cwd を外に出す。cwd がフォルダ内にあると Windows は rd できず、app/ が残る
 Set-Location $env:TEMP
@@ -55,5 +103,5 @@ Write-Host "フォルダを消します: $BaseDir"
 Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "ping -n 3 127.0.0.1 >nul & rd /s /q `"$BaseDir`"") -WorkingDirectory $env:TEMP -WindowStyle Hidden | Out-Null
 Write-Host ""
 Write-Host "アンインストールが終わりました。Claude Code を閉じて開き直してください。"
-Write-Host "Threads 側の連携を切るときは、Threads アプリの 設定 → アカウント → ウェブサイトのアクセス許可 から解除してください。"
+Write-Host "Threads 側の連携を切るときは、Threads アプリの 設定 → アカウント → ウェブサイトの権限 から解除してください。"
 exit 0

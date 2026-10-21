@@ -37,11 +37,14 @@ description: Threads運用アシスタントの初回セットアップ。発信
 
 ### 3. Threads 連携
 
-`threads_status` の threads.connected が false なら、次の順で案内する。
+`threads_status` の threads.connected が false なら、`threads_status` の `next`（次にやること）に従い、次の順で案内する。
 
-1. 提供元から届いている「テスター招待」を、Threads アプリの 設定 → アカウント → Threads テスター招待 で承認してもらう（承認していないと連携が「The user has not accepted the invite」で止まる）
-2. 提供元から届いている App ID と App Secret を、画面（http://localhost:4173）の設定タブ「2. Threads連携」に入れて「保存」してもらう。値はチャットに貼らないよう伝える。届いていなければ、提供元に「App ID と App Secret」を請求してもらう（これが無いと次の手順が「Threads App IDが未設定です」で止まる）
-3. `threads_auth_url` で URL を取り、ブラウザで開いて許可してもらう。「Threads App IDが未設定です」と返ったら 2 に戻る。戻ってきたら `threads_status` で connected を確かめる
+1. 提供元から届いている「連携コード」（TOPS1. で始まる1行）を、画面（http://localhost:4173）の設定タブ「2. Threads連携」の連携コード欄に貼って「保存」してもらう。コードには合言葉が入っているので、チャットには貼らないよう伝える。届いていなければ、提供元に「連携コード」を請求してもらう
+2. 提供元から届いている「テスター招待」を、Threads アプリの 設定 → アカウント → ウェブサイトの権限 → テスター招待 で承認してもらう（承認していないと連携が「The user has not accepted the invite」で止まる）
+3. 連携を押す前に、そのブラウザでログインしている Threads アカウントが、連携したいアカウントか確かめてもらう（別のアカウントでログインしていると、本体が止める）
+4. `threads_auth_url` で URL を取り、ブラウザで開いて許可してもらう。戻ってきたら `threads_status` で connected と、連携済みのユーザー名を確かめる
+
+App ID・App Secret・OAuth Host などの「詳しい設定」は、提供元に言われたときだけ触る。
 
 ### 4. 運用の初期値
 

@@ -1,5 +1,5 @@
 ﻿# Threads Ops Assistant: register (or remove) the logon task that starts the server hidden.
-param([switch]$Remove)
+param([switch]$Remove, [string]$Vbs = "start-hidden.vbs")
 $name = if ($env:THREADS_TASK_NAME) { $env:THREADS_TASK_NAME } else { "ThreadsOpsAssistant" }
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($Remove) {
@@ -7,7 +7,7 @@ if ($Remove) {
   Write-Output "removed: $name"
   exit 0
 }
-$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument ('//nologo "' + (Join-Path $dir "start-hidden.vbs") + '"') -WorkingDirectory $dir
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument ('//nologo "' + (Join-Path $dir $Vbs) + '"') -WorkingDirectory $dir
 
 # ログオン時に一度だけでは、サーバーが落ちた後そのログオンの間ずっと画面が開けない
 # （2026-09-23 実測: LastTaskResult=0 で起動した後に停止し、/api/state が接続不能のまま4日近く放置されていた）。

@@ -10,8 +10,11 @@
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand-block">
-          <p class="eyebrow">Threads</p>
-          <h1>運用アシスタント</h1>
+          <span class="brand-mark" aria-hidden="true">@</span>
+          <div class="brand-text">
+            <p class="eyebrow">Threads</p>
+            <h1>運用アシスタント</h1>
+          </div>
         </div>
         <nav class="nav">
           <button class="nav-item active" data-view="dashboard">概要</button>
@@ -33,9 +36,9 @@
 
       <main class="main">
         <header class="topbar">
-          <div>
-            <p class="eyebrow">リサーチ → 生成 → 承認 → 投稿 → 分析</p>
+          <div class="topbar-title">
             <h2 id="viewTitle">概要</h2>
+            <p class="view-desc" id="viewDesc">今やることと、投稿・コメントの状況をまとめて見られます。</p>
           </div>
           <div class="topbar-right"><span class="version" id="appVersion"></span><button class="button secondary" id="reloadBtn">再読み込み</button></div>
         </header>
@@ -55,6 +58,11 @@
 
         <!-- 概要 -->
         <section class="view active" id="dashboard">
+          <section class="panel today-panel">
+            <div class="panel-head"><h3>今やること</h3></div>
+            <ol id="setupSteps" class="setup-steps" hidden></ol>
+            <div id="todoList" class="todo-list"></div>
+          </section>
           <div class="metric-grid">
             <button class="metric" data-goto="queue" data-filter="review"><span>承認待ち</span><strong id="reviewCount">0</strong></button>
             <button class="metric" data-goto="queue" data-filter="approved"><span>承認済み（未予約）</span><strong id="approvedCount">0</strong></button>
@@ -63,25 +71,26 @@
             <button class="metric" data-goto="queue" data-filter="error"><span>エラー</span><strong id="errorCount">0</strong></button>
             <button class="metric" data-goto="replies"><span>未返信コメント</span><strong id="unhandledReplyCount">0</strong></button>
           </div>
-          <div class="split">
-            <section class="panel">
-              <div class="panel-head"><h3>次にやること</h3></div>
-              <div id="todoList" class="stack"></div>
-            </section>
-            <section class="panel">
-              <div class="panel-head"><h3>接続状態</h3></div>
-              <div id="connectionStatus" class="stack"></div>
-            </section>
-          </div>
+          <p class="hint metric-note">承認済み（未予約）は承認しただけでまだ送られない投稿、予約済みは自動送信がONなら予定の時刻に送られる投稿です。</p>
           <div class="split">
             <section class="panel">
               <div class="panel-head"><h3>これから投稿されるもの</h3></div>
               <div id="nextPosts" class="stack"></div>
             </section>
-            <section class="panel">
-              <div class="panel-head"><h3>最近のログ</h3></div>
-              <div id="logs" class="log-list"></div>
-            </section>
+            <div class="column">
+              <section class="panel" id="safetyPanel">
+                <div class="panel-head"><h3>出す前の安全確認</h3></div>
+                <div id="safetySummary" class="safety-summary"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><h3>接続状態</h3></div>
+                <div id="connectionStatus" class="conn-table"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><h3>最近のログ</h3></div>
+                <div id="logs" class="log-list"></div>
+              </section>
+            </div>
           </div>
         </section>
 
@@ -89,7 +98,7 @@
         <section class="view" id="research">
           <div class="tabs" data-tabs="research">
             <button class="tab active" data-tab="refTab">参考投稿（Threads）</button>
-            <button class="tab" data-tab="webTab">Web参照元（Google検索）</button>
+            <button class="tab" data-tab="webTab">Webで集めた参考（Google検索）</button>
           </div>
 
           <div class="tab-panel active" id="refTab">
@@ -111,7 +120,7 @@
               </div>
               <div class="row-actions"><button class="button secondary" id="refAccountBtn">そのアカウントの投稿を集める</button></div>
               <p class="notice">反応数（いいね・返信）は、Threads の権限が付いているときだけ自動で取れます。取れない投稿は「反応数なし」と表示し、0とは扱いません。下限を入れると、反応数が取れた投稿のうち、下限に届かないものを候補に入れません。</p>
-              <p class="notice">Threads上の投稿をキーワードで検索して候補に追加します。Threads API の検索はアプリ審査前は自分の投稿しか返さないため、0件のときは自動で Web検索経由（Claude Code）に切り替えて公開投稿を最大8件集めます（1〜3分かかります）。それでも見つからない場合は、下の「手動で貼り付け」を使ってください。</p>
+              <p class="notice">キーワードで投稿を探して候補に追加します。今は他の人の投稿を直接検索できないため、見つからないときはWeb検索で探します（最大8件・1〜3分）。それでも見つからない場合は、下の「手動で貼り付け」を使ってください。</p>
               <details class="details">
                 <summary>手動で貼り付けて追加する</summary>
                 <div class="form-grid">
@@ -133,12 +142,13 @@
                     <option value="added">追加した順</option>
                   </select>
                   <button class="button secondary" id="refClearBtn">選択を全解除</button>
-                  <button class="button" id="refAnalyzeBtn">選んだ投稿の型を分析</button>
+                  <button class="button secondary" id="refAnalyzeBtn">選んだ投稿の型を分析</button>
                 </div>
               </div>
               <p class="notice">チェックした投稿が「型を分析」と「投稿生成」に使われます。本文をコピーするのではなく、フックや構造を学んで自分の言葉で書き直します。</p>
               <div id="refAnalysisBox" class="analysis-box" hidden></div>
               <div id="refList" class="stack"></div>
+              <div id="refListMore"></div>
             </div>
           </div>
 
@@ -169,7 +179,7 @@
             </div>
             <div class="form-grid">
               <label>目的<input id="goalInput" value="認知拡大と見込み客との接点作り" /></label>
-              <label>テーマ<input id="topicInput" placeholder="例: AI活用で日々の業務を軽くする体験談" /></label>
+              <label>テーマ<input id="topicInput" placeholder="例: AI活用で日々の業務を軽くする体験談" /><span class="sub-note" id="topicThemeNote" hidden>空欄のままにすると、設定の「発信テーマ」から混ぜて作ります</span></label>
               <label>投稿日（この日から予約時刻を順に割り当て）<input id="dateInput" type="date" /></label>
               <label>本数<input id="countInput" type="number" min="1" max="12" value="8" /></label>
             </div>
@@ -186,35 +196,37 @@
         <!-- 投稿キュー -->
         <section class="view" id="queue">
           <div class="panel">
-            <div class="panel-head">
-              <h3>投稿キュー</h3>
+            <div class="panel-head panel-head-actions">
               <div class="row-actions">
                 <button class="button secondary" id="bulkApproveBtn">承認待ちをすべて承認</button>
                 <button class="button secondary" id="addPostBtn">手動で追加</button>
+                <button class="button secondary" id="clearStaleBtn" hidden>古いエラーを片づける</button>
               </div>
             </div>
             <div class="filter-row" id="queueFilters">
-              <button class="chip active" data-status="all">すべて</button>
-              <button class="chip" data-status="review">承認待ち</button>
-              <button class="chip" data-status="approved">承認済み</button>
-              <button class="chip" data-status="scheduled">予約済み</button>
-              <button class="chip" data-status="published">公開済み</button>
-              <button class="chip" data-status="error">エラー</button>
-              <button class="chip" data-status="rejected">却下</button>
+              <button class="chip active" data-status="action">要対応<span class="chip-count"></span></button>
+              <button class="chip" data-status="review">承認待ち<span class="chip-count"></span></button>
+              <button class="chip" data-status="approved">承認済み<span class="chip-count"></span></button>
+              <button class="chip" data-status="scheduled">予約済み<span class="chip-count"></span></button>
+              <button class="chip" data-status="published">公開済み<span class="chip-count"></span></button>
+              <button class="chip" data-status="error">エラー<span class="chip-count"></span></button>
+              <button class="chip" data-status="rejected">却下<span class="chip-count"></span></button>
+              <button class="chip" data-status="all">すべて<span class="chip-count"></span></button>
             </div>
             <div id="postList" class="stack"></div>
+            <div id="postListMore"></div>
           </div>
         </section>
 
         <!-- コメント返信 -->
         <section class="view" id="replies">
           <div class="panel">
-            <div class="panel-head">
-              <h3>コメント返信</h3>
+            <div class="toolbar">
               <button class="button" id="fetchRepliesBtn">コメントを取得</button>
-                  <button class="button secondary" id="draftBatchBtn">AIでまとめて下書き</button>
-                  <button class="button" id="sendDraftsBtn">下書きをまとめて送信</button>
-                  <button class="button" id="ignoreHeldBtn">要確認をまとめて「対応しない」にする</button>
+              <button class="button secondary" id="draftBatchBtn">AIでまとめて下書き</button>
+              <span class="public-group"><button class="button secondary" id="sendDraftsBtn">下書きをまとめて送信</button><span class="public-note">Threadsへ公開されます</span></span>
+              <span class="spacer"></span>
+              <button class="button text-button" id="ignoreHeldBtn">要確認をまとめて「対応しない」にする</button>
             </div>
             <div class="filter-row" id="replyFilters">
               <button class="chip active" data-status="open">未対応</button>
@@ -225,6 +237,7 @@
               <button class="chip" data-status="all">すべて</button>
             </div>
             <p class="notice">公開済み投稿へのコメントを取得し、AIで返信の下書きを作ります。送信は必ず内容を確認してから行います。</p>
+            <p class="hint">要確認: クレーム・営業・個人情報・お金の話など、人が見てから決めたほうがよいコメント。対応しない: 返信せずに一覧から外したもの（あとで未対応に戻せます）。</p>
             <div id="replyList" class="stack"></div>
           </div>
         </section>
@@ -250,6 +263,11 @@
               <div class="panel-head"><h3>時間帯別（平均）</h3></div>
               <div id="timeSlotTable" class="table-wrap"></div>
             </section>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h3>テーマ別（平均）</h3></div>
+            <div id="themeTable" class="table-wrap"></div>
+            <p class="hint">設定の「発信テーマ」で作った投稿だけを数えています。見ているのは閲覧・いいね・返信の平均です。フォロワーはアカウント全体の数なので、どのテーマで増えたかは分かりません。</p>
           </div>
           <div class="panel">
             <div class="panel-head"><h3>投稿別（閲覧数順）</h3></div>
@@ -293,15 +311,22 @@
               <span class="notice inline" id="geminiStatus"></span>
             </div>
             <p class="notice" data-provider="claude-code">このPCにインストール済みの Claude Code を裏で呼びます。Claude Code でログイン済みなら追加設定は不要です。利用量は Claude の契約枠から消費されます。</p>
-            <p class="notice" data-provider="codex">このPCにインストール済みの Codex CLI（OpenAI）を裏で呼びます。ターミナルで <code>codex</code> を起動して ChatGPT アカウントでログイン済みなら追加設定は不要です。利用量は ChatGPT の契約枠から消費されます（1回あたり Claude Code より多め）。Web参照元・参考投稿の Web検索も使えます。</p>
+            <p class="notice" data-provider="codex">このPCにインストール済みの Codex CLI（OpenAI）を裏で呼びます。ターミナルで <code>codex</code> を起動して ChatGPT アカウントでログイン済みなら追加設定は不要です。利用量は ChatGPT の契約枠から消費されます（1回あたり Claude Code より多め）。Webで集めた参考・参考投稿の Web検索も使えます。</p>
             <p class="notice" data-provider="gemini">無料枠には1分あたり・1日あたりの回数制限があります。上限に達すると自動で待って再試行しますが、続けて使う場合はGoogle AI Studioで課金設定を入れてください。</p>
-            <p class="notice" data-provider="claude-api">Web参照元の検索（Google検索）は Claude API では使えません。参考投稿のThreads検索・手動貼り付けは使えます。</p>
+            <p class="notice" data-provider="claude-api">Webで集めた参考の検索（Google検索）は Claude API では使えません。参考投稿のThreads検索・手動貼り付けは使えます。</p>
             <p class="notice inline" id="researchProviderNote"></p>
           </div>
 
           <div class="panel">
             <div class="panel-head"><h3>2. Threads連携</h3></div>
             <div id="threadsConnection" class="connection-box"></div>
+            <div class="form-grid">
+              <label class="wide">連携コード<input id="threadsLinkCode" type="password" autocomplete="off" placeholder="TOPS1.…" /></label>
+              <p class="hint wide">この画面を渡した運営者（林）からメッセージで届く、TOPS1. で始まる1行を、全部そのまま貼って、画面下の「設定を保存」を押します。LINEやメールのほかの人にも見せないでください。</p>
+              <p class="notice inline wide" id="threadsLinkStatus"></p>
+            </div>
+            <details class="advanced-threads">
+              <summary>詳しい設定<span class="sub-note">（運営者に言われたときだけ触る）</span></summary>
             <div class="form-grid">
               <label>連携先として期待するユーザー名（@は不要。入れると、別のアカウントでの連携と投稿を止めます。空のままだと投稿・連携とも動きません）<input id="expectedThreadsUsername" autocomplete="off" placeholder="例: example_user" /></label>
               <label>Threads App ID（「ユースケース → Threads API → 設定」のID。「アプリの設定 → ベーシック」のアプリIDとは別）<input id="threadsAppId" autocomplete="off" /></label>
@@ -311,13 +336,15 @@
               <label class="wide">Scopes<input id="threadsScopes" autocomplete="off" /></label>
               <label class="wide">アクセストークン（手動で貼る場合のみ）<input id="threadsAccessToken" type="password" autocomplete="off" /></label>
             </div>
+            </details>
             <div class="row-actions">
-              <button class="button" id="threadsAuthBtn">Threadsと連携する（認可画面を開く）</button>
+              <button class="button secondary" id="threadsAuthBtn">Threadsと連携する</button>
+              <span class="notice inline warn" id="threadsAuthHint" hidden>先に連携コードを入れて保存します</span>
               <button class="button secondary" id="refreshThreadsTokenBtn">トークンを更新</button>
               <button class="button secondary danger" id="threadsDisconnectBtn">連携を解除</button>
             </div>
             <details class="details" id="threadsSetupHelp">
-              <summary>設定手順</summary>
+              <summary>設定手順<span class="sub-note">（Meta アプリを自分で作る場合だけ。運営者から連携コードが届いた方は読まなくてよい）</span></summary>
               <ol class="steps">
                 <li>Meta for Developers でアプリを作成し、ユースケースに Threads API を追加する</li>
                 <li>左メニュー「ユースケース」→ Threads API の「設定」を開く。ここに表示される <b>Threads App ID</b> と <b>Threads App Secret</b> を使う（「アプリの設定 → ベーシック」のアプリIDを使うと「アプリIDが送信されませんでした」エラーになる）</li>
@@ -346,30 +373,42 @@
           </div>
 
           <div class="panel">
-            <div class="panel-head"><h3>4. 運用</h3></div>
+            <div class="panel-head"><h3>4. 発信テーマ（任意）</h3><button class="button secondary" type="button" id="addThemeBtn">テーマを足す</button></div>
+            <p class="hint">発信する話題を、いくつか分けて登録できます（例: 温活／韓国ドラマ好きの50〜60代／60代の生き方）。投稿生成でテーマを空欄にすると、ここから「出す量」の割合で混ぜて作ります。「何日に1回は必ず」を選んだテーマは、その日数があいたら必ず入れます。1回の生成で入る必須テーマは各1本までなので、数日分をまとめて作ると2日目以降には入りません（毎日作るか、日を分けて作ってください）。1つも登録しなければ、今までどおりです。</p>
+            <div id="themeRows" class="setting-rows"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>5. 宣伝したいもの（任意）</h3><button class="button secondary" type="button" id="addCampaignBtn">宣伝を足す</button></div>
+            <p class="hint">期間が決まっているお知らせを登録し、「宣伝投稿を作る」を押すと、期間の毎日に1本ずつ（1日の本数を変えたときはその数）の投稿案が承認待ちに入ります。承認するまで外には出ません。期間の外の日時には予約できません。宣伝の投稿は読まれにくいので、1日1本をおすすめします。本文には、ふだんはURLを入れず「プロフィールのリンクから」と書きます。</p>
+            <div id="campaignRows" class="setting-rows"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>6. 運用</h3></div>
             <div class="form-grid">
               <label class="wide">この画面のアクセスキー（任意・8文字以上。同じPCの別ユーザーや、外から開くときの合言葉。空欄なら不要）<input id="accessKey" type="password" autocomplete="off" /></label>
               <label>1日の投稿数（1以上なら下の予約時刻は使わず、時間帯の中でランダムな時刻にします。0=下の固定時刻）<input id="postsPerDay" type="number" min="0" max="100" /></label>
               <label>投稿の開始時（日本時間・0〜23）<input id="scheduleFromHour" type="number" min="0" max="23" /></label>
-              <label>投稿の終了時（日本時間・1〜24）<input id="scheduleToHour" type="number" min="1" max="24" /></label>
-              <label class="toggle-row wide"><input id="rebuzzEnabled" type="checkbox" /> バズ投稿の再投稿をON（過去に閲覧数が多かった投稿を、同じ文面で毎日自動で予約します。予約投稿の自動送信がONなら、そのまま公開されます）</label>
+              <label>投稿の終了時（日本時間・1〜24。開始時より後にします）<input id="scheduleToHour" type="number" min="1" max="24" /></label>
+              <label class="toggle-row wide"><input id="rebuzzEnabled" type="checkbox" /> <span>バズ投稿の再投稿をON（過去に閲覧数が多かった投稿を、同じ文面で毎日自動で予約します。予約投稿の自動送信がONなら、そのまま公開されます）<span class="public-note">Threadsへ公開されます</span></span></label>
               <label>バズ再投稿の1日の本数（0〜50・上の投稿の開始時〜終了時に散らします）<input id="rebuzzPerDay" type="number" min="0" max="50" /></label>
               <label>バズ再投稿の対象にする閲覧数の下限<input id="rebuzzMinViews" type="number" min="0" max="1000000" /></label>
               <label>同じ投稿を再投稿するまで空ける日数（1〜365）<input id="rebuzzCooldownDays" type="number" min="1" max="365" /></label>
-              <label class="toggle-row wide"><input id="repostEnabled" type="checkbox" /> 自分の投稿の自動リポストをON（閲覧数の多い自分の投稿を、Threadsのリポスト機能で1日に決めた回数まで、投稿の開始時〜終了時のあいだに自動で行います。取り消しはThreads側で行います）</label>
+              <label class="toggle-row wide"><input id="repostEnabled" type="checkbox" /> <span>自分の投稿の自動リポストをON（閲覧数の多い自分の投稿を、Threadsのリポスト機能で1日に決めた回数まで、投稿の開始時〜終了時のあいだに自動で行います。取り消しはThreads側で行います）<span class="public-note">Threadsへ公開されます</span></span></label>
               <label>自動リポストの1日の回数（0〜50）<input id="repostPerDay" type="number" min="0" max="50" /></label>
               <label>自動リポストの対象にする閲覧数の下限<input id="repostMinViews" type="number" min="0" max="1000000" /></label>
               <label>同じ投稿をリポストするまで空ける日数（1〜365）<input id="repostCooldownDays" type="number" min="1" max="365" /></label>
               <label class="wide">予約時刻（1日の投稿数が0のときだけ使う・カンマ区切り・日本時間）<input id="scheduleTimes" placeholder="07:00,09:00,11:00" /></label>
-              <label class="toggle-row"><input id="autoPublishEnabled" type="checkbox" /> 予約投稿の自動送信をON（このサーバーが起動している間だけ動作）</label>
+              <label class="toggle-row"><input id="autoPublishEnabled" type="checkbox" /> <span>予約投稿の自動送信をON（このサーバーが起動している間だけ動作）<span class="public-note">Threadsへ公開されます</span></span></label>
             </div>
             <p class="notice">自動送信をONにしても、送られるのは「予約済み」の投稿だけです。承認待ちの投稿は送られません。</p>
             <p class="notice" id="dataDirNote"></p>
-            <h4>コメント対応の自動化（サーバー起動中に裏で動く）</h4>
+            <h4>コメント対応の自動化<span class="sub-note">（サーバー起動中に裏で動く）</span></h4>
             <div class="form-grid">
               <label class="toggle-row"><input id="autoFetchRepliesEnabled" type="checkbox" /> 新着コメントを自動で取り込む</label>
               <label>取り込み間隔（分）<input id="autoFetchRepliesMinutes" type="number" min="1" max="60" /></label>
-              <label class="toggle-row"><input id="autoReplyEnabled" type="checkbox" /> AIが判定して自動で返信する（クレーム・営業・個人情報・金銭・意味不明・事実確認が要る質問は「要確認」に残す）</label>
+              <label class="toggle-row"><input id="autoReplyEnabled" type="checkbox" /> <span>AIが判定して自動で返信する（クレーム・営業・個人情報・金銭・意味不明・事実確認が要る質問は「要確認」に残す）<span class="public-note">Threadsへ公開されます</span></span></label>
               <label>返信の間隔（秒）<input id="autoReplyIntervalSec" type="number" min="5" max="600" /></label>
               <label>1日の返信上限（件）<input id="autoReplyDailyCap" type="number" min="1" max="1000" /></label>
               <label class="toggle-row"><input id="autoInsightsEnabled" type="checkbox" /> インサイトを1日1回自動で取り込む</label>
@@ -380,8 +419,26 @@
             <p class="notice">自動返信がOFFのときも、コメント返信タブの「AIでまとめて下書き」で10件ずつ判定と下書きだけ作れます。送信は「この内容で返信する」を押したときだけです。ONにすると、AIが「返信する」と判定したものは間隔と上限の範囲で自動送信され、一覧に「自動返信」と表示されます。相手をユーザー名で呼ぶ書き方はしません。</p>
           </div>
 
+          <div class="panel" id="safetySettingsPanel">
+            <div class="panel-head"><h3>7. 出す前の安全確認の数値</h3></div>
+            <p class="hint">Threads は凍結の基準を公開していません。ここの数値はすべて暫定の目安です。小さくするほど早めに止まり、大きくするほど止まりにくくなります。ただし公式の上限（投稿は24時間で250件、返信は1,000件）より大きくはできません。ONとOFFは、概要の安全確認の欄で切り替えます。</p>
+            <div class="form-grid">
+              <label>1日の投稿の上限（既定10本・1〜250）。直近24時間の投稿がこの本数を超えるなら止めます。多くするほど止められやすくなる目安です<input id="safetyDailyPostLimit" type="number" min="1" max="250" /></label>
+              <label>予約の最小間隔（分・0〜240）。直前の投稿とこの分数より近い予約は、後ろへずらして送ります。宣伝の予約の時刻もこの間隔を空けて決めます<input id="safetyMinIntervalMinutes" type="number" min="0" max="240" /></label>
+              <label>自分の過去投稿と似ていて止める一致率（%・1〜100）。直近500件と比べて、これ以上似ていたら止めます<input id="safetySimilarBlockPct" type="number" min="1" max="100" /></label>
+              <label>似ていて注意する一致率（%・1〜100）。これ以上似ていたら、止めずに注意だけ出します。止める一致率より小さくします<input id="safetySimilarWarnPct" type="number" min="1" max="100" /></label>
+              <label>24時間の公開数の上限（件・1〜250）。公式の250件の手前で止めます。OFFでも効きます<input id="safetyMaxPostsPer24h" type="number" min="1" max="250" /></label>
+              <label>急に増えたと見る倍率（1〜10・小数第1位まで。例: 1.5）。直近24時間が、その前の24時間のこの倍を超えたら注意を出します<input id="safetySurgeRatio" type="number" min="1" max="10" step="0.1" /></label>
+              <label>リンク入りの本数（直近10本中・1〜10）。URL入りの投稿がこの本数以上なら注意を出します<input id="safetyLinkWarnCount" type="number" min="1" max="10" /></label>
+              <label>自動返信が似ていて止める一致率（%・1〜100）。直近20件の返信とこれ以上似ていたら止めます<input id="safetyReplySimilarPct" type="number" min="1" max="100" /></label>
+              <label>24時間の返信数の上限（件・1〜1000）。公式の1,000件の手前で止めます。OFFでも効きます<input id="safetyReplyMaxPer24h" type="number" min="1" max="1000" /></label>
+              <label class="wide">追加の禁止語（改行かカンマで区切る・2文字以上の語を100語まで）。ここに書いた語が入った投稿は止めます。1文字の語は、ほとんどの投稿に入ってしまうので入れられません。もとから入っている語に足されます。例（ペット）: お譲りします, 里親募集, 生体販売<textarea id="safetyBannedWords" rows="3" placeholder="お譲りします, 里親募集, 生体販売"></textarea></label>
+            </div>
+            <p class="notice">空欄のまま、または範囲の外の数字を入れて保存すると、保存が止まります。注意する一致率が止める一致率と同じか大きいときも止まります。直してからもう一度保存してください。</p>
+          </div>
+
           <div class="sticky-actions">
-            <span class="notice inline warn" id="settingsDirtyNote" hidden>未保存の変更があります。「設定を保存」を押すまで反映されません</span>
+            <span class="notice inline warn" id="settingsDirtyNote" hidden>保存していない変更があります</span>
             <span class="notice inline" id="settingsNotice"></span>
             <button class="button" id="saveSettingsBtn">設定を保存</button>
           </div>
@@ -404,9 +461,9 @@
               <option value="VIDEO">動画</option>
             </select>
           </label>
-          <label>メディアURL（画像・動画のとき）<input id="editMediaUrl" placeholder="https://..." /></label>
-          <label>代替テキスト<input id="editAltText" /></label>
-          <label>トピックタグ<input id="editTopicTag" placeholder="例: ハンドメイド" /></label>
+          <label>画像・動画のURL（公開されているもの）<input id="editMediaUrl" placeholder="https://..." /></label>
+          <label>画像の説明文（読み上げ用）<input id="editAltText" /></label>
+          <label>話題のタグ<input id="editTopicTag" placeholder="例: ハンドメイド" /></label>
         </div>
         <datalist id="categoryList">
           <option value="Tips"></option><option value="本音・共感"></option><option value="失敗談"></option><option value="問いかけ"></option>

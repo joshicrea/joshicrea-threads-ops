@@ -1,5 +1,2 @@
-# Linux で動かすファイルは LF 固定（Windows の autocrlf で CRLF になると bash/systemd が読めない）
-*.sh text eol=lf
-*.service text eol=lf
-Caddyfile text eol=lf
-*.example text eol=lf
+# Linuxサーバーへ置くファイルは常にLF（WindowsのチェックアウトでCRが混ざるのCR再発を防ぐ）
+deploy/* text eol=lf
