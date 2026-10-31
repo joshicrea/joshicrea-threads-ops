@@ -115,7 +115,7 @@ function nextStep(s, tokenExpired) {
   if (tokenExpired) return "Threads の連携が期限切れです。threads_auth_url でもう一度連携してください。";
   if (st.aiProvider === "gemini" && !st.geminiApiKey) return "文章を作る AI が使えない設定です。threads_update_settings で aiProvider を claude-code にしてから、threads_ai_check で確かめてください。";
   if (!st.lastAiCheckAt) return "文章を作る AI がこの PC で動くか、threads_ai_check で確かめてください（最大3分）。";
-  if (!st.brandName || !st.profile) return "発信者情報が空です。初回セットアップ（名前・何をしている人か・文体）を1問ずつ聞いて、threads_update_settings で保存してください。";
+  if (!st.brandName || !st.profile) return "発信者情報が空です。初回セットアップ（名前・何をしている人か・文体・最後の一言）を1問ずつ聞いて、threads_update_settings で保存してください。文体は好みを聞く前に、利用者が過去に書いた文章を2〜3本貼ってもらい、そこから決まりごとの下書きを作って本人に確かめてください（手順は threads_guide の「3. はじめて使う人」）。";
   if (review) return `承認待ちの投稿が ${review} 件あります。threads_list_posts（status=review）で本文を見せて、承認するか聞いてください。`;
   if ((st.themes || []).some((t) => t.enabled !== false)) return "投稿案を作れます。発信テーマが設定済みなので、テーマは聞かずに、目的だけ聞いて threads_generate_posts を topic なしで呼んでください（テーマは設定から自動で割り当てます）。";
   return "投稿案を作れます。目的とテーマを1つずつ聞いてから threads_generate_posts を呼んでください。";
@@ -182,6 +182,25 @@ const tools = [
     run: async ({ campaignId }) => {
       const r = await api(`/api/campaigns/${encodeURIComponent(campaignId)}/generate`, { method: "POST", body: {} });
       return { created: (r.posts || []).map(briefPost), planned: r.planned, missing: r.missing, skipped: r.skipped || [], skippedDays: r.skippedDays || [] };
+    }
+  },
+  {
+    name: "threads_research",
+    description: "同じジャンルで反応を集めている Threads の投稿をまとめて調べる（裏で進むジョブ。1テーマで5〜10分ほど、最大20分で打ち切り）。keyword を省略すると、設定の発信テーマ（最大3つ）ごとに調べる。keyword を渡すときは、設定のどの発信テーマの分かを theme に入れる（入れると、そのテーマの投稿を作るときに使われる。入れなければその場の調べものとして扱い、次のその場の調べもので入れ替わる）。候補は Threads のページで全文と実際のいいね・返信数を確かめたものだけを残し、日本語でないもの・確かめられないものを除き、反応の大きい順に pick 件（既定5）を投稿生成の参考に自動で使い、型（フックの種類・構造）を分析する。minLikes=いいねの下限、maxAgeDays=何日以内の投稿だけにするか（0は制限なし）。開始したら threads_research_status で進み具合と結果を確かめる。",
+    inputSchema: { type: "object", properties: { keyword: { type: "string" }, theme: { type: "string" }, minLikes: { type: "integer", minimum: 0 }, maxAgeDays: { type: "integer", minimum: 0 }, pick: { type: "integer", minimum: 1, maximum: 8 } }, additionalProperties: false },
+    run: async (args) => {
+      const r = await api("/api/research/run", { method: "POST", body: args });
+      return { job: r.job, alreadyRunning: Boolean(r.alreadyRunning), targets: r.targets || [], next: "数分おきに threads_research_status で確かめる（待つ間に他の作業をしてよい）" };
+    }
+  },
+  {
+    name: "threads_research_status",
+    description: "threads_research の進み具合と結果を返す。cancel=true で進行中のリサーチを止める（今開いているページが終わったところで止まり、集め終わった分は残る）。終わっていれば、テーマごとの件数（候補→ページで確かめられた→使う）・除外の理由・自動で使うことにした投稿（いいね・返信・フックの種類・本文の冒頭・元投稿のURL）を返す。結果は利用者に、数字とURLを添えてそのまま見せる。",
+    inputSchema: { type: "object", properties: { jobId: { type: "string" }, cancel: { type: "boolean" } }, additionalProperties: false },
+    run: async ({ jobId, cancel }) => {
+      const target = encodeURIComponent(jobId || "latest");
+      if (cancel) await api(`/api/research/jobs/${target}/cancel`, { method: "POST", body: {} });
+      return api(`/api/research/jobs/${target}`);
     }
   },
   {
@@ -261,12 +280,12 @@ const tools = [
   },
   {
     name: "threads_insights",
-    description: "インサイト（閲覧・いいね・返信）を取り込み、カテゴリ別・時間帯別・テーマ別（byTheme）・投稿別の集計を返す。テーマ別は閲覧数・反応の平均で、フォロワーがどのテーマで増えたかは分からない。refresh=false なら取り込まず集計だけ。",
+    description: "インサイト（閲覧・いいね・返信）を取り込み、カテゴリ別・時間帯別・テーマ別（byTheme）・投稿別の集計と、1文目の型別の実績（typeStats。本数5未満の型は判定不能）を返す。テーマ別は閲覧数・反応の平均で、フォロワーがどのテーマで増えたかは分からない。refresh=false なら取り込まず集計だけ。",
     inputSchema: { type: "object", properties: { refresh: { type: "boolean", default: true } }, additionalProperties: false },
     run: async ({ refresh = true }) => {
       const fetched = refresh ? await api("/api/refresh-insights", { method: "POST" }) : null;
       const s = await api("/api/state");
-      return { fetched, stats: s.stats };
+      return { fetched, stats: s.stats, typeStats: await api("/api/pattern-stats") };
     }
   },
   {

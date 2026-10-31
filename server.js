@@ -22,6 +22,8 @@ import { existsSync, chmodSync, readFileSync, unlinkSync, readdirSync, statSync 
 import { extname, join, normalize, sep, dirname, delimiter } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { findChrome, verifyCandidates, filterCandidates, reactionScore, MAX_VERIFY as MAX_VERIFY_PAGES, MAX_VERIFY_MULTI } from "./research.js";
+import { emptyLicenseState, licenseCheckDue, licenseConfigured, licenseDecision, resolveLicenseUrl, runLicenseCheck } from "./license.js";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(ROOT, "public");
@@ -83,6 +85,13 @@ const TOKEN_REFRESH_BEFORE_MS = 7 * 24 * 60 * 60 * 1000;
 const SCHEDULE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
 const SCHEDULE_STALE_MS = 24 * 60 * 60 * 1000;
 const SCHEDULE_RETRY_MAX = 5;
+// 予約から1時間を超えて遅れた投稿（24時間以内）は、その場で出さず空き枠へ振り直す（PC停止明けに前後10分以内でまとめ出しになるのを防ぐ・Q319/Q333）。
+// 1時間・30分・7日は暫定値で、林さんの確定値ではない
+const SCHEDULE_LATE_RESCHEDULE_MS = 60 * 60 * 1000;
+const SCHEDULE_RESCHEDULE_MIN_GAP_MS = 30 * 60 * 1000;
+const SCHEDULE_RESCHEDULE_MAX_DAYS = 7;
+// 振り直しを繰り返して、最初の予約から7日を超えて遅れ続けた投稿は、これ以上振り直さず止める（暫定・林さん未確定。Q527）
+const SCHEDULE_RESCHEDULE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const MONITORING_HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
 
 const MIME_TYPES = {
@@ -96,7 +105,7 @@ const MIME_TYPES = {
 
 export const POST_STATUSES = ["review", "approved", "scheduled", "published", "rejected", "error"];
 export const THREADS_TEXT_LIMIT = 500;
-const CONTENT_FIELDS = ["text", "category", "format", "mediaUrl", "altText", "topicTag", "scheduledAt", "strategyMemo", "theme"];
+const CONTENT_FIELDS = ["text", "category", "format", "mediaUrl", "altText", "topicTag", "scheduledAt", "strategyMemo", "theme", "hookType", "patternId"];
 const DEFAULT_SCOPES = "threads_basic,threads_content_publish,threads_read_replies,threads_manage_replies,threads_manage_insights,threads_keyword_search,threads_profile_discovery";
 // 方式B（提供元の中継で連携）の標準。キーワード検索・他アカウント閲覧は Meta の審査が別に要るため含めない
 const HOSTED_DEFAULT_SCOPES = "threads_basic,threads_content_publish,threads_read_replies,threads_manage_replies,threads_manage_insights";
@@ -121,6 +130,9 @@ const defaultSettings = {
   materialFolder: "", // 素材フォルダ（このPC上のパス）。中の .md/.txt を読んで素材にし、写真・動画はファイル名だけ使う
   replyStyle: "", // 返信だけの文体（口調・絵文字）。空なら writingRules に従う。投稿の生成には効かない（補充の絵文字ゲートと食い違わせないため）
   expectedThreadsUsername: "", // 連携先として期待するユーザー名。設定すると、別のアカウントでの連携を拒否する（運用代行で他人の口座へ投稿しない）
+  licenseKey: "", // 提供元が発行する許可キー。空なら照合しない（提供元自身の口座）。契約: ライセンス台帳API_契約.md 4-1
+  licenseServerUrl: "", // 照合先（https の /lic まで）。許可キーとセットで提供元が渡す
+  licenseResumeMode: "ask", // 停止から再開したとき、過ぎた予約を ask=1件ずつ選ぶ / auto=そのまま出す
   threadsAppId: "",
   threadsAppSecret: "",
   threadsOAuthExchangeUrl: "",
@@ -140,8 +152,8 @@ const defaultSettings = {
   autoInsightsEnabled: true,
   autoDeleteLowLikesEnabled: false,
   autoDeleteAfterHours: 24,
-  autoDeleteMaxLikes: 9,
-  autoDeleteMaxReplies: 9, // 2026-10-03 林さん指示: いいねもコメントも10未満(9以下)のときだけ削除。どちらかが10以上なら残す
+  autoDeleteMaxLikes: 0,
+  autoDeleteMaxReplies: 0, // 2026-10-29 林さん決定（ガイア経由）: 反応が何もない（いいね0かつコメント0）投稿だけを削除対象にする既定。旧既定は9/9（2026-10-03）で、公開投稿の大半を24時間で消していた（監査FT-15）。どちらかが1以上なら残す
   lastAutoDeleteFailureAt: "",
   autoDeleteEnabledAt: "",
   autoDeleteBlockedToken: "",
@@ -203,6 +215,7 @@ const defaultDb = {
   research: [],
   references: [],
   referenceAnalysis: null,
+  researchRuns: [], // まとめてリサーチの記録（新しい順・30件まで）
   suggestions: [],
   monitoring: {
     lastHeartbeatAt: "",
@@ -236,7 +249,7 @@ const knownSecrets = new Set();
 let accessKeyCache = "";
 function rememberSecrets(settings) {
   knownSecrets.clear();
-  for (const key of ["threadsAccessToken", "threadsAppSecret", "threadsOAuthClientToken", "geminiApiKey", "anthropicApiKey", "accessKey"]) {
+  for (const key of ["threadsAccessToken", "threadsAppSecret", "threadsOAuthClientToken", "geminiApiKey", "anthropicApiKey", "accessKey", "licenseKey"]) {
     const v = String(settings[key] || "");
     if (v.length >= 8) knownSecrets.add(v);
   }
@@ -596,6 +609,7 @@ function publicSettings(settings) {
     threadsAccessToken: maskSecret(settings.threadsAccessToken),
     threadsAppSecret: maskSecret(settings.threadsAppSecret),
     threadsOAuthClientToken: maskSecret(settings.threadsOAuthClientToken),
+    licenseKey: maskSecret(settings.licenseKey),
     accessKey: maskSecret(settings.accessKey)
   };
 }
@@ -1398,7 +1412,7 @@ function toResearchRecord(keyword, parsed) {
 const THREADS_POST_URL = /^https?:\/\/(?:www\.)?threads\.(?:com|net)\/@([A-Za-z0-9._]+)\/post\/([A-Za-z0-9_-]+)/;
 const THREADS_WEB_SEARCH_TIMEOUT_MS = 300_000;
 
-async function searchThreadsPostsViaWeb(settings, keyword) {
+async function searchThreadsPostsViaWeb(settings, keyword, { max = 8 } = {}) {
   const provider = settings.aiProvider || "gemini";
   if (provider !== "claude-code" && provider !== "codex") {
     throw new HttpError(400, "Threads の公開投稿を Web 経由で探す機能は、AIプロバイダが Claude Code か Codex のときだけ使えます。設定で切り替えるか、参考投稿の「手動で貼り付け」を使ってください。");
@@ -1422,7 +1436,7 @@ async function searchThreadsPostsViaWeb(settings, keyword) {
   const prompt = [
     "Threads（threads.com）の公開投稿から、次のキーワードに関する投稿を集めてください。",
     "手順: WebSearch を allowed_domains に threads.com を指定して2〜3回（言い回しを変えて）実行し、URL が https://www.threads.com/@ユーザー名/post/ID の形のものだけを候補にする（プロフィールURLは除外）。",
-    "候補のうち、検索結果の抜粋に本文が見えているものから最大8件を選び、検索結果に表示された抜粋を一字も変えずに text に入れる。ユーザー名（@なし）は URL から取る。投稿日は検索結果に書かれているときだけ入れる（YYYY-MM-DD）。",
+    `候補のうち、検索結果の抜粋に本文が見えているものから最大${max}件を選び、検索結果に表示された抜粋を一字も変えずに text に入れる。ユーザー名（@なし）は URL から取る。投稿日は検索結果に書かれているときだけ入れる（YYYY-MM-DD）。`,
     "ページは開かない（Threads はログイン画面に遮られ、開くと本文やいいね数を創作してしまうため、WebFetch は使わない）。いいね数・返信数は取れないので出力しない。抜粋が見えない候補は除外する。要約・補完・創作をしない。",
     `キーワード: ${keyword}`
   ].join("\n");
@@ -2165,10 +2179,124 @@ function topPerformingPosts(db, limit = 5) {
     .slice(0, limit);
 }
 
+// 生成に入れる参考投稿。人が選んだものは今までどおり全部入れる。
+// まとめてリサーチが自動で選んだものは、今回のテーマに合うものだけを反応順に上限まで入れる（全テーマ分を毎回入れない）
+const DRAFT_RESEARCH_REF_MAX = 6;
+function selectDraftReferences(db, request) {
+  const selected = db.references.filter((ref) => ref.selected);
+  const auto = selected.filter((ref) => ref.autoSelected && ref.theme);
+  if (!auto.length) return selected;
+  const manual = selected.filter((ref) => !(ref.autoSelected && ref.theme));
+  const wanted = new Set([...(request.themePlan || []).map((t) => t.name), request.topic].filter(Boolean));
+  const matched = auto.filter((ref) => wanted.has(ref.theme));
+  const configured = new Set((db.settings?.themes || []).map((t) => t.name));
+  const pool = matched.length ? matched : auto.filter((ref) => !configured.has(ref.theme));
+  return [...manual, ...[...pool].sort((a, b) => reactionScore(b.metrics) - reactionScore(a.metrics)).slice(0, DRAFT_RESEARCH_REF_MAX)];
+}
+
+// ---------------------------------------------------------------------------
+// 共有の型ライブラリ（patterns/patterns.json・提供元が配布物に同梱する読み取り専用ファイル）と、この口座の型別の実績
+// 守備範囲: 型の選び方と集計だけ。型を使った投稿が伸びるかは、後から typePerformance で測る
+// ---------------------------------------------------------------------------
+// ファイルが無い・壊れている・patterns が空なら空配列。そのとき生成プロンプトは変更前の版と1字も変わらない
+function loadSharedPatterns() {
+  try {
+    const raw = JSON.parse(readFileSync(process.env.THREADS_PATTERNS_PATH || join(ROOT, "patterns", "patterns.json"), "utf8"));
+    return (Array.isArray(raw?.patterns) ? raw.patterns : []).filter((p) => p && p.id && HOOK_TYPES.includes(p.hookType) && p.skeleton);
+  } catch {
+    return [];
+  }
+}
+
+const RECENT_TYPE_WINDOW = 5; // 直近何本の自分の投稿の型を「最近使った」とみなすか
+const postTimeMs = (p) => Date.parse(p.publishedAt || p.scheduledAt || p.createdAt || "") || 0;
+const isOwnOriginalPost = (p) => !p.replyToId && p.origin !== "rebuzz" && !p.rebuzzOf;
+
+// テーマ（今回のテーマ・発信テーマ・プロフィール）に合う型を優先し、直近の自分の投稿で使った型は後ろへ回す
+function selectSharedPatterns(db, { topic = "", themes = [], count = 3 } = {}) {
+  const library = loadSharedPatterns();
+  if (!library.length) return [];
+  const recent = (db.posts || []).filter((p) => isOwnOriginalPost(p) && p.status !== "rejected").sort((a, b) => postTimeMs(b) - postTimeMs(a)).slice(0, RECENT_TYPE_WINDOW);
+  const usedTypes = new Set(recent.map((p) => p.hookType).filter(Boolean));
+  const usedIds = new Set(recent.map((p) => p.patternId).filter(Boolean));
+  const s = db.settings || {};
+  const haystack = [topic, ...themes, s.profile, s.brandName, s.materials].filter(Boolean).join(" ");
+  const fit = (p) => {
+    const words = Array.isArray(p.themes) ? p.themes : [];
+    const hits = words.filter((w) => w !== "汎用" && haystack.includes(w)).length;
+    return hits || (words.includes("汎用") ? 0.5 : 0);
+  };
+  return library
+    .map((p, i) => ({ p, i, fit: fit(p), used: usedIds.has(p.id) ? 2 : usedTypes.has(p.hookType) ? 1 : 0 }))
+    .filter((x) => x.fit > 0)
+    .sort((a, b) => a.used - b.used || b.fit - a.fit || a.i - b.i)
+    .slice(0, count)
+    .map((x) => x.p);
+}
+
+function sharedPatternLines(patterns) {
+  if (!patterns.length) return [];
+  return [
+    "## 実績のある型（共有ライブラリ）",
+    "他の口座や公開投稿で反応が出た型です。骨子の構造（入り方→展開→締め）だけを借り、題材・言葉・経験は上の発信者のものに置き換える。骨子の[ ]は発信者の実態で埋め、実態に無いものは作らない。発信者に合わない型は使わない。",
+    "型を使った投稿は patternId にその id を書く（使わなかった投稿は空文字）。",
+    ...patterns.map((p) => `- id=${p.id}（${p.hookType}）${p.name}: 骨子=${p.skeleton} / 効く理由=${p.whyItWorks} / 根拠=${p.evidence?.sourceKind || "不明"}・${p.evidence?.scale || "規模不明"}`),
+    ""
+  ];
+}
+
+// 型別の実績。再投稿・返信・公開24時間未満・公開日時の無い投稿・数字の無い投稿は除く。
+// 本数が TYPE_PERF_MIN_POSTS 未満の型、または口座全体の中央値が0・無いときは「判定不能」で比率を出さない。
+// 「出ている／出ていない」の 1.2倍・0.8倍は暫定の目安（実測で決めた値ではない）
+const TYPE_PERF_MIN_POSTS = 5;
+function medianOf(values) {
+  if (!values.length) return null;
+  const v = [...values].sort((a, b) => a - b);
+  const m = Math.floor(v.length / 2);
+  return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+}
+function typePerformance(db, now = Date.now()) {
+  const metrics = latestMetricsByPost(db);
+  const rows = (db.posts || [])
+    .filter((p) => p.status === "published" && isOwnOriginalPost(p) && metrics.has(p.id) && now - (Date.parse(p.publishedAt || "") || now) >= 24 * 60 * 60 * 1000)
+    .map((p) => ({ p, views: Number(metrics.get(p.id).views) || 0 }));
+  const overallMedian = medianOf(rows.map((r) => r.views));
+  const summarize = (list) => {
+    const medianViews = medianOf(list.map((r) => r.views));
+    const ratio = list.length >= TYPE_PERF_MIN_POSTS && overallMedian > 0 ? +(medianViews / overallMedian).toFixed(2) : null;
+    return { count: list.length, medianViews, ratio, verdict: ratio === null ? "判定不能" : ratio >= 1.2 ? "出ている" : ratio <= 0.8 ? "出ていない" : "並" };
+  };
+  const groupBy = (keyFn) => {
+    const acc = new Map();
+    for (const r of rows) { const k = keyFn(r.p); if (k) acc.set(k, [...(acc.get(k) || []), r]); }
+    return [...acc].map(([key, list]) => ({ key, ...summarize(list) })).sort((a, b) => (b.ratio ?? -1) - (a.ratio ?? -1) || b.count - a.count);
+  };
+  const typed = (p) => HOOK_TYPES.includes(p.hookType) ? p.hookType : "";
+  return {
+    overall: { count: rows.length, medianViews: overallMedian },
+    untyped: rows.filter((r) => !typed(r.p)).length,
+    minPosts: TYPE_PERF_MIN_POSTS,
+    byType: groupBy(typed).map(({ key, ...x }) => ({ hookType: key, ...x })),
+    byTypeTheme: groupBy((p) => typed(p) && p.theme ? `${p.hookType}\t${p.theme}` : "").map(({ key, ...x }) => ({ hookType: key.split("\t")[0], theme: key.split("\t")[1], ...x }))
+  };
+}
+function typePerformanceLines(perf) {
+  if (!perf.byType.length) return [];
+  return [
+    "## この口座で反応が出ている型／出ていない型（型ごとの閲覧数の中央値を、口座全体の中央値と比べたもの）",
+    `口座全体: ${perf.overall.count}本・閲覧数の中央値${perf.overall.medianViews ?? "なし"}（再投稿・返信・公開24時間未満は除く。型が記録されていない${perf.untyped}本は型別に入らない）`,
+    ...perf.byType.map((t) => (t.ratio === null
+      ? `- ${t.hookType}: ${t.count}本（${perf.minPosts}本未満または比べる基準が無いため判定不能。比率は出さない）`
+      : `- ${t.hookType}: ${t.count}本・中央値${t.medianViews}・口座比${t.ratio}倍（${t.verdict}）`)),
+    "反応が出ている型を多めに使い、出ていない型は減らす。判定不能の型を良し悪しの根拠にしない。上の「過去に反応が良かった投稿」は全期間の上位5件だけなので、偏りをこの表で補う。",
+    ""
+  ];
+}
+
 function buildDraftPrompt(db, request) {
   const settings = db.settings;
   const sources = db.research.flatMap((item) => (item.sources || []).filter((s) => s.selected).map((s) => ({ ...s, summary: item.summary })));
-  const references = db.references.filter((ref) => ref.selected);
+  const references = selectDraftReferences(db, request);
   const top = topPerformingPosts(db);
   const lines = [
     "あなたはThreads運用の編集者です。以下の発信者になりきって投稿案を作ってください。",
@@ -2192,8 +2320,9 @@ function buildDraftPrompt(db, request) {
       "参考投稿を選ぶ際は、その内容が発信者にとって実際に語れる/行える行動かを確認する（発信者がしていない行動——他人のアプリ開発の話・関係のないイベント出店等——をそのまま真似ない）。"
     );
     for (const ref of references) {
-      lines.push(`- 投稿: ${ref.text.replace(/\s+/g, " ").slice(0, 400)}`);
-      if (ref.analysis?.hook) lines.push(`  型: フック=${ref.analysis.hook} / 構造=${ref.analysis.structure} / 効いている理由=${ref.analysis.whyItWorks}`);
+      const reaction = ref.verifiedAt && ref.metrics?.likes !== null && ref.metrics?.likes !== undefined ? `（実際の反応: いいね${ref.metrics.likes}・返信${ref.metrics.replies ?? 0}）` : "";
+      lines.push(`- 投稿${reaction}: ${ref.text.replace(/\s+/g, " ").slice(0, 400)}`);
+      if (ref.analysis?.hook) lines.push(`  型: フック=${ref.analysis.hook}${ref.verifiedAt && ref.analysis.hookType ? `（${ref.analysis.hookType}）` : ""} / 構造=${ref.analysis.structure} / 効いている理由=${ref.analysis.whyItWorks}`);
     }
     lines.push("");
   }
@@ -2201,6 +2330,12 @@ function buildDraftPrompt(db, request) {
   if (db.referenceAnalysis?.commonPatterns && analysisStillRelevant) {
     lines.push("## 参考投稿に共通する型", db.referenceAnalysis.commonPatterns, "");
   }
+  // まとめてリサーチで使う投稿を選んだ回の「共通する型」（今回入れた投稿を選んだ回だけ）
+  const usedRunIds = new Set(references.filter((ref) => ref.autoSelected && ref.researchRunId).map((ref) => ref.researchRunId));
+  for (const run of (db.researchRuns || []).filter((r) => usedRunIds.has(r.id) && r.commonPatterns)) {
+    lines.push(`## リサーチ「${run.theme}」で反応の大きい投稿に共通する型`, run.commonPatterns, "");
+  }
+  lines.push(...sharedPatternLines(selectSharedPatterns(db, { topic: request.topic, themes: (request.themePlan || []).map((t) => t.name), count: 3 })));
   const latestSuggestion = db.suggestions?.[0];
   if (latestSuggestion) {
     lines.push("## 直近の実績分析からの方針（従う）");
@@ -2221,6 +2356,7 @@ function buildDraftPrompt(db, request) {
     for (const { post, m } of top) lines.push(`- [views ${m.views || 0} / likes ${m.likes || 0} / replies ${m.replies || 0}] ${post.text.replace(/\s+/g, " ").slice(0, 160)}`);
     lines.push("");
   }
+  lines.push(...typePerformanceLines(typePerformance(db)));
   lines.push(...profilePromptLines());
   lines.push(
     "## 書き方",
@@ -2475,6 +2611,8 @@ function buildCampaignPrompt(db, campaign, slots) {
   ].join("\n");
 }
 
+// 1文目の入り方の種類。参考投稿の分析・自分の投稿の記録・共有ライブラリで同じ語彙を使う
+const HOOK_TYPES = ["question", "empathy", "story", "bold-claim", "contrarian", "list", "other"];
 const draftSchema = {
   type: "object",
   properties: {
@@ -2485,9 +2623,11 @@ const draftSchema = {
         properties: {
           category: { type: "string" },
           text: { type: "string" },
-          topicTag: { type: "string" }
+          topicTag: { type: "string" },
+          hookType: { type: "string", enum: HOOK_TYPES, description: "1文目の入り方の種類。question=問いかけ／empathy=あるある・共感／story=体験談／bold-claim=言い切り／contrarian=常識の逆／list=まとめ・数を先に言う／other" },
+          patternId: { type: "string", description: "共有ライブラリの型を使ったときはその id。使っていなければ空文字" }
         },
-        required: ["category", "text"]
+        required: ["category", "text", "hookType"]
       }
     },
     strategyMemo: { type: "string" }
@@ -2540,7 +2680,7 @@ function buildReferenceAnalysisPrompt(settings, references) {
     "（括弧の数字は、その投稿の実際の反応数です。数字がある投稿は、数字の大きさの違いを踏まえて、反応を集めた投稿に共通する型を挙げてください。数字の無い投稿の反応数を推測しないでください）",
     "",
     "## 出力の指示",
-    "- items: 各投稿について hook（冒頭1行で注意を引いている仕掛け）・structure（本文の構造を3〜5語の並びで）・whyItWorks（反応を集める理由）・howToAdapt（この発信者ならどう置き換えるか、具体的に1〜2文）",
+    "- items: 各投稿について hook（冒頭1行で注意を引いている仕掛け）・hookType（フックの種類。次のどれか1つ: question=問いかけ／empathy=あるある・共感／story=体験談／bold-claim=言い切り／contrarian=常識の逆／list=まとめ・箇条書き／other）・structure（本文の構造を3〜5語の並びで）・whyItWorks（反応を集める理由）・howToAdapt（この発信者ならどう置き換えるか、具体的に1〜2文）",
     "- commonPatterns: 全投稿に共通する型を箇条書きの文章で3〜5点",
     "- 日本語で。絵文字は使わない"
   ].join("\n");
@@ -2556,6 +2696,7 @@ const referenceAnalysisSchema = {
         properties: {
           id: { type: "string" },
           hook: { type: "string" },
+          hookType: { type: "string", enum: HOOK_TYPES },
           structure: { type: "string" },
           whyItWorks: { type: "string" },
           howToAdapt: { type: "string" }
@@ -2604,7 +2745,29 @@ const replyDraftSchema = {
   required: ["text"]
 };
 
-function buildSuggestionPrompt(settings, stats) {
+// 直近3件の提案と、その後の投稿で提案の型が使われた割合。提案が毎日ほぼ同じ文になる堂々巡りを止めるために渡す
+function suggestionText(sug) {
+  return [...(sug?.doMore || []), ...(sug?.avoid || []), ...(sug?.nextTopics || [])].join(" ");
+}
+function suggestionHistoryLines(db) {
+  const recent = (db.suggestions || []).slice(0, 3);
+  if (!recent.length) return [];
+  const lines = ["## 直近の提案と、その後に提案の型が使われた割合（同じ提案を繰り返さない）"];
+  for (const sug of recent) {
+    const since = Date.parse(sug.at || "") || 0;
+    const after = (db.posts || []).filter((p) => isOwnOriginalPost(p) && p.status !== "rejected" && HOOK_TYPES.includes(p.hookType) && (Date.parse(p.createdAt || "") || 0) >= since);
+    const rec = (sug.recommendedHookTypes || []).filter((t) => HOOK_TYPES.includes(t));
+    const hit = after.filter((p) => rec.includes(p.hookType)).length;
+    const usage = !rec.length ? "推した型の記録なし（使われたかは測れない）"
+      : !after.length ? "その後の型つき投稿0本（判定不能）"
+        : `その後の型つき投稿${after.length}本中${hit}本（${Math.round((hit / after.length) * 100)}%）が推した型`;
+    lines.push(`- ${String(sug.at || "").slice(0, 10)}: 伸ばす=${(sug.doMore || []).join(" / ") || "なし"} / 減らす=${(sug.avoid || []).join(" / ") || "なし"} / 推した型=${rec.join("・") || "なし"} / ${usage}`);
+  }
+  lines.push("- 上と同じ方針・同じテーマ案を言い換えて出さない。推した型があまり使われていないなら、同じことを繰り返さず、使われなかった理由が投稿データから読めるかを書く。使われて反応が変わらないなら、別の切り口を出す", "");
+  return lines;
+}
+
+function buildSuggestionPrompt(settings, stats, db) {
   return [
     "あなたはThreads運用のアナリストです。以下の実績データから、次の1週間の投稿方針を提案してください。",
     "出力は指定JSONのみ。数字はデータにあるものだけを使い、根拠のない断定はしない。",
@@ -2615,12 +2778,15 @@ function buildSuggestionPrompt(settings, stats) {
     "## 実績データ（JSON）",
     JSON.stringify(stats, null, 1).slice(0, 12_000),
     "",
+    ...typePerformanceLines(typePerformance(db)),
+    ...suggestionHistoryLines(db),
     "## 出力の指示",
     "- summary: 全体の傾向を3〜5文で",
     "- doMore: 伸ばすべきカテゴリ・切り口・時間帯（理由付き、最大3点。データが足りなければ少なくてよい）",
     "- avoid: 反応が弱かったので減らすもの（理由付き、最大3点。無ければ空配列）",
     "- nextTopics: 次に書くべき投稿テーマ案（最大5つ・各1文）",
     "- styleNotes: 文体・構成で気づいたことを最大3点",
+    `- recommendedHookTypes: 次の1週間で増やす1文目の型（${HOOK_TYPES.join("・")} のうち最大3つ）。型別の実績で判定不能の型を、根拠なく推さない`,
     "- excludedRecent は公開24時間未満で集計から外した件数。数字の少なさを根拠に断定しない",
     "- 伸びている投稿(top)は、1文目の入り方・構成・話題・時間帯のどれが効いたかを、投稿本文の実物から具体的に書く。本文にない理由は書かない",
     "- 本数が少ない区分の平均で断定しない。件数(count)が2件以下の区分は傾向として扱わない",
@@ -2636,7 +2802,8 @@ const suggestionSchema = {
     doMore: { type: "array", items: { type: "string" } },
     avoid: { type: "array", items: { type: "string" } },
     nextTopics: { type: "array", items: { type: "string" } },
-    styleNotes: { type: "array", items: { type: "string" } }
+    styleNotes: { type: "array", items: { type: "string" } },
+    recommendedHookTypes: { type: "array", items: { type: "string", enum: HOOK_TYPES } }
   },
   required: ["summary", "doMore", "avoid", "nextTopics", "styleNotes"]
 };
@@ -2714,6 +2881,13 @@ function normalizePost(input) {
     safety: input.safety || null,
     safetyOverride: input.safetyOverride || null,
     ...(input.theme ? { theme: String(input.theme).slice(0, 60) } : {}),
+    // 遅れた予約を振り直したときの記録（元の予約時刻・振り直した時刻・空きが無く振り直せなかった印）。編集で消えないように持ち越す
+    ...(input.originalScheduledAt ? { originalScheduledAt: input.originalScheduledAt } : {}),
+    ...(input.rescheduledAt ? { rescheduledAt: input.rescheduledAt } : {}),
+    ...(input.rescheduleSkippedAt ? { rescheduleSkippedAt: input.rescheduleSkippedAt } : {}),
+    // 型の記録（共有ライブラリと型別実績の集計に使う）。HOOK_TYPES 以外は捨てる
+    ...(HOOK_TYPES.includes(input.hookType) ? { hookType: input.hookType } : {}),
+    ...(input.patternId ? { patternId: String(input.patternId).slice(0, 60) } : {}),
     ...(input.campaignId ? { campaignId: String(input.campaignId).slice(0, 40), campaignStartDate: String(input.campaignStartDate || ""), campaignEndDate: String(input.campaignEndDate || "") } : {})
   };
 }
@@ -2802,6 +2976,7 @@ function profileViolations(text) {
 function applyTransition(post, action, options = {}) {
   const rule = TRANSITIONS[action];
   if (!rule) throw new HttpError(400, `不明な操作です: ${action}`);
+  if (post.licenseHold && rule.from.includes(post.status)) delete post.licenseHold; // 人が予約・解除・却下などを選び直したら、停止による保留は終わり
   if (!rule.from.includes(post.status)) {
     throw new HttpError(409, `この投稿は「${statusLabel(post.status)}」なので「${actionLabel(action)}」できません。`);
   }
@@ -2900,6 +3075,81 @@ function assignSchedule(settings, dateStr, count) {
   return slots;
 }
 
+// 振り直し用の空き枠（純関数・DB に触らない）。投稿の時間帯（JST の開始時〜終了時）の中で、
+//   ・今から5分以降（assignJitteredSchedule と同じ）
+//   ・occupiedMs のどの時刻からも minGapMs 以上あく（取った枠どうしも同じ）
+//   ・その時刻の前後24時間の本数が dailyCap を超えない
+//   ・accept(ms) が真（宣伝投稿の期間など）
+// 時刻を早い順に count 個まで返す。最大 SCHEDULE_RESCHEDULE_MAX_DAYS 日先まで探し、足りなければ見つかった分だけ返す
+function findFreeSlots(settings, occupiedMs, count, nowMs = Date.now(), options = {}) {
+  const from = Number.isFinite(Number(settings.scheduleFromHour)) ? Number(settings.scheduleFromHour) : 7;
+  const to = Number.isFinite(Number(settings.scheduleToHour)) ? Number(settings.scheduleToHour) : 21;
+  const minGap = Number.isFinite(options.minGapMs) ? options.minGapMs : SCHEDULE_RESCHEDULE_MIN_GAP_MS;
+  const cap = Number.isFinite(options.dailyCap) ? options.dailyCap : Infinity;
+  const accept = typeof options.accept === "function" ? options.accept : () => true;
+  const taken = (occupiedMs || []).filter(Number.isFinite);
+  const out = [];
+  if (!(from < to)) return out;
+  const DAY = 86_400_000;
+  const countAt = (t) => taken.reduce((n, x) => (x > t - DAY && x <= t ? n + 1 : n), 0);
+  const fits = (ms) => {
+    if (!Number.isFinite(cap)) return true;
+    if (countAt(ms) + 1 > cap) return false;
+    return !taken.some((t) => t > ms && t < ms + DAY && countAt(t) + 1 > cap);
+  };
+  const earliest = Math.ceil((nowMs + 5 * 60_000 + 1) / 60_000) * 60_000;
+  const today = jstYmd(nowMs);
+  for (let day = 0; day <= SCHEDULE_RESCHEDULE_MAX_DAYS && out.length < count; day += 1) {
+    const dayStart = Date.parse(`${ymdAddDays(today, day)}T00:00:00${JST_OFFSET}`);
+    const winEnd = dayStart + to * 3_600_000;
+    for (let ms = Math.max(dayStart + from * 3_600_000, earliest); ms < winEnd && out.length < count; ms += 60_000) {
+      if (taken.some((t) => Math.abs(t - ms) < minGap) || !fits(ms) || !accept(ms)) continue;
+      out.push(ms);
+      taken.push(ms);
+    }
+  }
+  return out;
+}
+
+// 予約から1時間を超えて（24時間以内に）遅れた予約を、いつ・どこへ振り直すかを決める（純関数・DB に触らない）。
+// 対象: 予約済みで、送信中・結果不明・再試行待ち・ライセンス保留・送信処理中でなく、いまの予約時刻（scheduledAt）から1時間超・24時間以内に遅れたもの。
+// 振り直した投稿がもう一度遅れた場合も、いまの予約時刻で数えて対象にする（元の予約時刻で24時間を数えると、2回目の遅れだけが振り直されずにまとめて出る）。
+// 古い予約から順に、占有時刻（ほかの予約・公開済み・承認待ちの予約時刻・リポスト・今すぐ出す投稿）と30分以上あく空き枠へ入れる
+function planLateReschedules(posts, settings, nowMs = Date.now(), inFlightIds = new Set()) {
+  const live = (posts || []).filter((p) => !p.replyToId);
+  const isLate = (p) => p.status === "scheduled" && p.scheduledAt && !p.publishing && !p.sendUncertainAt && !p.retryAfter && !p.licenseHold && !inFlightIds.has(p.id)
+    && nowMs - Date.parse(p.scheduledAt) > SCHEDULE_LATE_RESCHEDULE_MS
+    && nowMs - Date.parse(p.scheduledAt) <= SCHEDULE_STALE_MS
+    && !(p.originalScheduledAt && nowMs - Date.parse(p.originalScheduledAt) > SCHEDULE_RESCHEDULE_MAX_AGE_MS); // 最初の予約から7日超は振り直さず、schedulerTick の期限切れ処理が error にする
+  const targets = live.filter(isLate).sort((a, b) => Date.parse(a.scheduledAt) - Date.parse(b.scheduledAt));
+  const moves = [];
+  const skipped = [];
+  if (!targets.length) return { moves, skipped };
+  const targetIds = new Set(targets.map((p) => p.id));
+  const rest = live.filter((p) => !targetIds.has(p.id));
+  // 見る範囲は「いまの24時間前〜探す最後の日の24時間後」だけ（それより古い公開済みは間隔にも本数にも効かない。全履歴を毎回数えると遅い）
+  const lo = nowMs - SAFETY_DAY_MS;
+  const hi = nowMs + (SCHEDULE_RESCHEDULE_MAX_DAYS + 2) * SAFETY_DAY_MS;
+  const occupied = [
+    ...safetyPostTimes(rest, null, true),
+    ...rest.filter((p) => ["review", "approved"].includes(p.status) && !p.publishing).map((p) => Date.parse(p.scheduledAt || "")).filter(Number.isFinite),
+    ...safetyRepostTimes(posts)
+  ].filter((t) => t > lo && t < hi);
+  // 1時間以内の遅れ分は、この tick で今すぐ出る。実際に出る時刻は「いま」なので占有に入れる
+  if (rest.some((p) => p.status === "scheduled" && p.scheduledAt && Date.parse(p.scheduledAt) <= nowMs && !p.sendUncertainAt && !p.licenseHold)) occupied.push(nowMs);
+  const g1 = Math.min(THREADS_POST_DAILY_LIMIT, safetySetting(settings, "safetyMaxPostsPer24h"));
+  const g2 = settings.safetyGuardEnabled === false ? Infinity : safetySetting(settings, "safetyDailyPostLimit");
+  const dailyCap = Math.min(g1, g2);
+  for (const post of targets) {
+    const accept = (ms) => { try { assertCampaignWindow(post, ms); return true; } catch { return false; } };
+    const [slot] = findFreeSlots(settings, occupied, 1, nowMs, { dailyCap, accept });
+    if (!Number.isFinite(slot)) { skipped.push({ id: post.id, scheduledAt: post.scheduledAt }); occupied.push(nowMs); continue; } // 振り直せない投稿は今すぐ出る（実際に出る時刻は「いま」なので占有に入れる）
+    occupied.push(slot);
+    moves.push({ id: post.id, from: post.scheduledAt, to: new Date(slot).toISOString() });
+  }
+  return { moves, skipped };
+}
+
 async function markPublished(db, post, result, message) {
   if (post.sendUncertainAt) {
     post.sendConfirmedAt = nowIso();
@@ -2910,6 +3160,11 @@ async function markPublished(db, post, result, message) {
   post.threadsId = result.id;
   post.permalink = result.permalink || "";
   post.publishedAt = result.publishedAt || nowIso(); // 照合で直すときは Threads 側の公開時刻（24時間判定を照合時刻から数え直さない）
+  if (post.manualPublish) {
+    // 人が押した公開は、公開時刻が予約時刻より前なら遅延ではない（振り直しの記録を終わらせる）。予約時刻を過ぎていたら遅延なので記録を残す（林さん指示 2026-10-30）。手動公開の応答が届かず照合で公開済みと分かった場合も同じ
+    if (!post.scheduledAt || Date.parse(post.publishedAt) <= Date.parse(post.scheduledAt)) { delete post.originalScheduledAt; delete post.rescheduledAt; delete post.rescheduleSkippedAt; }
+    delete post.manualPublish;
+  }
   post.updatedAt = nowIso();
   post.error = "";
   delete post.publishing;
@@ -2920,6 +3175,17 @@ async function markPublished(db, post, result, message) {
 }
 
 function markPublishError(db, post, error, message) {
+  // 送信直前の検査（二重投稿の防止・案件ルール）で止めた分は故障ではない。エラーに数えず、理由つきで却下に移す（復元すれば承認待ちに戻る）
+  if (error?.stage === "content_gate" && error.safeToShow === true && error.status === 409) {
+    post.status = "rejected";
+    post.rejectReason = safeSendError(error).message.slice(0, 200);
+    post.error = "";
+    post.updatedAt = nowIso();
+    delete post.publishing;
+    delete post.retryAfter;
+    log(db, "info", "送信直前の検査で止めたため、エラーではなく却下に移しました。", { postId: post.id, reason: post.rejectReason });
+    return;
+  }
   post.status = "error";
   recordSendAttempt(post, error);
   post.error = safeSendError(error).message;
@@ -2938,6 +3204,27 @@ async function findRecentSameText(settings, text, sinceMs) {
   const wanted = String(text || "").trim();
   return (data.data || []).find((item) => String(item.text || "").trim() === wanted && (!sinceMs || Date.parse(item.timestamp || "") >= sinceMs)) || null;
 }
+
+// sinceMs より古い投稿まで遡ってページ送りし、同じ本文を探す。complete は「sinceMs まで遡り切れた」＝無かったと言ってよい範囲を見た、の意味。
+// findRecentSameText は直近50件しか見ないので、古い滞留投稿の「Threads側に同文なし」の根拠には使えない
+async function findSameTextSince(settings, text, sinceMs, { maxPages = 20 } = {}) {
+  const token = requireToken(settings);
+  const wanted = String(text || "").trim();
+  let after = "";
+  for (let page = 0; page < maxPages; page += 1) {
+    const data = await threadsFetch("/me/threads", { params: { fields: "id,text,permalink,timestamp", limit: 50, after }, token });
+    const rows = data.data || [];
+    const hit = rows.find((item) => String(item.text || "").trim() === wanted && (!sinceMs || Date.parse(item.timestamp || "") >= sinceMs));
+    if (hit) return { found: hit, complete: true };
+    const oldest = rows.length ? Date.parse(rows[rows.length - 1].timestamp || "") : 0;
+    after = data.paging?.cursors?.after || "";
+    if (!rows.length || !after || (oldest && oldest < sinceMs)) return { found: null, complete: true };
+  }
+  return { found: null, complete: false };
+}
+
+// 公開結果が確定しないまま、この時間を超えた送信中の投稿は、Threads側に同文が無いことを確認できたら終端（エラー＋理由）へ移す
+const PUBLISHING_EXPIRE_MS = 24 * 60 * 60 * 1000;
 
 function threadsTimestampIso(value) {
   const ms = Date.parse(String(value || ""));
@@ -2990,12 +3277,24 @@ async function recoverPublishing(snapshot) {
     if (Date.now() - startedAt < 2 * 60 * 1000) continue; // 送信中かもしれない（別プロセスの猶予）
     let published = null;
     let checkError = null;
+    let absenceConfirmed = false;
     try {
       // 先に本文一致で探す（公開後のメディアIDと permalink がそのまま取れる）。無ければコンテナの状態で判定する
-      const found = await findRecentSameText(snapshot.settings, item.text, startedAt - 5 * 60 * 1000);
+      const expired = Date.now() - startedAt >= PUBLISHING_EXPIRE_MS;
+      const { found, complete } = expired
+        ? await findSameTextSince(snapshot.settings, item.text, startedAt - 5 * 60 * 1000)
+        : { found: await findRecentSameText(snapshot.settings, item.text, startedAt - 5 * 60 * 1000), complete: false };
       if (found) published = { id: String(found.id), permalink: found.permalink || "", publishedAt: threadsTimestampIso(found.timestamp) };
+      absenceConfirmed = expired && complete && !found;
       if (!published && item.publishing.containerId) {
-        const container = await threadsFetch(`/${item.publishing.containerId}`, { params: { fields: "status,permalink" }, token: requireToken(snapshot.settings) });
+        // 期限切れのコンテナは Threads が 400「does not exist」で返す（2026-10-29 実測）。これは確認の失敗ではなく「もう無い」という答えなので、
+        // 同文なしの照合結果と合わせて終端の根拠にする（通信失敗・5xx は従来どおり確認失敗として握る）
+        let container = {};
+        try {
+          container = await threadsFetch(`/${item.publishing.containerId}`, { params: { fields: "status" }, token: requireToken(snapshot.settings) });
+        } catch (error) {
+          if (!isThreadsMissingObjectError(error)) throw error;
+        }
         if (container.status === "PUBLISHED") published = { id: item.publishing.containerId, permalink: container.permalink || "" };
       }
     } catch (error) {
@@ -3011,6 +3310,21 @@ async function recoverPublishing(snapshot) {
       if (checkError) {
         log(db, "error", "送信中に中断した投稿の状態を確認できませんでした。次回もう一度確認します。", { postId: post.id, diagnostic: diagnosticMeta({ area: "post_publish", error: checkError }) });
         post.publishing.reconcileAfter = new Date(Date.now() + SCHEDULE_RETRY_INTERVAL_MS).toISOString();
+        return;
+      }
+      if (absenceConfirmed) {
+        // 24時間を超え、起動時刻まで遡って同文が無いと確認できた。コンテナは期限切れで、待っても確定しない。終端（エラー＋理由）へ移し、再承認できる状態にする。
+        // 古い予約を無言で出さない: status は error なので自動では送られず、画面で本文を見て「承認し直す」を押した時だけ出る
+        post.status = "error";
+        post.error = "公開未確認のまま期限切れ。Threads側に同じ本文は見つかりませんでした。出すなら本文を見て承認し直してください。";
+        if (post.sendFailure) { post.sendFailure.outcome = "not_sent"; post.sendFailure.retryable = false; }
+        post.sendUncertainResolvedAt = nowIso();
+        post.publishFailedAt = nowIso();
+        post.updatedAt = nowIso();
+        delete post.sendUncertainAt;
+        delete post.publishing;
+        delete post.retryAfter;
+        log(db, "error", "公開結果を確定できないまま24時間を超えた送信を終端しました。Threads側に同文なし。画面で本文を見て、出すか却下するかを選んでください。", { postId: post.id });
         return;
       }
       post.sendUncertainAt ||= nowIso();
@@ -3676,6 +3990,7 @@ const AUTO_REPLY_MAX_PER_TICK = 3;
 async function sendAutoReplies(snapshot) {
   const s = snapshot.settings;
   if (!s.autoReplyEnabled || !s.threadsAccessToken) return { sent: 0 };
+  if (!licenseDecisionOf(snapshot).allowed) return { sent: 0, licenseStopped: true };
   if (s.autoReplyPausedUntil && Date.parse(s.autoReplyPausedUntil) > Date.now()) return { sent: 0, paused: true };
   const intervalMs = Math.max(5, Number(s.autoReplyIntervalSec) || 20) * 1000;
   const cap = Math.min(THREADS_REPLY_DAILY_LIMIT, Math.max(1, Number(s.autoReplyDailyCap) || 500));
@@ -3684,6 +3999,7 @@ async function sendAutoReplies(snapshot) {
   for (let i = 0; i < perTick; i += 1) {
     const picked = await withDb(async (d) => {
       if (!d.settings.autoReplyEnabled) return { save: false, value: null };
+      if (!licenseDecisionOf(d).allowed) return { save: false, value: null };
       if (d.settings.autoReplyPausedUntil && Date.parse(d.settings.autoReplyPausedUntil) > Date.now()) return { save: false, value: null };
       if (repliesSentLast24h(d) >= cap) return { save: false, value: null };
       if (i === 0) {
@@ -3904,13 +4220,13 @@ async function autoReplyTick() {
   // 先に送る。下書き作成はAIの応答待ちが長く、先に走ると、できあがっている下書きの送信まで遅れてコメントが溜まる
   await requeueNetworkFailedReplies(current);
   current = await readDb();
-  await sendAutoReplies(current);
+  if (licenseDecisionOf(current).allowed) await sendAutoReplies(current);
   current = await readDb();
   const lastFailure = Date.parse(current.settings.lastDraftFailureAt || "") || 0;
   if (s.autoReplyEnabled && Date.now() - lastFailure >= REPLY_DRAFT_FAILURE_BACKOFF_MS && pickPendingReplies(current.replies).length) {
     await draftRepliesBatch(current);
     current = await readDb();
-    await sendAutoReplies(current);
+    if (licenseDecisionOf(current).allowed) await sendAutoReplies(current);
   }
   const lastInsights = Date.parse(s.lastInsightsAutoAt || "") || 0;
   if (s.autoInsightsEnabled && Date.now() - lastInsights >= 24 * 60 * 60 * 1000 && current.posts.some((p) => p.status === "published" && p.threadsId)) {
@@ -3918,7 +4234,7 @@ async function autoReplyTick() {
     current = await readDb();
   }
   const lastDeleteCheck = Date.parse(s.lastAutoDeleteCheckAt || "") || 0;
-  if (s.autoDeleteLowLikesEnabled && Date.now() - lastDeleteCheck >= AUTO_DELETE_CHECK_EVERY_MS) {
+  if (s.autoDeleteLowLikesEnabled && licenseDecisionOf(current).allowed && Date.now() - lastDeleteCheck >= AUTO_DELETE_CHECK_EVERY_MS) {
     await withDb(async (d) => { d.settings.lastAutoDeleteCheckAt = nowIso(); });
     try {
       await deleteLowLikePosts(current);
@@ -4059,11 +4375,122 @@ async function autoRepostTick() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// ライセンス照合（段階A・local 型）。契約: ライセンス台帳API_契約.md 4-1。許可キーが空なら何もしない
+// ---------------------------------------------------------------------------
+function licenseStateOf(db) { return { ...emptyLicenseState(), ...(db.license || {}) }; }
+const LICENSE_EXEMPT = process.env.THREADS_LICENSE_EXEMPT === "1"; // 提供元自身のアカウント用。許可キーが空でも止めない。配布版には設定しない
+const LICENSE_ALLOW_LOOPBACK =process.env.THREADS_LICENSE_ALLOW_LOOPBACK === "1"; // 検証用。配布版では設定しない
+// 台帳の応答の署名を確かめる公開鍵。配布物に同梱の license_public.pem を読む（提供元の鍵が入るまでは空＝署名が確かめられず、照合は猶予の扱いになる）。
+// 検証用に限り THREADS_LICENSE_PUBKEY_FILE で差し替えられる（THREADS_LICENSE_ALLOW_LOOPBACK=1 のときだけ。配布版では設定しない）
+const LICENSE_PUBLIC_KEY_PEM = (() => {
+  const path = LICENSE_ALLOW_LOOPBACK && process.env.THREADS_LICENSE_PUBKEY_FILE ? process.env.THREADS_LICENSE_PUBKEY_FILE : join(ROOT, "license_public.pem");
+  try { return readFileSync(path, "utf8"); } catch { return ""; }
+})();
+function licenseDecisionOf(db, nowMs = Date.now()) {
+  const resolved = resolveLicenseUrl(db.settings.licenseServerUrl, { allowLoopback: LICENSE_ALLOW_LOOPBACK });
+  return licenseDecision(db.settings, licenseStateOf(db), nowMs, { serverUrl: resolved.ok ? resolved.url : "", exempt: LICENSE_EXEMPT, publicKeyPem: LICENSE_PUBLIC_KEY_PEM });
+}
+// 実行系（公開・返信の送信・自動削除・自動再投稿）の入口で呼ぶ。止まっているなら理由の文をそのまま返して断る
+function assertLicenseAllows(db) {
+  const decision = licenseDecisionOf(db);
+  if (!decision.allowed) throw new HttpError(403, decision.message);
+}
+// 停止中に予約時刻を過ぎた投稿に印を付ける。再開しても自動では出さず、画面で1件ずつ「出す」「破棄」を選ぶ（COO裁定 D-20261029-012）
+function holdPastDueScheduled(db, blockedSince = "") {
+  if (db.settings.licenseResumeMode === "auto") return 0;
+  const since = (Date.parse(blockedSince || "") || 0) - 10 * 60_000; // 停止とは関係なく過ぎていた予約（自動公開OFF・連携切れ）は対象にしない
+  let n = 0;
+  for (const post of db.posts) {
+    if (post.status !== "scheduled" || post.licenseHold || post.publishing || post.sendUncertainAt) continue;
+    const at = Date.parse(post.scheduledAt || "");
+    if (!at || at > Date.now() || at < since) continue;
+    post.licenseHold = { at: nowIso(), scheduledAt: post.scheduledAt };
+    n += 1;
+  }
+  return n;
+}
+// 許可キーが変わったら状態を空に戻して照合し直す（停止の印と導入IDは残す）。確認先だけが変わったときは、拒否も最後の成功も消さず、照合だけすぐやり直す
+function applyLicenseSettingsChange(db, before) {
+  const old = licenseStateOf(db);
+  // 最初に試した時刻も残す（キーを入れ直して未確認の猶予をやり直させない）
+  if (before.licenseKey !== db.settings.licenseKey) db.license = { ...emptyLicenseState(), installId: old.installId, blockedSince: old.blockedSince, firstAttemptAt: old.firstAttemptAt };
+  else if (before.licenseServerUrl !== db.settings.licenseServerUrl) db.license = { ...old, lastAttemptAt: "" };
+}
+
+// 予約の日時を、保留したときの時刻から変えたら保留は終わり（本体の項目に直接ついているので、保存の前に消す）
+function releaseHoldIfRescheduled(found, patch) {
+  if (!found.licenseHold || !("scheduledAt" in patch)) return false;
+  if (Date.parse(found.scheduledAt || "") === Date.parse(found.licenseHold.scheduledAt || "")) return false;
+  delete found.licenseHold;
+  return true;
+}
+
+// 保留した予約の決定。publish=次の周で公開 / discard=却下に移す
+function applyLicenseHold(db, postId, action) {
+  const post = findOr404(db.posts, postId, "投稿");
+  if (!post.licenseHold || post.status !== "scheduled") throw new HttpError(409, "この投稿は、ライセンス停止による保留の対象ではありません。");
+  assertNotInFlight(post.id);
+  if (action === "publish") {
+    assertLicenseAllows(db);
+    delete post.licenseHold;
+    post.scheduledAt = new Date(Date.now() + 60_000).toISOString();
+    log(db, "info", "停止中に予約時刻を過ぎた投稿を、出すことにしました。まもなく公開します。", { postId: post.id });
+  } else {
+    delete post.licenseHold;
+    post.status = "rejected";
+    post.rejectReason = "ライセンス停止中に予約時刻を過ぎたため、破棄しました。";
+    post.updatedAt = nowIso();
+    log(db, "info", "停止中に予約時刻を過ぎた投稿を、破棄しました（却下に移しました）。", { postId: post.id });
+  }
+  return { ok: true, id: post.id, status: post.status, autoPublish: Boolean(db.settings.autoPublishEnabled) };
+}
+// 照合（24時間ごと・失敗後は15分ごと）と、停止・再開の境目の処理。毎周の最初に呼ぶ
+async function licenseTick() {
+  const snap = await readDb();
+  if (!licenseConfigured(snap.settings) && LICENSE_EXEMPT && !snap.license?.blockedSince) return;
+  const state0 = licenseStateOf(snap);
+  if (licenseCheckDue(snap.settings, state0, Date.now())) {
+    const installId = state0.installId || randomBytes(8).toString("hex");
+    const attemptAt = nowIso();
+    const diff = await runLicenseCheck({ settings: snap.settings, serverUrl: snap.settings.licenseServerUrl, installId, version: APP_VERSION, nowIso: attemptAt, allowLoopback: LICENSE_ALLOW_LOOPBACK, publicKeyPem: LICENSE_PUBLIC_KEY_PEM });
+    await withDb(async (db) => {
+      const prev = licenseStateOf(db);
+      // 確定した拒否は、その後の通信失敗では消さない（拒否のあとに一瞬つながらなくなっても猶予に戻さない）
+      const keepDenied = prev.result === "denied" && diff.result === "unreachable";
+      const next = { ...prev, installId, firstAttemptAt: prev.firstAttemptAt || attemptAt, lastAttemptAt: attemptAt, ...(keepDenied ? { detail: diff.detail } : diff), ...(diff.result === "denied" ? { signed: null } : {}) }; // 拒否を受けたら、古い署名つきの控えは捨てる（拒否の印を書き換えても猶予が戻らない）
+      if (diff.result === "denied" && prev.result !== "denied") log(db, "error", `ライセンスが確認できませんでした: ${diff.message || "利用が停止されています。担当者にご連絡ください"}`, { reason: diff.reason });
+      else if (diff.result === "ok" && prev.result === "denied") log(db, "info", "ライセンスが有効に戻りました。");
+      else if (diff.result === "unreachable" && prev.result !== "unreachable") log(db, "error", `ライセンスの照合先につながりませんでした。最後の成功から${prev.graceDays ?? 7}日間は今までどおり使えます。`, { reason: diff.reason, detail: diff.detail });
+      db.license = next;
+    });
+  }
+  await withDb(async (db) => {
+    const state = licenseStateOf(db);
+    const decision = licenseDecisionOf(db);
+    if (!decision.allowed && !state.blockedSince) {
+      db.license = { ...state, blockedSince: decision.blockedFrom ? new Date(decision.blockedFrom).toISOString() : nowIso() };
+      log(db, "error", `ライセンスの確認ができないため、投稿・返信の自動実行を止めました: ${decision.message}`, { status: decision.status, reason: decision.reason || "" });
+    } else if (decision.allowed && state.blockedSince) {
+      const held = holdPastDueScheduled(db, state.blockedSince);
+      db.license = { ...state, blockedSince: "" };
+      log(db, "info", held
+        ? `ライセンスが再開しました。停止中に予約時刻を過ぎた投稿が ${held} 件あります。画面で1件ずつ「出す」か「破棄」を選んでください。`
+        : "ライセンスが再開しました。", { held });
+    } else if (decision.allowed && db.settings.licenseResumeMode === "auto" && db.posts.some((p) => p.licenseHold)) {
+      for (const p of db.posts) delete p.licenseHold; // 「そのまま出す」に切り替えたので、保留中のものも通常の予約に戻す
+      log(db, "info", "再開時の扱いを「そのまま出す」に変えたため、保留していた予約を通常の予約に戻しました。");
+    } else return { save: false };
+  });
+}
+
 async function schedulerTick() {
   if (schedulerRunning) return;
   schedulerRunning = true;
   try {
+    await licenseTick().catch((error) => appendErrorLog(error));
     const snapshot = await readDb();
+    const licenseAllowed = licenseDecisionOf(snapshot).allowed;
     const tokenExpiry = Date.parse(snapshot.settings.threadsTokenExpiresAt || "");
     const tokenExpired = Boolean(snapshot.settings.threadsAccessToken) && Boolean(tokenExpiry) && tokenExpiry < Date.now();
     if (tokenExpired) {
@@ -4080,15 +4507,21 @@ async function schedulerTick() {
       await reconcileFailedPublishes(snapshot).catch((error) => withDb(async (db) => { log(db, "error", "失敗扱いの投稿をThreads側と照合できませんでした。6時間後にもう一度確認します。", { diagnostic: diagnosticMeta({ area: "post_publish", error }) }); }));
     }
     // スリープ・電源オフ明けに古い予約をそのまま出さない（24時間以上過ぎた予約は止めて知らせる）
-    const isStale = (post) => post.status === "scheduled" && post.scheduledAt && Date.now() - Date.parse(post.scheduledAt) > SCHEDULE_STALE_MS && !post.publishing;
-    for (const stale of snapshot.posts.filter(isStale)) {
+    // 予約時刻から24時間超、または、振り直しを繰り返して最初の予約から7日超かつ今の予約から1時間超遅れたもの
+    // 再試行待ち・結果不明の投稿は対象にしない（従来どおり24時間の側だけが掛かる）。判定の時計は振り直しの計画と同じ tickNow を使い、境目で取りこぼさない
+    const tickNow = Date.now();
+    const isAgedOut = (post) => Boolean(post.originalScheduledAt) && !post.retryAfter && !post.sendUncertainAt && tickNow - Date.parse(post.originalScheduledAt) > SCHEDULE_RESCHEDULE_MAX_AGE_MS && tickNow - Date.parse(post.scheduledAt) > SCHEDULE_LATE_RESCHEDULE_MS;
+    const isStale = (post) => post.status === "scheduled" && post.scheduledAt && (Date.now() - Date.parse(post.scheduledAt) > SCHEDULE_STALE_MS || isAgedOut(post)) && !post.publishing && !post.licenseHold;
+    for (const stale of licenseAllowed ? snapshot.posts.filter(isStale) : []) {
       await withDb(async (db) => {
         const post = db.posts.find((p) => p.id === stale.id);
         if (!post || !isStale(post) || inFlight.has(post.id)) return { save: false };
         const heldBySafety = post.safety?.level === "blocked";
         markPublishError(db, post, own(heldBySafety
           ? `安全確認で保留したまま予約時刻を24時間以上過ぎたため送りませんでした: ${(post.safety.reasons || []).filter((r) => r.level === "blocked").map((r) => r.message).join(" / ")}`
-          : "予約時刻を24時間以上過ぎていたため送りませんでした（PC が止まっていた間の予約）。内容を確認して予約し直してください。"), "期限を過ぎた予約投稿を止めました。");
+          : isAgedOut(post) && Date.now() - Date.parse(post.scheduledAt) <= SCHEDULE_STALE_MS
+            ? "最初の予約から7日以上たち、時刻を振り直しても遅れが続いたため送りませんでした（PC が止まる日が続いた予約）。内容が古くなっていないか確認して予約し直してください。"
+            : "予約時刻を24時間以上過ぎていたため送りませんでした（PC が止まっていた間の予約）。内容を確認して予約し直してください。"), "期限を過ぎた予約投稿を止めました。");
       });
     }
     // 承認待ち・承認済み（未予約）のまま予約時刻を過ぎた投稿は、公開処理にも期限切れ処理にも掛からず、誰にも知らされない
@@ -4108,15 +4541,36 @@ async function schedulerTick() {
         log(db, "error", `予約時刻を過ぎても承認・予約されていない投稿が ${n} 件あります。承認して予約し直すか、却下してください。`, { count: n });
       });
     }
-    if (snapshot.settings.autoPublishEnabled && snapshot.settings.threadsAccessToken && !tokenExpired) {
-      const isDue = (post) => post.status === "scheduled" && post.scheduledAt && Date.parse(post.scheduledAt) <= Date.now()
-        && !post.sendUncertainAt && (!post.retryAfter || Date.parse(post.retryAfter) <= Date.now());
+    // 予約から1時間を超えて遅れた投稿（24時間以内）は、その場で出さず空き枠へ振り直す。PC停止明けに前後10分以内でまとめ出しになるのを防ぐ（Q319/Q333）。
+    // 計画は最新の DB を持つロックの中で立て、そのまま書く。空き枠が無く振り直せない投稿は従来どおり今すぐ出す（印を1回だけ残す）
+    if (snapshot.settings.autoPublishEnabled && snapshot.settings.threadsAccessToken && !tokenExpired && licenseAllowed) {
+      await withDb(async (db) => {
+        const plan = planLateReschedules(db.posts, db.settings, tickNow, inFlight);
+        // rescheduleSkippedAt は「空きが無いことをログに出した」印。ログを1回にするためだけに使い、次の tick でも空きを探し直す（空きができたら振り直す）
+        const newSkips = plan.skipped.filter((s) => !db.posts.find((p) => p.id === s.id)?.rescheduleSkippedAt);
+        if (!plan.moves.length && !newSkips.length) return { save: false };
+        for (const move of plan.moves) {
+          const post = db.posts.find((p) => p.id === move.id);
+          if (!post.originalScheduledAt) post.originalScheduledAt = post.scheduledAt; // 2回目以降の振り直しでも、いちばん最初の予約時刻を残す
+          post.scheduledAt = move.to;
+          post.rescheduledAt = nowIso();
+          post.updatedAt = nowIso();
+          delete post.rescheduleSkippedAt;
+        }
+        for (const skip of newSkips) db.posts.find((p) => p.id === skip.id).rescheduleSkippedAt = nowIso();
+        if (plan.moves.length) log(db, "info", `予約から1時間以上遅れた投稿 ${plan.moves.length} 件の時刻を、まとめて出さないよう空き枠へ振り直しました。`, { count: plan.moves.length, moves: plan.moves });
+        if (newSkips.length) log(db, "info", `予約から1時間以上遅れた投稿 ${newSkips.length} 件は、${SCHEDULE_RESCHEDULE_MAX_DAYS}日先までに空き枠が無かったため、振り直さずに出します。`, { count: newSkips.length, ids: newSkips.map((s) => s.id) });
+      }).catch((error) => appendErrorLog(error));
+    }
+    if (snapshot.settings.autoPublishEnabled && snapshot.settings.threadsAccessToken && !tokenExpired && licenseAllowed) {
+      const isDue =(post) => post.status === "scheduled" && post.scheduledAt && Date.parse(post.scheduledAt) <= Date.now()
+        && !post.sendUncertainAt && !post.licenseHold && (!post.retryAfter || Date.parse(post.retryAfter) <= Date.now());
       const dueIds = snapshot.posts.filter(isDue).map((post) => post.id);
       for (const postId of dueIds) {
         // 前の送信中に状態が変わっていることがあるので、送る直前にロック内で確認し直す
         const claimed = await withDb(async (db) => {
           const post = db.posts.find((item) => item.id === postId);
-          if (!post || !isDue(post) || inFlight.has(post.id) || post.publishing || !db.settings.autoPublishEnabled) return { save: false, value: null };
+          if (!post || !isDue(post) || inFlight.has(post.id) || post.publishing || !db.settings.autoPublishEnabled || !licenseDecisionOf(db).allowed) return { save: false, value: null };
           try {
             assertTextWithinLimit(post);
             assertCampaignWindow(post, Date.now());
@@ -4153,6 +4607,7 @@ async function schedulerTick() {
           }
           post.safety = safety;
           inFlight.add(post.id);
+          delete post.manualPublish; // 予約の自動送信は手動ではない（手動で失敗した後の再送でも遅延の記録を残す）
           post.publishing = { startedAt: nowIso(), prevStatus: post.status, containerId: "" }; // 送信中の印を先に保存（落ちても復旧できる）
           return { value: { post: structuredClone(post), settings: db.settings } };
         });
@@ -4163,7 +4618,7 @@ async function schedulerTick() {
           if (claimed.post.publishFailedAt && !claimed.post.textChangedAfterFailure) {
             // 前回失敗した投稿は、実は届いていることがある（保存失敗・タイムアウト）。送る前に直近の投稿と照合する
             const dup = await findRecentSameText(claimed.settings, claimed.post.text, Date.parse(claimed.post.publishFailedAt) - 30 * 60 * 1000);
-            if (dup) result = { id: String(dup.id), permalink: dup.permalink || "" };
+            if (dup) result = { id: String(dup.id), permalink: dup.permalink || "", publishedAt: threadsTimestampIso(dup.timestamp) };
           }
           if (!result) result = await publishThreadsPost(claimed.settings, claimed.post, {
             safety: { stage: "publish" },
@@ -4228,8 +4683,8 @@ async function schedulerTick() {
         }
       });
     }
-    if (snapshot.settings.threadsAccessToken && !tokenExpired) await rebuzzTopUp().catch((error) => appendErrorLog(error));
-    if (snapshot.settings.threadsAccessToken && !tokenExpired) await autoRepostTick().catch((error) => appendErrorLog(error));
+    if (snapshot.settings.threadsAccessToken && !tokenExpired && licenseAllowed) await rebuzzTopUp().catch((error) => appendErrorLog(error));
+    if (snapshot.settings.threadsAccessToken && !tokenExpired && licenseAllowed) await autoRepostTick().catch((error) => appendErrorLog(error));
     if (!tokenExpired) await autoReplyTick();
   } catch (error) {
     await appendErrorLog(error);
@@ -4376,7 +4831,7 @@ function sanitizeSettings(current, rawInput) {
       next.accessKey = k;
       continue;
     }
-    if (["geminiApiKey", "anthropicApiKey", "threadsAccessToken", "threadsAppSecret", "threadsOAuthClientToken"].includes(key)) {
+    if (["geminiApiKey", "anthropicApiKey", "threadsAccessToken", "threadsAppSecret", "threadsOAuthClientToken", "licenseKey"].includes(key)) {
       if (isMaskedSecret(value)) continue;
       // 伏字欄を部分的に編集した値（*が混ざる）は、壊れたキーとして保存せず、貼り直しを求める
       if (String(value || "").includes("*")) throw new HttpError(400, "キーの欄に伏字（*）が混ざっています。欄を空にしてから、キー全体を貼り直してください。");
@@ -4533,15 +4988,29 @@ async function readDbForState() {
   return stateCache;
 }
 
+// ライセンスの状態と、停止中に予約時刻を過ぎて保留した投稿の一覧（画面用。許可キーの値は含めない）
+function licensePayload(db) {
+  const decision = licenseDecisionOf(db);
+  const state = licenseStateOf(db);
+  return {
+    enforced: decision.enforced, allowed: decision.allowed, status: decision.status, message: decision.message || "",
+    expiresOn: state.expiresOn || "", lastCheckedAt: state.lastAttemptAt || "", lastSuccessAt: state.lastSuccessAt || "", blockedSince: state.blockedSince || "",
+    held: db.posts.filter((p) => p.licenseHold && p.status === "scheduled").map((p) => ({ id: p.id, text: String(p.text || "").slice(0, 200), scheduledAt: p.scheduledAt, heldAt: p.licenseHold.at }))
+  };
+}
+
 function statePayload(db, derived = {}) {
   return {
     settings: publicSettings(db.settings),
+    license: licensePayload(db),
     posts: derived.posts || db.posts.map((p) => (p.status === "published" || p.replyToId ? p : { ...p, styleWarnings: styleWarnings(p.text) })),
     replies: db.replies,
     insights: db.insights,
     research: db.research,
     references: db.references,
     referenceAnalysis: db.referenceAnalysis,
+    researchRuns: db.researchRuns || [],
+    researchJob: latestResearchJob(),
     suggestions: db.suggestions,
     logs: db.logs,
     stats: derived.stats || buildStats(db),
@@ -4574,6 +5043,7 @@ route("POST", "/api/settings", async ({ body }) => {
     for (const key of ["autoDeleteEnabledAt", "autoDeleteBlockedToken", "autoDeleteLog", "autoDeleteAfterHours"]) delete input[key]; // 画面から書き換えさせない（サーバーが管理する値）
     if ("autoDeleteLowLikesEnabled" in input && typeof input.autoDeleteLowLikesEnabled !== "boolean") throw new HttpError(400, "自動削除のON/OFFは true か false で指定してください。");
     db.settings = sanitizeSettings(db.settings, input);
+    applyLicenseSettingsChange(db, before);
     if (db.settings.autoDeleteLowLikesEnabled && !before.autoDeleteLowLikesEnabled) db.settings.autoDeleteEnabledAt = nowIso(); // この時刻より前の投稿は消さない
     if (!db.settings.autoDeleteLowLikesEnabled) db.settings.autoDeleteEnabledAt = "";
     if (before.geminiApiKey !== db.settings.geminiApiKey) invalidateModelCache();
@@ -4674,6 +5144,242 @@ route("PUT", "/api/research/sources/:id", async ({ params, body }) => {
   return { status: 200, body: { source } };
 });
 
+// --- まとめてリサーチ（候補を探す → ページで本文と反応数を確かめる → 足切り・反応順 → 上位を自動で使う → 型の分析） ---
+// 1ページ20秒〜1分ほどかかるので、ジョブにして裏で進める（MCP の1回の呼び出しは310秒で切れるため、開始と状態確認を分ける）。
+// 本物で1テーマ12ページを通して約6分（2026-10-22 実測）。全体の上限は20分で、止めることもできる
+const RESEARCH_PICK_DEFAULT = 5;
+const RESEARCH_PICK_MAX = 8;
+const RESEARCH_RUNS_KEEP = 30;
+const RESEARCH_SAVE_PER_RUN = 10; // 1回のリサーチで保存する上限（使う分を含む）。溜めすぎない
+const RESEARCH_JOB_LIMIT_MS = 20 * 60_000;
+const REFERENCES_KEEP = 300;
+// ページとページの間（試験では THREADS_RESEARCH_GAP_MS で縮める）
+const RESEARCH_GAP_MS = Number.isFinite(Number(process.env.THREADS_RESEARCH_GAP_MS)) && process.env.THREADS_RESEARCH_GAP_MS !== "" ? Number(process.env.THREADS_RESEARCH_GAP_MS) : undefined;
+const DROP_LABELS = { duplicate: "重複", notVerified: "ページで確かめられない", notJapanese: "日本語でない", belowMinLikes: "いいねが下限未満", tooOld: "古い", empty: "本文が短い" };
+const researchJobs = new Map();
+let currentResearchJobId = "";
+
+function publicResearchJob(job) {
+  const { id: jobId, status, step, done, total, startedAt, finishedAt, message, error, runIds } = job;
+  return { id: jobId, status, step, done, total, startedAt, finishedAt, message, error, runIds };
+}
+function latestResearchJob() {
+  const job = researchJobs.get(currentResearchJobId);
+  return job ? publicResearchJob(job) : null;
+}
+
+// 調べる言葉。キーワードがあればそれだけ（theme を指定すればそのテーマの分として扱う。設定のテーマ名を含むキーワードもそのテーマ扱い）。
+// キーワードが無ければ設定の発信テーマ（最大3つ）
+function researchTargets(settings, body) {
+  const clean = (v) => String(v || "").replace(/\s+/g, " ").trim().slice(0, 60);
+  const themes = (settings.themes || []).filter((t) => t.enabled !== false && t.name);
+  const keyword = clean(body.keyword);
+  if (keyword) {
+    const named = clean(body.theme);
+    const matched = themes.find((t) => t.name === named) || themes.find((t) => keyword.includes(t.name));
+    return [{ theme: matched ? matched.name : named || keyword, keyword }];
+  }
+  return themes.slice(0, 3).map((t) => ({ theme: t.name, keyword: clean([t.name, t.audience].filter(Boolean).join(" ")) }));
+}
+
+function researchRunSummary(run) {
+  const dropped = Object.entries(run.dropped || {}).filter(([, n]) => n > 0).map(([k, n]) => `${DROP_LABELS[k] || k}${n}`).join("・");
+  return `「${run.theme}」: 候補${run.candidates}件 → ページで確かめられた${run.verified}件 → 使う${run.pickedIds.length}件${dropped ? `（除外: ${dropped}）` : ""}`;
+}
+
+// 参考投稿を上限まで切り詰める。人が貼ったもの・使う印が付いているものは残し、自動で集めた使わないものから古い順に外す
+function trimReferences(d) {
+  if (d.references.length <= REFERENCES_KEEP) return 0;
+  const keep = (r) => r.selected || r.source === "manual" || r.source === "profile";
+  let over = d.references.length - REFERENCES_KEEP;
+  const drop = new Set();
+  for (let i = d.references.length - 1; i >= 0 && over > 0; i -= 1) {
+    if (!keep(d.references[i])) { drop.add(d.references[i]); over -= 1; }
+  }
+  d.references = d.references.filter((r) => !drop.has(r));
+  return drop.size;
+}
+
+async function researchOneTarget(job, settings, target, opts, chromePath) {
+  const run = { id: id("rrun"), at: nowIso(), theme: target.theme, keyword: target.keyword, via: "web", candidates: 0, verified: 0, failures: 0, kept: 0, dropped: {}, pickedIds: [], commonPatterns: "", warnings: [] };
+  job.step = `「${target.keyword}」の投稿を探しています`;
+  job.done = 0;
+  job.total = 0;
+  // 1. Threads API。審査後は他人の公開投稿を反応数つきで返す。審査前は自分の投稿しか返さないので、他人の投稿が3件未満なら Web で探す
+  let items = [];
+  try {
+    const own = String(settings.threadsUsername || "").toLowerCase();
+    const viaApi = (await searchThreadsPosts(settings, target.keyword, "TOP")).filter((p) => p.username && p.username.toLowerCase() !== own && p.metrics && p.metrics.likes !== null);
+    if (viaApi.length >= 3) {
+      run.via = "api";
+      items = viaApi.map((p) => ({ ...p, unverified: false, verifiedAt: nowIso() }));
+    }
+  } catch (error) {
+    if (!(error instanceof ExternalApiError) && !(error instanceof HttpError)) throw error;
+  }
+  if (run.via === "web") {
+    // Chrome が無ければ、AI の枠を使う Web 検索の前に止める（確かめられない候補は使わないため、探しても無駄になる）
+    if (!chromePath) {
+      run.warnings.push("Chrome（または Microsoft Edge）が見つからないため、調べられませんでした。Chrome を入れると使えます（別の場所に入れている場合は、環境変数 THREADS_CHROME_PATH にその場所を書く）。それまでは「手動で貼り付けて追加する」を使ってください。");
+    } else {
+      const max = opts.pagesPerTarget;
+      const candidates = await searchThreadsPostsViaWeb(settings, target.keyword, { max });
+      run.candidates = candidates.length;
+      job.step = `「${target.keyword}」の投稿をページで確かめています（本文と反応数）`;
+      const verified = await verifyCandidates(candidates, {
+        chromePath, max, deadline: opts.deadline, shouldStop: () => job.cancelRequested, ...(RESEARCH_GAP_MS === undefined ? {} : { gapMs: RESEARCH_GAP_MS }),
+        onProgress: (a, b) => { job.done = a; job.total = b; }
+      });
+      items = verified.items;
+      run.failures = verified.failures;
+      if (verified.stopped) run.warnings.push(verified.stopped);
+      else if (items.length && verified.failures === items.length) run.warnings.push("候補のページを1件も確かめられませんでした。Threads のページの形が変わったか、通信が遮られている可能性があります。");
+    }
+  } else {
+    run.candidates = items.length;
+  }
+  const { kept, dropped } = filterCandidates(items, { minLikes: opts.minLikes, maxAgeDays: opts.maxAgeDays });
+  run.verified = items.filter((x) => !x.unverified).length;
+  run.kept = kept.length;
+  run.dropped = dropped;
+  const saveList = kept.slice(0, RESEARCH_SAVE_PER_RUN);
+  const picked = new Set(kept.slice(0, opts.pick));
+  await withDb(async (d) => {
+    // 前の自動選択を外す: 同じテーマの分。その場の調べもの（設定のテーマに無いキーワード）どうしは最新の1回だけを使う。人が選んだものは触らない
+    const configured = new Set((d.settings.themes || []).map((t) => t.name));
+    const targetAdhoc = !configured.has(target.theme);
+    for (const r of d.references) {
+      if (r.autoSelected && (r.theme === target.theme || (targetAdhoc && !configured.has(r.theme)))) { r.selected = false; r.autoSelected = false; }
+    }
+    const byThreadsId = new Map(d.references.filter((r) => r.threadsId).map((r) => [r.threadsId, r]));
+    for (const it of saveList) {
+      const fields = {
+        text: it.text, username: it.username, permalink: it.permalink, timestamp: it.timestamp, metrics: it.metrics,
+        unverified: false, unverifiedReason: "", verifiedAt: it.verifiedAt || nowIso(),
+        theme: target.theme, keyword: target.keyword, researchRunId: run.id, score: reactionScore(it.metrics)
+      };
+      let ref = it.threadsId ? byThreadsId.get(it.threadsId) : null;
+      if (ref) {
+        // 別のテーマで使っている投稿は、数字と本文だけ新しくし、テーマは付け替えない（前のテーマの選択を消さない）
+        const usedElsewhere = ref.selected && ref.theme && ref.theme !== target.theme;
+        const { theme, keyword, researchRunId, ...dataOnly } = fields;
+        Object.assign(ref, usedElsewhere ? dataOnly : fields);
+      } else {
+        ref = { id: id("ref"), threadsId: it.threadsId, source: it.source, mediaType: it.mediaType || "TEXT", selected: false, analysis: null, createdAt: nowIso(), ...fields };
+        d.references.unshift(ref);
+      }
+      if (picked.has(it) && !ref.userRejected) { // 人が「使わない」に外した投稿は、次のリサーチでも使う側に戻さない
+        if (!ref.selected) { ref.selected = true; ref.autoSelected = true; }
+        run.pickedIds.push(ref.id);
+      }
+    }
+    const trimmed = trimReferences(d);
+    d.researchRuns = [run, ...(d.researchRuns || [])].slice(0, RESEARCH_RUNS_KEEP);
+    log(d, "info", `まとめてリサーチ: ${researchRunSummary(run)}`, { via: run.via, failures: run.failures, warnings: run.warnings, trimmed });
+  });
+  // 2. 使う投稿の型を分析する。失敗しても集めた結果は残す
+  if (run.pickedIds.length && !job.cancelRequested && Date.now() <= opts.deadline) {
+    job.step = `「${target.theme}」で反応の大きい投稿の型を分析しています`;
+    try {
+      const refs = (await readDb()).references.filter((r) => run.pickedIds.includes(r.id));
+      const result = await callAiJson(settings, buildReferenceAnalysisPrompt(settings, refs), referenceAnalysisSchema);
+      await withDb(async (d) => {
+        applyReferenceAnalysis(d, result);
+        const saved = (d.researchRuns || []).find((x) => x.id === run.id);
+        if (saved) saved.commonPatterns = String(result.commonPatterns || "").slice(0, 2000);
+      });
+    } catch (error) {
+      const message = `型の分析に失敗しました（集めた投稿は使えます）: ${String(error.message || error).slice(0, 200)}`;
+      run.warnings.push(message);
+      await withDb(async (d) => {
+        const saved = (d.researchRuns || []).find((x) => x.id === run.id);
+        if (saved) saved.warnings.push(message);
+      });
+    }
+  }
+  return run;
+}
+
+async function runResearchJob(job, targets, opts) {
+  const { settings } = await readDb();
+  const chromePath = findChrome();
+  const lines = [];
+  for (const target of targets) {
+    if (job.cancelRequested) { lines.push(`「${target.theme}」: 止めたため調べていません`); continue; }
+    if (Date.now() > opts.deadline) { lines.push(`「${target.theme}」: 時間の上限（20分）に達したため調べていません`); continue; }
+    try {
+      const run = await researchOneTarget(job, settings, target, opts, chromePath);
+      job.runIds.push(run.id);
+      lines.push(researchRunSummary(run), ...run.warnings);
+    } catch (error) {
+      // 1つのテーマで失敗しても、残りのテーマは続ける
+      lines.push(`「${target.theme}」: 調べられませんでした（${String(error.message || error).slice(0, 300)}）`);
+    }
+  }
+  job.status = job.runIds.length ? "done" : "error";
+  if (!job.runIds.length) job.error = lines.join("\n");
+  job.step = "";
+  job.message = lines.join("\n");
+  job.finishedAt = nowIso();
+}
+
+route("POST", "/api/research/run", async ({ body }) => {
+  const running = researchJobs.get(currentResearchJobId);
+  if (running?.status === "running") return { status: 200, body: { job: publicResearchJob(running), alreadyRunning: true } };
+  // 先に「実行中」を登録してから await する（間に2本目が入って同時に走らないように）
+  const job = { id: id("rjob"), status: "running", step: "準備しています", done: 0, total: 0, startedAt: nowIso(), finishedAt: "", message: "", error: "", runIds: [], cancelRequested: false };
+  for (const key of [...researchJobs.keys()].slice(0, Math.max(0, researchJobs.size - 9))) researchJobs.delete(key);
+  researchJobs.set(job.id, job);
+  const previousJobId = currentResearchJobId;
+  currentResearchJobId = job.id;
+  let targets;
+  try {
+    const db = await readDb();
+    targets = researchTargets(db.settings, body);
+    if (!targets.length) throw new HttpError(400, "キーワードを入れるか、設定で発信テーマを登録してください。");
+  } catch (error) {
+    researchJobs.delete(job.id);
+    currentResearchJobId = previousJobId;
+    throw error;
+  }
+  const int = (v, lo, hi, dflt) => (v === undefined || v === null || v === "" ? dflt : Math.min(hi, Math.max(lo, Math.floor(Number(v) || 0))));
+  const opts = {
+    minLikes: int(body.minLikes, 0, 1_000_000, 0), maxAgeDays: int(body.maxAgeDays, 0, 3650, 0), pick: int(body.pick, 1, RESEARCH_PICK_MAX, RESEARCH_PICK_DEFAULT),
+    pagesPerTarget: targets.length > 1 ? MAX_VERIFY_MULTI : MAX_VERIFY_PAGES, deadline: Date.now() + RESEARCH_JOB_LIMIT_MS
+  };
+  runResearchJob(job, targets, opts).catch(async (error) => {
+    job.status = "error";
+    job.step = "";
+    job.error = String(error.message || error).slice(0, 400);
+    job.finishedAt = nowIso();
+    await withDb(async (d) => { log(d, "error", `まとめてリサーチが止まりました: ${job.error}`); }).catch(() => {});
+  });
+  return { status: 202, body: { job: publicResearchJob(job), targets } };
+});
+
+// 進行中のリサーチを止める（今開いているページが終わったところで止まる。集め終わった分は残る）
+route("POST", "/api/research/jobs/:id/cancel", async ({ params }) => {
+  const job = researchJobs.get(params.id === "latest" ? currentResearchJobId : params.id);
+  if (!job) throw new HttpError(404, "そのリサーチは見つかりません。");
+  if (job.status === "running") {
+    job.cancelRequested = true;
+    job.step = "止めています（今開いているページが終わったら止まります）";
+  }
+  return { status: 200, body: { job: publicResearchJob(job) } };
+});
+
+route("GET", "/api/research/jobs/:id", async ({ params }) => {
+  const job = researchJobs.get(params.id === "latest" ? currentResearchJobId : params.id);
+  if (!job) throw new HttpError(404, "そのリサーチは見つかりません（サーバーを再起動すると、進行中の記録は消えます。結果はリサーチ画面に残っています）。");
+  const db = job.status === "running" ? null : await readDb();
+  const runs = db ? (db.researchRuns || []).filter((r) => job.runIds.includes(r.id)) : [];
+  const picked = db ? runs.flatMap((r) => r.pickedIds.map((pid) => db.references.find((ref) => ref.id === pid)).filter(Boolean).map((ref) => ({
+    id: ref.id, theme: ref.theme, username: ref.username, permalink: ref.permalink, likes: ref.metrics?.likes ?? null, replies: ref.metrics?.replies ?? null,
+    hookType: ref.analysis?.hookType || "", hook: ref.analysis?.hook || "", text: String(ref.text || "").slice(0, 200)
+  }))) : [];
+  return { status: 200, body: { job: publicResearchJob(job), runs, picked } };
+});
+
 // --- 参考投稿（Threadsキーワード検索 / 手動貼り付け / 型の分析） ---
 // 特定ユーザー1アカウントの公開投稿を一覧する。save:true なら参考投稿（未選択）としても保存する
 route("POST", "/api/profile-posts", async ({ body }) => {
@@ -4749,7 +5455,7 @@ route("POST", "/api/references", async ({ body }) => {
 route("PUT", "/api/references/:id", async ({ params, body }) => {
   const ref = await withDb(async (d) => {
     const found = findOr404(d.references, params.id, "参考投稿");
-    if ("selected" in body) found.selected = Boolean(body.selected);
+    if ("selected" in body) { found.selected = Boolean(body.selected); found.autoSelected = false; found.userRejected = !found.selected; }
     return { value: found };
   });
   return { status: 200, body: { reference: ref } };
@@ -4763,16 +5469,23 @@ route("DELETE", "/api/references/:id", async ({ params }) => {
   return { status: 200, body: { ok: true } };
 });
 
+// 型の分析結果を各参考投稿に保存する（手動の分析ボタンと、まとめてリサーチの両方で使う）
+function applyReferenceAnalysis(d, result) {
+  for (const item of result.items || []) {
+    const ref = d.references.find((r) => r.id === item.id);
+    if (!ref) continue;
+    ref.analysis = { hook: item.hook, structure: item.structure, whyItWorks: item.whyItWorks, howToAdapt: item.howToAdapt };
+    if (HOOK_TYPES.includes(item.hookType)) ref.analysis.hookType = item.hookType;
+  }
+}
+
 route("POST", "/api/references/analyze", async () => {
   const db = await readDb();
   const selected = db.references.filter((ref) => ref.selected).slice(0, 12);
   if (!selected.length) throw new HttpError(400, "分析する参考投稿にチェックを入れてください（最大12件）。");
   const result = await callAiJson(db.settings, buildReferenceAnalysisPrompt(db.settings, selected), referenceAnalysisSchema);
   const analysis = await withDb(async (d) => {
-    for (const item of result.items || []) {
-      const ref = d.references.find((r) => r.id === item.id);
-      if (ref) ref.analysis = { hook: item.hook, structure: item.structure, whyItWorks: item.whyItWorks, howToAdapt: item.howToAdapt };
-    }
+    applyReferenceAnalysis(d, result);
     d.referenceAnalysis = { commonPatterns: result.commonPatterns || "", analyzedIds: selected.map((r) => r.id), at: nowIso() };
     log(d, "info", "参考投稿の型を分析しました。", { count: selected.length });
     return { value: d.referenceAnalysis };
@@ -5237,6 +5950,7 @@ route("POST", "/api/generate-posts", async ({ body }) => {
     acceptedSoFar.push({ id: `batch${acceptedSoFar.length}`, status: "approved", text, createdAt: nowIso() });
     return true;
   });
+  const libraryIds = new Set(loadSharedPatterns().map((p) => p.id));
   const posts = await withDb(async (d) => {
     const slots = assignSchedule(d.settings, body.date, count);
     if (skipped.length) log(d, "error", `生成された投稿案のうち${skipped.length}件を捨てました（${skipped.map((s) => s.reason).join("・")}）。`, { skipped });
@@ -5246,12 +5960,16 @@ route("POST", "/api/generate-posts", async ({ body }) => {
         text: post.text,
         topicTag: themeByPost.get(post)?.topicTag || post.topicTag,
         theme: themeByPost.get(post)?.name,
+        hookType: post.hookType,
+        patternId: libraryIds.has(post.patternId) ? post.patternId : "", // ライブラリに無い id は残さない
         status: "review",
         scheduledAt: slots[index] || "",
         origin: d.settings.aiProvider || "gemini",
         strategyMemo: result.strategyMemo || ""
       })
     );
+    const usedReferenceIds = selectDraftReferences(db, request).map((ref) => ref.id);
+    if (usedReferenceIds.length) for (const post of created) post.referenceIds = usedReferenceIds;
     for (const post of created) post.safety = evaluateSafety(post, { settings: d.settings, posts: d.posts, stage: "generate" });
     d.posts.unshift(...created);
     log(d, "info", `${aiProviderLabel(d.settings.aiProvider || "gemini")}で投稿案を${created.length}件生成しました（承認待ち）。`, { count: created.length });
@@ -5308,6 +6026,7 @@ route("POST", "/api/campaigns/:id/generate", async ({ params }) => {
       category: "宣伝",
       text: post.text,
       topicTag: post.topicTag,
+      hookType: post.hookType,
       status: "review",
       scheduledAt: slots[index],
       origin: d.settings.aiProvider || "gemini",
@@ -5355,6 +6074,9 @@ route("PUT", "/api/posts/:id", async ({ params, body }) => {
     if (found.status === "published") throw new HttpError(409, "公開済みの投稿は編集できません。");
     const patch = pickContent(body);
     const next = normalizePost({ ...found, ...patch, id: found.id, status: found.status, createdAt: found.createdAt });
+    // 人が予約時刻を直したら、自動の振り直しの記録は終わり（遅延として数えない）
+    // 画面は分までしか送らないので、秒以下の違いは人が直したことにしない
+    if ("scheduledAt" in patch && Math.floor(Date.parse(next.scheduledAt || "") / 60000) !== Math.floor(Date.parse(found.scheduledAt || "") / 60000) && next.scheduledAt !== (found.scheduledAt || "")) { delete next.originalScheduledAt; delete next.rescheduledAt; delete next.rescheduleSkippedAt; }
     const contentChanged = ["text", "format", "mediaUrl", "topicTag", "altText"].some((key) => (next[key] || "") !== (found[key] || ""));
     if (contentChanged && found.publishFailedAt) {
       // 失敗後に本文を変えると、前回分が届いているかを本文で照合できない。印を残して公開時に知らせる
@@ -5382,6 +6104,11 @@ route("PUT", "/api/posts/:id", async ({ params, body }) => {
     }
     if (["approved", "scheduled"].includes(next.status) && "scheduledAt" in patch && next.scheduledAt) assertCampaignWindow(next, Date.parse(next.scheduledAt));
     Object.assign(found, next);
+    // Object.assign は next から消した項目を found から消さない。振り直しの記録は found 側からも消す
+    for (const key of ["originalScheduledAt", "rescheduledAt", "rescheduleSkippedAt"]) if (!(key in next)) delete found[key];
+    releaseHoldIfRescheduled(found, patch);
+    // 型の欄は、空や7種以外を送ったら消す（Object.assign では前の値が残るため）
+    for (const key of ["hookType", "patternId"]) if (key in patch && !(key in next)) delete found[key];
     return { value: found };
   });
   return { status: 200, body: { post } };
@@ -5397,6 +6124,7 @@ route("POST", "/api/posts/:id/transition", async ({ params, body }) => {
     }
     try {
       applyTransition(found, body.action, { force: !!body.force, reason: body.reason, safetyContext: { settings: d.settings, posts: d.posts } });
+      if (found.scheduledAt !== previousScheduledAt || ["unschedule", "reject", "restore", "approve"].includes(body.action)) { delete found.originalScheduledAt; delete found.rescheduledAt; delete found.rescheduleSkippedAt; } // 人が予約時刻を直した（自動の振り直しの記録は終わり）
     } catch (error) {
       // 失敗した予約の日時は残さない（変更前の状態のまま 409 を返す）
       if (previousScheduledAt === undefined) delete found.scheduledAt;
@@ -5493,11 +6221,23 @@ route("POST", "/api/replies/:id/safety-override", async ({ params, body }) => {
 });
 
 // 手動公開: 承認済み・予約済みのみ。運用モードに関わらずサーバー側で強制する。
+// ライセンスの状態と、停止中に予約時刻を過ぎて保留した投稿の一覧
+route("GET", "/api/license", async () => ({ status: 200, body: licensePayload(await readDb()) })); // 応答の本文に status 項目があるので、必ず status/body の形で返す
+
+// 保留した予約を1件ずつ決める。「出す」は1操作（次の周で公開）、「破棄」は却下に移す
+route("POST", "/api/posts/:id/license-hold", async ({ params, body }) => {
+  const action = body?.action;
+  if (action !== "publish" && action !== "discard") throw new HttpError(400, "action は publish か discard で指定してください。");
+  const decided = await withDb(async (db) => ({ value: applyLicenseHold(db, params.id, action) }));
+  return { status: 200, body: decided };
+});
+
 route("POST", "/api/posts/:id/publish", async ({ params }) => {
   // 状態検査とロック取得をDBロック内で行い、同じ投稿への同時リクエストを1本に絞る
   const { target, settings, blocked } = await withDb(async (d) => {
     const found = findOr404(d.posts, params.id, "投稿");
     assertNotInFlight(found.id);
+    assertLicenseAllows(d);
     if (!canPublish(found)) throw new HttpError(409, `「${statusLabel(found.status)}」の投稿は公開できません。先に承認してください。`);
     assertTextWithinLimit(found);
     assertCampaignWindow(found, Date.now());
@@ -5517,6 +6257,7 @@ route("POST", "/api/posts/:id/publish", async ({ params }) => {
     }
     inFlight.add(found.id);
     found.publishing = { startedAt: nowIso(), prevStatus: found.status, containerId: "" };
+    found.manualPublish = true; // 手動公開の印（markPublished が、遅延の規則を手動用に切り替える）
     return { value: { target: structuredClone(found), settings: d.settings } };
   });
   if (blocked) throw Object.assign(new HttpError(409, safetyMessage(blocked)), { safety: blocked });
@@ -5525,7 +6266,7 @@ route("POST", "/api/posts/:id/publish", async ({ params }) => {
   try {
     if (target.publishFailedAt && !target.textChangedAfterFailure) {
       const dup = await findRecentSameText(settings, target.text, Date.parse(target.publishFailedAt) - 30 * 60 * 1000);
-      if (dup) result = { id: String(dup.id), permalink: dup.permalink || "" };
+      if (dup) result = { id: String(dup.id), permalink: dup.permalink || "", publishedAt: threadsTimestampIso(dup.timestamp) };
     }
     if (!result) result = await publishThreadsPost(settings, target, {
       safety: { stage: "publish", manual: true },
@@ -5635,6 +6376,7 @@ route("PUT", "/api/replies/:id", async ({ params, body }) => {
 // スパムコメントを非表示にする（Threads側で「全員に対して非表示」。画面から元に戻せる。削除ではない）
 route("POST", "/api/replies/:id/hide", async ({ params, body }) => {
   const snapshot = await readDb();
+  assertLicenseAllows(snapshot);
   const target = findOr404(snapshot.replies, params.id, "コメント");
   const hide = body.hide !== false;
   await threadsFetch(`/${target.id}/manage_reply`, { method: "POST", params: { hide: hide ? "true" : "false" }, token: requireToken(snapshot.settings) });
@@ -5674,6 +6416,7 @@ route("POST", "/api/replies/:id/respond", async ({ params, body }) => {
   const { text, settings, replyId, wasError } = await withDb(async (d) => {
     const reply = findOr404(d.replies, params.id, "コメント");
     assertNotInFlight(lockKey);
+    assertLicenseAllows(d);
     if (reply.status === "responded") throw new HttpError(409, "このコメントには返信済みです。");
     if (reply.status === "ignored") throw new HttpError(409, "「対応しない」にしたコメントです。返信するには先に「未対応に戻す」を押してください。");
     const candidate = (String(body.text || "").trim() || String(reply.responseText || "")).trim();
@@ -5692,20 +6435,37 @@ route("POST", "/api/replies/:id/respond", async ({ params, body }) => {
 });
 
 // --- 改善提案 ---
+const SUGGESTION_REPEAT_LIMIT = 0.5; // 暫定の目安（文字5-gramの重なり。実測で決めた値ではない）
 async function generateSuggestion(snapshot) {
   const stats = buildStats(snapshot);
   if (stats.publishedWithInsights < 3) {
     throw new HttpError(400, `改善提案にはインサイト付きの公開投稿が3件以上必要です（現在${stats.publishedWithInsights}件）。先に「インサイトを取得」してください。`);
   }
-  const result = await callAiJson(snapshot.settings, buildSuggestionPrompt(snapshot.settings, stats), suggestionSchema, { maxOutputTokens: 4096 });
+  const result = await callAiJson(snapshot.settings, buildSuggestionPrompt(snapshot.settings, stats, snapshot), suggestionSchema, { maxOutputTokens: 4096 });
+  const recommendedHookTypes = (Array.isArray(result.recommendedHookTypes) ? result.recommendedHookTypes : []).filter((t) => HOOK_TYPES.includes(t)).slice(0, 3);
+  // 直近3件のどれかと本文（伸ばす・減らす・テーマ案）の重なりが大きい提案は repeated を付けて残す（捨てない。画面と次の分析で見分けるため）
+  const newText = suggestionText(result);
+  const repeatedOf = (snapshot.suggestions || []).slice(0, 3)
+    .map((sug) => ({ id: sug.id, overlap: +ngramOverlap(newText, suggestionText(sug)).toFixed(2) }))
+    .filter((x) => x.overlap >= SUGGESTION_REPEAT_LIMIT)
+    .sort((a, b) => b.overlap - a.overlap)[0];
   return withDb(async (d) => {
-    const item = { id: id("sug"), at: nowIso(), basedOn: stats.publishedWithInsights, ...result };
+    const item = { id: id("sug"), at: nowIso(), basedOn: stats.publishedWithInsights, ...result, recommendedHookTypes, repeated: Boolean(repeatedOf), ...(repeatedOf ? { repeatedOf } : {}) };
+    if (repeatedOf) log(d, "info", `改善提案が直近の提案とほぼ同じ内容でした（重なり${Math.round(repeatedOf.overlap * 100)}%）。`, { repeatedOf });
     d.suggestions.unshift(item);
     d.suggestions = d.suggestions.slice(0, 20);
     log(d, "info", "改善提案を生成しました。", { basedOn: stats.publishedWithInsights });
     return { value: item };
   });
 }
+
+// 型別の実績（この口座）と、共有ライブラリの型の数。画面・MCP・確認用
+route("GET", "/api/pattern-stats", async () => {
+  const db = await readDb();
+  const library = loadSharedPatterns();
+  const libraryByType = Object.fromEntries(HOOK_TYPES.map((t) => [t, library.filter((p) => p.hookType === t).length]));
+  return { status: 200, body: { ...typePerformance(db), library: { count: library.length, byType: libraryByType } } };
+});
 
 route("POST", "/api/suggestions", async () => {
   const suggestion = await generateSuggestion(await readDb());
@@ -5923,14 +6683,16 @@ export { appendErrorLog };
 export const _internals = {
   classifySendFailure, recordSendAttempt, safeSendError, alreadyRepliedByMe, requeueNetworkFailedReplies, sendReplyNow, publishThreadsPost,
   styleWarnings,
-  recoverPublishing, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, sanitizeLogMeta, isTransientThreadsError, isThreadsMissingObjectError, boundedBackoffMs, applyReplyFetchFailures, recordAutoDeleteFailureForTest: recordAutoDeleteFailure, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
+  recoverPublishing, reconcileFailedPublishes, markPublishError, findSameTextSince, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, sanitizeLogMeta, isTransientThreadsError, isThreadsMissingObjectError, boundedBackoffMs, applyReplyFetchFailures, recordAutoDeleteFailureForTest: recordAutoDeleteFailure, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
   toStrictSchema,
   REPLY_TEXT_BLOCKLIST,
-  autoReplyTick, classifySafeError, monitoringStatusPayload, buildDraftPrompt, questionQualityIssue,
+  autoReplyTick, classifySafeError, monitoringStatusPayload, buildDraftPrompt, selectDraftReferences, callAiJson, loadSharedPatterns, selectSharedPatterns, typePerformance, buildSuggestionPrompt, generateSuggestion, HOOK_TYPES, researchTargets, questionQualityIssue,
   diagnosticMeta, endpointKindForThreadsPath,
   evaluateSafety,
   safetyMessage, safetySummary, safetyTextKey, allocateThemes, sanitizeThemes, sanitizeCampaigns, assertCampaignWindow, applyCampaignLink, campaignSlots, buildCampaignPrompt, autoRepostTick, rebuzzTopUp, SAFETY_DEFAULT_WORDS,
+  findFreeSlots, planLateReschedules,
   draftRepliesBatch, pickAiFailedForRecovery, recoverAiFailedReplies, REPLY_AI_RECOVERY_EVERY_MS, schedulerTick, assignSchedule, sanitizeSettings, applyTransition, normalizePost, readDb, withDb,
+  licenseTick, licenseDecisionOf, holdPastDueScheduled, applyLicenseHold, assertLicenseAllows, sendAutoReplies, applyLicenseSettingsChange, releaseHoldIfRescheduled,
   pauseBackgroundScheduler: () => { backgroundSchedulerPaused = true; } };
 
 // 自己署名証明書（localhost・10年）。openssl が無ければ https は立てず、手動トークン運用を案内する。

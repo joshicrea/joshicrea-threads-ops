@@ -8,6 +8,8 @@ const state = {
   replies: [],
   insights: [],
   research: [],
+  researchRuns: [],
+  researchJob: null,
   references: [],
   referenceAnalysis: null,
   suggestions: [],
@@ -225,7 +227,7 @@ let settingsDirty = false;
 
 const VIEW_RENDERERS = {
   dashboard: () => {},
-  research: () => { renderReferences(); renderResearch(); },
+  research: () => { renderAutoResearch(); renderReferences(); renderResearch(); },
   generate: renderGenerateInputs,
   queue: renderQueue,
   replies: renderReplies,
@@ -324,6 +326,9 @@ function renderDashboard() {
   // tone: danger=取り消しや失敗に関わる / warn=人の判断待ち / 無し=ふつう
   // （未設定・期限切れは上の手順の欄に出るので、ここには入れない）
   const todos = [];
+  const lic = state.license || {};
+  if (lic.enforced && !lic.allowed) todos.push({ text: `${lic.message} 自動の投稿・返信・削除は止まっています`, goto: "settings", focus: "licenseKey", tone: "danger" });
+  else if (lic.status === "grace") todos.push({ text: lic.message, goto: "settings", focus: "licenseKey", tone: "warn" });
   if (countStatus("error")) todos.push({ count: countStatus("error"), text: `エラーになった投稿が${countStatus("error")}件あります。原因を確認して承認し直す`, goto: "queue", filter: "error", tone: "danger" });
   const safetyStopped = state.posts.filter((p) => p.safety?.level === "blocked" && !["published", "rejected"].includes(p.status) && !safetyDeferred(p)).length
     + state.replies.filter((r) => r.safety?.level === "blocked" && r.status !== "responded").length;
@@ -340,6 +345,8 @@ function renderDashboard() {
   $("#todoList").innerHTML = todos.length
     ? todos.map((t) => `<button class="todo-item ${t.tone ? `t-${t.tone}` : ""}" type="button" data-goto="${t.goto}" ${t.filter ? `data-filter="${t.filter}"` : ""}${t.focus ? ` data-focus="${t.focus}"` : ""}><span class="todo-count">${t.count ?? ""}</span><span class="todo-text">${escapeHtml(t.text)}</span><span class="todo-open">開く</span></button>`).join("")
     : showSteps ? "" : `<p class="empty">今すぐやることはありません。</p>`;
+
+  renderLicenseHold(lic.held || []);
 
   $("#connectionStatus").innerHTML = [
     aiConnLine(),
@@ -370,6 +377,15 @@ function renderDashboard() {
       ${log.level === "error" && log.meta?.error ? `<details class="log-detail"><summary>${escapeHtml(log.meta.error.slice(0, 90))}${log.meta.error.length > 90 ? "..." : ""}</summary>${escapeHtml(log.meta.error)}${log.meta.detail ? `<br>${escapeHtml(log.meta.detail)}` : ""}</details>` : ""}</div>
     </div>
   `).join("") || `<p class="empty">ログはまだありません。</p>`;
+}
+
+// 許可が止まっていた間に予約時刻を過ぎた投稿。1件ずつ「出す」か「破棄」を選ぶ（「出す」が既定）
+function renderLicenseHold(held) {
+  const box = $("#licenseHold");
+  box.hidden = held.length === 0;
+  box.innerHTML = held.length ? `<p class="next-group-label">許可が止まっていた間に、予約の時刻を過ぎた投稿が${held.length}件あります。1件ずつ選んでください。</p>`
+    + held.map((h) => `<div class="mini-card"><div class="post-meta row"><span class="meta-time">予約: ${fmtDate(h.scheduledAt)}</span></div><div class="clamp">${nl2br(h.text)}</div>
+      <div class="row"><button class="button" type="button" data-license-hold="publish" data-id="${escapeHtml(h.id)}">出す</button><button class="button secondary" type="button" data-license-hold="discard" data-id="${escapeHtml(h.id)}">破棄</button></div></div>`).join("") : "";
 }
 
 function aiConnLine() {
@@ -428,7 +444,7 @@ function renderReferences() {
     <article class="ref-card ${ref.selected ? "selected" : ""}">
       <label class="ref-head">
         <input type="checkbox" data-ref-toggle="${ref.id}" ${ref.selected ? "checked" : ""} />
-        <span class="post-meta">${ref.username ? `@${escapeHtml(ref.username)}` : "手動追加"}${ref.keyword ? ` / 「${escapeHtml(ref.keyword)}」` : ""}${ref.timestamp ? ` / ${fmtDate(ref.timestamp)}` : ""}${likesOf(ref) !== null ? ` / いいね ${likesOf(ref)}${ref.metrics.replies !== null && ref.metrics.replies !== undefined ? ` / 返信 ${Number(ref.metrics.replies) || 0}` : ""}` : " / 反応数なし"}${ref.unverified ? ` / <strong class="unverified-tag">未検証（AI取得・要目視確認）</strong>` : ""}</span>
+        <span class="post-meta">${ref.username ? `@${escapeHtml(ref.username)}` : "手動追加"}${ref.keyword ? ` / 「${escapeHtml(ref.keyword)}」` : ""}${ref.timestamp ? ` / ${fmtDate(ref.timestamp)}` : ""}${likesOf(ref) !== null ? ` / いいね ${likesOf(ref)}${ref.metrics.replies !== null && ref.metrics.replies !== undefined ? ` / 返信 ${Number(ref.metrics.replies) || 0}` : ""}` : " / 反応数なし"}${ref.verifiedAt ? " / ページで確認済み" : ""}${ref.theme ? ` / テーマ「${escapeHtml(ref.theme)}」` : ""}${ref.autoSelected ? ` / <strong>自動で使う</strong>` : ""}${ref.unverified ? ` / <strong class="unverified-tag">未検証（AI取得・要目視確認）</strong>` : ""}</span>
         <span class="spacer"></span>
         ${safeHref(ref.permalink) ? `<a class="link" href="${safeHref(ref.permalink)}" target="_blank" rel="noreferrer">元投稿</a>` : ""}
         <button class="small-button ghost" data-ref-delete="${ref.id}" type="button">削除</button>
@@ -436,13 +452,74 @@ function renderReferences() {
       <div class="ref-text">${nl2br(ref.text)}</div>
       ${ref.analysis ? `
         <div class="ref-analysis">
-          <div><b>フック</b> ${escapeHtml(ref.analysis.hook)}</div>
+          <div><b>フック</b> ${escapeHtml(ref.analysis.hook)}${ref.analysis.hookType ? `（${escapeHtml(HOOK_TYPE_LABEL[ref.analysis.hookType] || ref.analysis.hookType)}）` : ""}</div>
           <div><b>構造</b> ${escapeHtml(ref.analysis.structure)}</div>
           <div><b>効いている理由</b> ${escapeHtml(ref.analysis.whyItWorks)}</div>
           <div><b>自分ならこう置き換える</b> ${escapeHtml(ref.analysis.howToAdapt)}</div>
         </div>` : ""}
     </article>
   `).join("") : `<p class="notice">まだ候補がありません。上のキーワード検索か、手動貼り付けで追加してください。</p>`;
+}
+
+// ---------------------------------------------------------------------------
+// リサーチ: まとめてリサーチ（裏で進むジョブ。終わるまで数秒おきに状態を聞く）
+// ---------------------------------------------------------------------------
+const HOOK_TYPE_LABEL = { question: "問いかけ", empathy: "あるある・共感", story: "体験談", "bold-claim": "言い切り", contrarian: "常識の逆", list: "まとめ", other: "その他" };
+let researchPollTimer = null;
+let researchPollFailures = 0;
+function renderAutoResearch() {
+  const box = $("#autoResearchStatus");
+  const job = state.researchJob;
+  const runs = state.researchRuns || [];
+  const btn = $("#autoResearchBtn");
+  if (job && job.status === "running") {
+    box.hidden = false;
+    box.innerHTML = `<h4>調べています</h4><div>${escapeHtml(job.step || "")}${job.total ? `（${job.done} / ${job.total}件）` : ""}</div><div class="input-note">この画面を離れても進みます。</div>`;
+    btn.disabled = true;
+    $("#autoResearchCancelBtn").hidden = false;
+    if (!researchPollTimer) researchPollTimer = setInterval(pollResearchJob, 4000);
+    return;
+  }
+  btn.disabled = false;
+  $("#autoResearchCancelBtn").hidden = true;
+  if (job && job.status === "error") {
+    box.hidden = false;
+    box.innerHTML = `<h4>リサーチが止まりました</h4><div>${nl2br(job.error || "")}</div>`;
+  } else if (job && job.status === "done") {
+    box.hidden = false;
+    box.innerHTML = `<h4>リサーチの結果（${fmtDate(job.finishedAt)}）</h4><div>${nl2br(job.message || "")}</div><div class="input-note">使う投稿は下の候補に「自動で使う」と表示され、次の投稿生成に入ります（その回のテーマに合うものだけ）。</div>`;
+  } else if (runs.length) {
+    box.hidden = false;
+    const latest = runs.filter((r) => r.at === runs[0].at || Date.parse(runs[0].at) - Date.parse(r.at) < 3_600_000);
+    box.innerHTML = `<h4>前回のリサーチ（${fmtDate(runs[0].at)}）</h4><div>${latest.map((r) => `「${escapeHtml(r.theme)}」: 候補${r.candidates}件 → 確かめられた${r.verified}件 → 使う${(r.pickedIds || []).length}件`).join("<br>")}</div>`;
+  } else {
+    box.hidden = true;
+  }
+}
+async function pollResearchJob() {
+  const job = state.researchJob;
+  if (!job) { clearInterval(researchPollTimer); researchPollTimer = null; return; }
+  try {
+    const r = await api(`/api/research/jobs/${encodeURIComponent(job.id)}`);
+    researchPollFailures = 0;
+    state.researchJob = r.job;
+    if (r.job.status !== "running") {
+      clearInterval(researchPollTimer);
+      researchPollTimer = null;
+      await loadState();
+      toast(r.job.status === "done" ? "リサーチが終わりました。結果を確認してください。" : "リサーチが止まりました。", r.job.status === "done" ? "info" : "error");
+    }
+    renderAutoResearch();
+  } catch (error) {
+    researchPollFailures += 1;
+    if (researchPollFailures < 3) return;
+    clearInterval(researchPollTimer);
+    researchPollTimer = null;
+    researchPollFailures = 0;
+    state.researchJob = null;
+    renderAutoResearch();
+    toast(`リサーチの進み具合を確かめられませんでした: ${error.message}`, "error");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,6 +1146,8 @@ function renderSettings() {
   $("#threadsAppSecret").value = s.threadsAppSecret || "";
   $("#threadsOAuthExchangeUrl").value = s.threadsOAuthExchangeUrl || "";
   $("#threadsOAuthClientToken").value = s.threadsOAuthClientToken || "";
+  $("#licenseKey").value = s.licenseKey || "";
+  $("#licenseResumeMode").value = s.licenseResumeMode === "auto" ? "auto" : "ask";
   $("#threadsRedirectUri").value = s.threadsRedirectUri || "";
   $("#threadsScopes").value = s.threadsScopes || "";
   $("#threadsAccessToken").value = s.threadsAccessToken || "";
@@ -1259,6 +1338,8 @@ function collectSettings() {
     threadsAppSecret: $("#threadsAppSecret").value,
     threadsOAuthExchangeUrl: $("#threadsOAuthExchangeUrl").value,
     threadsOAuthClientToken: $("#threadsOAuthClientToken").value,
+    licenseKey: $("#licenseKey").value,
+    licenseResumeMode: $("#licenseResumeMode").value,
     threadsRedirectUri: $("#threadsRedirectUri").value,
     threadsScopes: $("#threadsScopes").value,
     threadsAccessToken: $("#threadsAccessToken").value,
@@ -1341,6 +1422,16 @@ function bindEvents() {
     if (goto) {
       showView(goto.dataset.goto, { filter: goto.dataset.filter });
       if (goto.dataset.focus) focusField(goto.dataset.focus);
+    }
+    const hold = event.target.closest("[data-license-hold]");
+    if (hold) {
+      const action = hold.dataset.licenseHold;
+      busy(hold, action === "publish" ? "出しています" : "破棄しています", async () => {
+        await api(`/api/posts/${encodeURIComponent(hold.dataset.id)}/license-hold`, { method: "POST", body: { action } });
+        await loadState();
+        toast(action === "discard" ? "破棄しました（却下に移しました）。" : state.settings.autoPublishEnabled ? "出すことにしました。まもなく公開します。" : "予約し直しました。自動送信がOFFなので、投稿キューで「今すぐ投稿」を押してください。", "info", 8000);
+        return true;
+      });
     }
     const tab = event.target.closest(".tab");
     if (tab) {
@@ -1461,6 +1552,18 @@ function bindEvents() {
       await loadState();
     });
   });
+  $("#autoResearchBtn").addEventListener("click", (e) => busy(e.currentTarget, "開始中", async () => {
+    const r = await api("/api/research/run", { method: "POST", body: { keyword: $("#autoResearchKeyword").value.trim(), minLikes: $("#autoResearchMinLikes").value, maxAgeDays: $("#autoResearchMaxAge").value } });
+    state.researchJob = r.job;
+    renderAutoResearch();
+    toast(r.alreadyRunning ? "前のリサーチがまだ進んでいます。終わるまでお待ちください。" : `リサーチを始めました（${(r.targets || []).map((t) => `「${t.keyword}」`).join("・")}）。1テーマで5〜10分ほど、最大20分で打ち切りです。`);
+  }));
+  $("#autoResearchCancelBtn").addEventListener("click", (e) => busy(e.currentTarget, "止めています", async () => {
+    if (!state.researchJob) return;
+    const r = await api(`/api/research/jobs/${encodeURIComponent(state.researchJob.id)}/cancel`, { method: "POST" });
+    state.researchJob = r.job;
+    renderAutoResearch();
+  }));
   $("#researchBtn").addEventListener("click", (e) => busy(e.currentTarget, "検索中（30秒ほど）", async () => {
     const keyword = $("#researchKeyword").value.trim();
     if (!keyword) throw new Error("キーワードを入力してください。");
