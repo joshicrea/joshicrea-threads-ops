@@ -221,6 +221,8 @@ const defaultDb = {
     lastHeartbeatAt: "",
     lastPostSuccessAt: "",
     lastReplySuccessAt: "",
+    heldReplyCount: 0, // 要確認（held）と成否不明の返信の件数。画面を開かなくても滞留が分かるように残す
+    uncertainReplyCount: 0,
     lastSafeError: null,
     lastUpdatedAt: ""
   },
@@ -772,6 +774,8 @@ function monitoringStatusPayload(db) {
     lastHeartbeatAt: monitoring.lastHeartbeatAt || "",
     lastPostSuccessAt: monitoring.lastPostSuccessAt || "",
     lastReplySuccessAt: monitoring.lastReplySuccessAt || "",
+    heldReplyCount: monitoring.heldReplyCount || 0,
+    uncertainReplyCount: monitoring.uncertainReplyCount || 0,
     lastSafeError: monitoring.lastSafeError || null,
     lastUpdatedAt: monitoring.lastUpdatedAt || "",
     serverTime: nowIso()
@@ -814,10 +818,11 @@ function classifySafeError(error, area = "unknown") {
   return base;
 }
 
-function recordMonitoringEvent(db, type, { error, area } = {}) {
+function recordMonitoringEvent(db, type, { error, area, held, uncertain } = {}) {
   if (!db.settings.monitoringEnabled) return;
   db.monitoring = { ...structuredClone(defaultDb.monitoring), ...(db.monitoring || {}) };
   const at = nowIso();
+  if (type === "reply_backlog") { db.monitoring.heldReplyCount = held; db.monitoring.uncertainReplyCount = uncertain; }
   if (type === "heartbeat") db.monitoring.lastHeartbeatAt = at;
   if (type === "post_success") db.monitoring.lastPostSuccessAt = at;
   if (type === "reply_success") db.monitoring.lastReplySuccessAt = at;
@@ -3427,7 +3432,8 @@ function buildReplyBatchPrompt(settings, items) {
       `- id: ${item.id}`,
       `  元投稿: ${String(item.postText || "").replace(/\s+/g, " ").slice(0, 200)}`,
       `  コメント: ${String(item.text || "").replace(/\s+/g, " ").slice(0, 500)}`,
-      `  このユーザーとのやり取り: ${item.isFollowUp ? "2回目以降" : "1回目"}`
+      `  このユーザーとのやり取り: ${item.isFollowUp ? "2回目以降" : "1回目"}`,
+      ...(item.avoidEcho ? ["  注意: 前回の返信案はコメントの言葉を繰り返しすぎて見送られた。コメントに出てくる語句（名詞・動詞）をそのまま使わず、短い受け止めの一言と、作品を見ても分からないことへの問いかけ（1回目の場合）に絞って書き直す。言い換えて褒める文は書かない"] : [])
     ].join("\n"))
   ].join("\n");
 }
@@ -3703,6 +3709,70 @@ async function recoverAiFailedReplies(snapshot) {
   return true;
 }
 
+const REPLY_ECHO_HOLD = "返信文がコメントの言い換えになっているため自動送信を見送りました";
+// AIの判定1件を、自動送信してよいかどうかで見る。空文字なら通る、文字列なら見送る理由
+function replyDraftHold(settings, item, verdict, text, found, seenTexts) {
+  const source = normalizeForQuote(item.text);
+  const quote = normalizeForQuote(verdict?.quote).slice(0, 8);
+  const quoteOk = verdict && quote.length >= Math.min(4, source.length) && source.includes(quote);
+  if (!verdict) return "AIの判定に含まれませんでした";
+  if (!quoteOk) return "AIの応答がどのコメントへの返信か照合できませんでした";
+  if (verdict.decision !== "reply") return String(verdict.reason || "AIが人の確認が必要と判定").slice(0, 300);
+  if (!text) return "AIが返信文を作れませんでした";
+  if ([...text].length > THREADS_TEXT_LIMIT) return `返信文が${THREADS_TEXT_LIMIT}文字を超えています`;
+  if (REPLY_TEXT_BLOCKLIST.test(text)) return "返信文にURL・メンション・連絡先・名前の呼びかけが含まれるため自動送信を見送りました";
+  if (seenTexts.has(text)) return "同じ文面の返信が同時に作られたため自動送信を見送りました";
+  if ((String(settings.replyStyle || "").trim() ? REPLY_VAGUE_ENDING_SOFT : REPLY_VAGUE_ENDING).test(text)) return "返信文に「気がします」「かもしれません」などの曖昧な言い回しがあるため自動送信を見送りました（断定で書き直してください）";
+  if (replyLanguageMismatch(item.text, text)) return "コメントが英語なのに返信文が日本語のため自動送信を見送りました（英語で書き直してください）";
+  if (REPLY_ASKS_SCHEDULE.test(text)) return "返信文が、期間・時期・完成の予定を聞き返しているため自動送信を見送りました（作品はすでに形になっていることが多く、噛み合いません）";
+  if (REPLY_ASKS_VISIBLE.test(text)) return "返信文が、投稿を見れば分かることを聞き返しているため自動送信を見送りました";
+  if (replyEchoesComment(item.text, text)) return REPLY_ECHO_HOLD;
+  if ((found.depth || 1) >= 2 && /[?？]/.test(text)) return "2回目以降の返信に問いかけが含まれるため自動送信を見送りました";
+  return "";
+}
+
+// 言い換えで止まった下書きを、言い換えを避ける指示を強めて1回だけ作り直す。通れば通常の下書き、それでも止まる場合だけ要確認に残す
+async function retryEchoHeldReplies(snapshot) {
+  const targets = snapshot.replies.filter((r) => r.status === "held" && r.holdReason === REPLY_ECHO_HOLD && r.text && !r.echoRetriedAt).slice(0, REPLY_BATCH_SIZE);
+  if (!targets.length) return { retried: 0, drafted: 0 };
+  await withDb(async (d) => { for (const r of d.replies) if (targets.some((t) => t.id === r.id)) r.echoRetriedAt = nowIso(); }); // 失敗しても作り直しは1回きり
+  const items = targets.map((reply) => ({
+    id: reply.id, text: reply.text, postText: snapshot.posts.find((p) => p.id === reply.postId)?.text || "",
+    isFollowUp: Boolean(reply.username) && snapshot.replies.some((r) => r.id !== reply.id && r.postId === reply.postId && r.username === reply.username && r.status === "responded"),
+    avoidEcho: true
+  }));
+  let result;
+  try {
+    result = await callAiJson(snapshot.settings, buildReplyBatchPrompt(snapshot.settings, items), replyBatchSchema, { maxOutputTokens: 4096 });
+    if (!result || !Array.isArray(result.replies)) return { retried: targets.length, drafted: 0 };
+  } catch (error) {
+    await appendErrorLog(new Error(`言い換え保留の下書き作り直しに失敗: ${String(error?.message || error)}`)).catch(() => {});
+    return { retried: targets.length, drafted: 0 };
+  }
+  const byId = new Map(result.replies.filter((r) => r && typeof r === "object").map((r) => [String(r.id), r]));
+  const seenTexts = new Set();
+  return withDb(async (d) => {
+    let drafted = 0;
+    for (const item of items) {
+      const found = d.replies.find((r) => r.id === item.id);
+      if (!found || found.status !== "held" || found.holdReason !== REPLY_ECHO_HOLD) continue;
+      const verdict = byId.get(item.id);
+      const text = typeof verdict?.text === "string" ? verdict.text.trim() : "";
+      if (!text || replyDraftHold(d.settings, item, verdict, text, found, seenTexts)) continue; // 作り直しも通らなければ、元の保留と下書きのまま人に残す
+      seenTexts.add(text);
+      found.responseText = text;
+      found.status = "drafted";
+      found.holdReason = "";
+      found.autoDrafted = true;
+      found.autoQueued = true;
+      found.draftedAt = nowIso();
+      drafted += 1;
+    }
+    log(d, "info", `言い換えで止まっていた返信${items.length}件を、言い換えを避けて作り直しました（下書きに戻せたもの${drafted}件）。`);
+    return { value: { retried: items.length, drafted } };
+  });
+}
+
 async function draftRepliesBatch(snapshot) {
   const pending = pickPendingReplies(snapshot.replies);
   if (!pending.length) return { drafted: 0, held: 0, failed: false };
@@ -3748,23 +3818,7 @@ async function draftRepliesBatch(snapshot) {
       if (!found || found.status !== "unhandled") continue;
       const verdict = byId.get(item.id);
       const text = typeof verdict?.text === "string" ? verdict.text.trim() : "";
-      const source = normalizeForQuote(item.text);
-      const quote = normalizeForQuote(verdict?.quote).slice(0, 8);
-      const quoteOk = verdict && quote.length >= Math.min(4, source.length) && source.includes(quote);
-      let hold = "";
-      if (!verdict) hold = "AIの判定に含まれませんでした";
-      else if (!quoteOk) hold = "AIの応答がどのコメントへの返信か照合できませんでした";
-      else if (verdict.decision !== "reply") hold = String(verdict.reason || "AIが人の確認が必要と判定").slice(0, 300);
-      else if (!text) hold = "AIが返信文を作れませんでした";
-      else if ([...text].length > THREADS_TEXT_LIMIT) hold = `返信文が${THREADS_TEXT_LIMIT}文字を超えています`;
-      else if (REPLY_TEXT_BLOCKLIST.test(text)) hold = "返信文にURL・メンション・連絡先・名前の呼びかけが含まれるため自動送信を見送りました";
-      else if (seenTexts.has(text)) hold = "同じ文面の返信が同時に作られたため自動送信を見送りました";
-      else if ((String(d.settings.replyStyle || "").trim() ? REPLY_VAGUE_ENDING_SOFT : REPLY_VAGUE_ENDING).test(text)) hold = "返信文に「気がします」「かもしれません」などの曖昧な言い回しがあるため自動送信を見送りました（断定で書き直してください）";
-      else if (replyLanguageMismatch(item.text, text)) hold = "コメントが英語なのに返信文が日本語のため自動送信を見送りました（英語で書き直してください）";
-      else if (REPLY_ASKS_SCHEDULE.test(text)) hold = "返信文が、期間・時期・完成の予定を聞き返しているため自動送信を見送りました（作品はすでに形になっていることが多く、噛み合いません）";
-      else if (REPLY_ASKS_VISIBLE.test(text)) hold = "返信文が、投稿を見れば分かることを聞き返しているため自動送信を見送りました";
-      else if (replyEchoesComment(item.text, text)) hold = "返信文がコメントの言い換えになっているため自動送信を見送りました";
-      else if ((found.depth || 1) >= 2 && /[?？]/.test(text)) hold = "2回目以降の返信に問いかけが含まれるため自動送信を見送りました";
+      const hold = replyDraftHold(d.settings, item, verdict, text, found, seenTexts);
       if (hold) {
         found.status = "held";
         found.holdReason = hold;
@@ -3833,22 +3887,27 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
   const { settings, previous } = await withDb(async (d) => ({ save: false, value: { settings: d.settings, previous: { ...d.replies.find((r) => r.id === replyId) } } }));
   let result;
   let failure;
+  let verifiedNone = false; // 送る直前の照合で「付いていない」と確定した（成否不明の印を外して送ってよい根拠）
   try {
-    if (verifyFirst && await alreadyRepliedByMe(settings, replyId)) {
-      const updated = await withDb(async (d) => {
-        const found = findOr404(d.replies, replyId, "コメント");
-        found.status = "responded";
-        found.external = true;
-        found.autoQueued = false;
-        found.respondedAt = found.respondedAt || nowIso();
-        found.error = "";
-        recordMonitoringEvent(d, "reply_success");
-        log(d, "info", "このコメントには既に自分の返信が付いていたため、送信せず返信済みにしました。", { replyId });
-        return { value: found };
-      });
-      return updated;
+    if (verifyFirst) {
+      if (await alreadyRepliedByMe(settings, replyId)) {
+        const updated = await withDb(async (d) => {
+          const found = findOr404(d.replies, replyId, "コメント");
+          found.status = "responded";
+          found.external = true;
+          found.autoQueued = false;
+          found.respondedAt = found.respondedAt || nowIso();
+          found.error = "";
+          delete found.sendUncertainAt;
+          recordMonitoringEvent(d, "reply_success");
+          log(d, "info", "このコメントには既に自分の返信が付いていたため、送信せず返信済みにしました。", { replyId });
+          return { value: found };
+        });
+        return updated;
+      }
+      verifiedNone = true;
     }
-    if (previous.sendUncertainAt || (previous.status === "error" && !previous.sendFailure)) {
+    if (!verifiedNone && (previous.sendUncertainAt || (previous.status === "error" && !previous.sendFailure))) {
       throw Object.assign(new Error("Reply outcome requires review; resend blocked."), { stage: "reconcile", maybePublished: true });
     }
     await withDb(async (d) => { findOr404(d.replies, replyId, "コメント").sendingAt = nowIso(); });
@@ -3859,7 +3918,7 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
   // 通信失敗は「送れたか」が分からない。返信が付いたかを直接見て、付いていれば返信済み・付いていなければ未送信と確定させる
   let confirmedSent = null; // true=付いている / false=付いていない / null=確認できなかった
   const failureInfo = failure ? classifySendFailure(failure) : null;
-  if (failureInfo && previous.sendUncertainAt) Object.assign(failureInfo, { outcome: "unknown", retryable: false });
+  if (failureInfo && previous.sendUncertainAt && !verifiedNone) Object.assign(failureInfo, { outcome: "unknown", retryable: false });
   if (!result && failureInfo?.outcome === "unknown") {
     for (let k = 0; k < 2 && confirmedSent === null; k += 1) {
       try {
@@ -3871,6 +3930,7 @@ async function sendReplyNow(replyId, text, { auto = false, verifyFirst = false }
   }
   const updated = await withDb(async (d) => {
     const found = findOr404(d.replies, replyId, "コメント");
+    if (verifiedNone) delete found.sendUncertainAt; // 照合で未送信と確定済み。この送信の結果が新しい状態を決める
     if (failure) {
       found.sendFailure = { ...failureInfo, at: nowIso() };
       recordSendAttempt(found, failure, { result: "failed", operation: "reply" });
@@ -3983,6 +4043,63 @@ async function requeueNetworkFailedReplies(snapshot) {
     else requeued += 1;
   }
   return { requeued, markedSent };
+}
+
+// 成否不明（sendUncertainAt）で止まった返信を、Threads 側の実際の状態で確定させる。付いていれば返信済み、付いていなければ印を外して下書きに戻す
+// （自動では送り直さない。人が見て送る）。照合できなければ印は残し、試行時刻と回数だけ記録する。二重送信を防ぐ印は、照合で確定するまで外さない
+const REPLY_RECONCILE_EVERY_MS = 30 * 60 * 1000;
+async function reconcileUncertainReply(settings, replyId) {
+  let sent;
+  try {
+    sent = await alreadyRepliedByMe(settings, replyId);
+  } catch (error) {
+    await withDb(async (d) => {
+      const found = d.replies.find((x) => x.id === replyId);
+      if (!found || !found.sendUncertainAt) return { save: false };
+      found.reconcileAttemptedAt = nowIso();
+      found.reconcileAttempts = (found.reconcileAttempts || 0) + 1;
+      log(d, "info", "成否不明の返信をThreads側で照合できませんでした。印は残します。", { replyId, attempts: found.reconcileAttempts, message: String(error?.message || error).slice(0, 120) });
+      return { value: null };
+    });
+    return "unresolved";
+  }
+  return withDb(async (d) => {
+    const found = d.replies.find((x) => x.id === replyId);
+    if (!found || !found.sendUncertainAt || found.status !== "error") return { save: false, value: "skipped" };
+    found.reconcileAttemptedAt = nowIso();
+    found.reconcileAttempts = (found.reconcileAttempts || 0) + 1;
+    delete found.sendUncertainAt;
+    delete found.sendFailure;
+    found.autoQueued = false;
+    found.error = "";
+    if (sent) {
+      found.status = "responded";
+      found.external = true;
+      found.respondedAt = found.respondedAt || nowIso();
+      recordMonitoringEvent(d, "reply_success");
+      log(d, "info", "成否不明だった返信は、Threads側に付いていたため返信済みにしました。", { replyId });
+      return { value: "responded" };
+    }
+    found.status = "drafted";
+    log(d, "info", "成否不明だった返信は、Threads側に付いていないと確認できたため、送れる下書きに戻しました（自動では送りません）。", { replyId });
+    return { value: "drafted" };
+  });
+}
+
+async function reconcileUncertainReplies(snapshot) {
+  const s = snapshot.settings;
+  if (!s.threadsAccessToken) return { responded: 0, drafted: 0, unresolved: 0 };
+  const now = Date.now();
+  const targets = snapshot.replies
+    .filter((r) => r.status === "error" && r.sendUncertainAt && !r.sendingAt && !inFlight.has(`reply:${r.id}`)
+      && now - (Date.parse(r.reconcileAttemptedAt || "") || 0) >= REPLY_RECONCILE_EVERY_MS)
+    .slice(0, 5);
+  const counts = { responded: 0, drafted: 0, unresolved: 0 };
+  for (const r of targets) {
+    const outcome = await reconcileUncertainReply(s, r.id);
+    if (outcome === "responded" || outcome === "drafted" || outcome === "unresolved") counts[outcome] += 1;
+  }
+  return counts;
 }
 
 // 自動送信: autoQueued の下書きだけを、間隔と1日上限を守って送る。1ティックは最大 AUTO_REPLY_MAX_PER_TICK 件（ティックが60秒を超えないように）
@@ -4219,6 +4336,7 @@ async function autoReplyTick() {
   if (s.autoReplyEnabled && (await recoverAiFailedReplies(current))) current = await readDb();
   // 先に送る。下書き作成はAIの応答待ちが長く、先に走ると、できあがっている下書きの送信まで遅れてコメントが溜まる
   await requeueNetworkFailedReplies(current);
+  await reconcileUncertainReplies(current);
   current = await readDb();
   if (licenseDecisionOf(current).allowed) await sendAutoReplies(current);
   current = await readDb();
@@ -4227,6 +4345,16 @@ async function autoReplyTick() {
     await draftRepliesBatch(current);
     current = await readDb();
     if (licenseDecisionOf(current).allowed) await sendAutoReplies(current);
+  }
+  if (s.autoReplyEnabled && current.replies.some((r) => r.status === "held" && r.holdReason === REPLY_ECHO_HOLD && !r.echoRetriedAt)) {
+    const retry = await retryEchoHeldReplies(current);
+    current = await readDb();
+    if (retry.drafted && licenseDecisionOf(current).allowed) await sendAutoReplies(current);
+  }
+  const heldNow = current.replies.filter((r) => r.status === "held").length;
+  const uncertainNow = current.replies.filter((r) => r.sendUncertainAt).length;
+  if (heldNow !== (current.monitoring?.heldReplyCount || 0) || uncertainNow !== (current.monitoring?.uncertainReplyCount || 0)) {
+    await withDb(async (d) => { recordMonitoringEvent(d, "reply_backlog", { held: heldNow, uncertain: uncertainNow }); });
   }
   const lastInsights = Date.parse(s.lastInsightsAutoAt || "") || 0;
   if (s.autoInsightsEnabled && Date.now() - lastInsights >= 24 * 60 * 60 * 1000 && current.posts.some((p) => p.status === "published" && p.threadsId)) {
@@ -6411,6 +6539,27 @@ route("GET", "/api/replies/:id/response-link", async ({ params }) => {
   return { status: 200, body: { url } };
 });
 
+// 画面の「Threadsで確認する」。成否不明の返信を、定期照合と同じ処理でその場で確定させる
+route("POST", "/api/replies/:id/reconcile", async ({ params }) => {
+  const lockKey = `reply:${params.id}`;
+  const settings = await withDb(async (d) => {
+    const reply = findOr404(d.replies, params.id, "コメント");
+    if (!reply.sendUncertainAt) throw new HttpError(409, "このコメントは、送信結果が不明な状態ではありません。");
+    assertNotInFlight(lockKey);
+    requireToken(d.settings);
+    inFlight.add(lockKey);
+    return { save: false, value: d.settings };
+  });
+  try {
+    const outcome = await reconcileUncertainReply(settings, params.id);
+    const reply = (await readDb()).replies.find((r) => r.id === params.id);
+    if (outcome === "unresolved") throw new HttpError(502, "Threadsで確認できませんでした。しばらくしてからもう一度押してください。");
+    return { status: 200, body: { outcome, reply } };
+  } finally {
+    inFlight.delete(lockKey);
+  }
+});
+
 route("POST", "/api/replies/:id/respond", async ({ params, body }) => {
   const lockKey = `reply:${params.id}`;
   const { text, settings, replyId, wasError } = await withDb(async (d) => {
@@ -6691,6 +6840,7 @@ export const _internals = {
   evaluateSafety,
   safetyMessage, safetySummary, safetyTextKey, allocateThemes, sanitizeThemes, sanitizeCampaigns, assertCampaignWindow, applyCampaignLink, campaignSlots, buildCampaignPrompt, autoRepostTick, rebuzzTopUp, SAFETY_DEFAULT_WORDS,
   findFreeSlots, planLateReschedules,
+  reconcileUncertainReply, reconcileUncertainReplies, replyDraftHold, retryEchoHeldReplies, REPLY_ECHO_HOLD,
   draftRepliesBatch, pickAiFailedForRecovery, recoverAiFailedReplies, REPLY_AI_RECOVERY_EVERY_MS, schedulerTick, assignSchedule, sanitizeSettings, applyTransition, normalizePost, readDb, withDb,
   licenseTick, licenseDecisionOf, holdPastDueScheduled, applyLicenseHold, assertLicenseAllows, sendAutoReplies, applyLicenseSettingsChange, releaseHoldIfRescheduled,
   pauseBackgroundScheduler: () => { backgroundSchedulerPaused = true; } };

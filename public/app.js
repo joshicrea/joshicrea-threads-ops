@@ -975,6 +975,7 @@ function renderRepliesList() {
           <div class="row-actions">
             <button class="small-button primary" data-reply-action="send" data-id="${reply.id}" type="button">この内容で返信する</button>
             <span class="public-note">Threadsへ公開されます</span>
+            ${reply.sendUncertainAt ? `<button class="small-button" data-reply-action="reconcile" data-id="${reply.id}" type="button">Threadsで確認する</button><span class="public-note">送れたかどうかが不明です。Threadsで実際に返信が付いているか確かめます（送信はしません）</span>` : ""}
             <button class="small-button" data-reply-action="draft" data-id="${reply.id}" type="button">AIで下書き</button>
             ${reply.status === "drafted" && reply.autoQueued && state.settings.autoReplyEnabled ? `<button class="small-button" data-reply-action="unqueue" data-id="${reply.id}" type="button">自動送信をやめる（下書きは残す）</button>` : ""}
             <span class="spacer"></span>
@@ -1007,6 +1008,17 @@ async function replyAction(action, id, button) {
         await loadState();
       }
     });
+  }
+  if (action === "reconcile") {
+    await busy(button, "確認中", async () => {
+      try {
+        const result = await api(`/api/replies/${encodeURIComponent(id)}/reconcile`, { method: "POST" });
+        toast(result.outcome === "responded" ? "Threadsに返信が付いていました。返信済みにしました。" : "Threadsに返信は付いていませんでした。送れる状態に戻しました。内容を見て送信してください。");
+      } finally {
+        await loadState();
+      }
+    });
+    return;
   }
   if (action === "open-response") {
     const win = window.open("", "_blank"); // 非同期の後に開くとブロックされるので、先に空の窓を開けておく
