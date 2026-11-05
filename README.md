@@ -203,7 +203,7 @@ ZIP で入れた場合:
 - Meta のアプリ審査（公開投稿の検索・外部提供に必要）の出し方は提供元の手元にある `Meta審査申請/申請手順.md`（配布 ZIP には入れていない）
 - 公開リポジトリ（1行インストールの取得元）: https://github.com/joshicrea/joshicrea-threads-ops 。中身はこのフォルダの git 追跡ファイルから `Meta審査申請/` を除いたもの。更新は `publish-github.ps1`（このフォルダの HEAD から書き出して commit・push する。data/ と Meta審査申請/ は入らない）
 - 配布用 ZIP: `配布用ZIPを作る.cmd`（`data/`・`test/`・`Meta審査申請/`・`.git` を除外し、秘密が入りうるファイルが混ざっていないか検査してから作る）
-- テスト: `npm test`（外部API を模擬。状態遷移・承認制の強制・二重投稿の防止・送信中断からの復旧・アクセスキー・OAuth の state 検証・コメント自動処理など）
+- テスト: `npm test` は test/ の全ての .test.mjs を実行します（外部API を模擬。偽APIの試験は `node test/<名前>_fakeapi.mjs` で個別に実行）。内容は状態遷移・承認制の強制・二重投稿の防止・送信中断からの復旧・アクセスキー・OAuth の state 検証・コメント自動処理など）
 - 画面のAPIは、固定ヘッダ `x-threads-ops` と Origin/Host の検査（別サイトからの偽リクエスト対策）に加え、アクセスキーを設定すると `x-threads-key` を要求する。同じ PC の別ユーザーからの操作は、アクセスキーを設定していない限り防げない
 - PC を閉じている間も動かす（VPS 常時稼働）: [deploy/README.md](deploy/README.md)。Ubuntu 24.04 に `deploy/install.sh` で Caddy（https 自動）＋ systemd 常駐を入れる。アクセスキー必須・Redirect URI は `https://<ドメイン>/oauth/callback` を直接使う・Claude Code は `claude setup-token` の長期トークンを環境変数で渡す
 - 外部提供版として足りていないもの: 利用者ごとのアカウント、秘密情報の暗号化保存、課金、監査ログ、利用規約への同意。現状は1台のPCで1人が使う前提

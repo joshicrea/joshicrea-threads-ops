@@ -8,7 +8,7 @@ export const LICENSE_RECHECK_RETRY_MS = 15 * 60 * 1000;
 export const LICENSE_DEFAULT_GRACE_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHECK_TIMEOUT_MS = 15_000;
-export const LICENSE_DEFAULT_URL = "https://ksfactory.joshicrea.com/lic";
+export const LICENSE_DEFAULT_URL = "https://lunettes.co.jp/lic";
 
 // 照合先を決める。空なら提供元の既定。既定のURL以外（利用者が書き換えた先・パスだけ変えたもの）は使わない。
 // 検証用に限り、環境変数 THREADS_LICENSE_ALLOW_LOOPBACK=1 のときだけ、このPC自身の http を許す
