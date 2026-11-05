@@ -3174,6 +3174,7 @@ async function markPublished(db, post, result, message) {
   post.error = "";
   delete post.publishing;
   delete post.publishFailedAt;
+  delete post.unconfirmedPublish;
   delete post.textChangedAfterFailure;
   recordMonitoringEvent(db, "post_success");
   log(db, "info", message, { postId: post.id, threadsId: post.threadsId });
@@ -3210,6 +3211,19 @@ async function findRecentSameText(settings, text, sinceMs) {
   return (data.data || []).find((item) => String(item.text || "").trim() === wanted && (!sinceMs || Date.parse(item.timestamp || "") >= sinceMs)) || null;
 }
 
+// 失敗・不明だった投稿を送り直す前の二重投稿検査。通常は直近50件で足りる。
+// 確認不能のまま24時間を超えて error にした投稿（unconfirmedPublish）は、元の公開が直近50件より奥にあり得るので、ページ送りで遡って照合する。
+// 遡り切れないときは「出ていない」と言えないので送らずに止める（提案254・破壊レビュー2周目）
+async function findDuplicateBeforeResend(settings, post) {
+  if (!post.publishFailedAt || post.textChangedAfterFailure) return null;
+  const sinceMs = Date.parse(post.publishFailedAt) - 30 * 60 * 1000;
+  if (!post.unconfirmedPublish) return findRecentSameText(settings, post.text, sinceMs);
+  const { found, complete } = await findSameTextSince(settings, post.text, sinceMs);
+  if (found) return found;
+  if (!complete) throw Object.assign(new Error("以前の公開結果が未確認で、Threadsを十分に遡れないため送信を止めています。Threadsで本文を確かめてください。"), { stage: "reconcile", maybePublished: true, safeToShow: true });
+  return null;
+}
+
 // sinceMs より古い投稿まで遡ってページ送りし、同じ本文を探す。complete は「sinceMs まで遡り切れた」＝無かったと言ってよい範囲を見た、の意味。
 // findRecentSameText は直近50件しか見ないので、古い滞留投稿の「Threads側に同文なし」の根拠には使えない
 async function findSameTextSince(settings, text, sinceMs, { maxPages = 20 } = {}) {
@@ -3230,6 +3244,8 @@ async function findSameTextSince(settings, text, sinceMs, { maxPages = 20 } = {}
 
 // 公開結果が確定しないまま、この時間を超えた送信中の投稿は、Threads側に同文が無いことを確認できたら終端（エラー＋理由）へ移す
 const PUBLISHING_EXPIRE_MS = 24 * 60 * 60 * 1000;
+// 24時間超のあと、確認の失敗（または遡り切れない照合）がこの回数続いたら、確認不能のエラーに移して知らせる（10分おきなので約30分。暫定値）
+const PUBLISHING_UNCONFIRMED_MAX_CHECKS = 3;
 
 function threadsTimestampIso(value) {
   const ms = Date.parse(String(value || ""));
@@ -3311,6 +3327,29 @@ async function recoverPublishing(snapshot) {
       if (published) {
         await markPublished(db, post, published, "送信中に中断した投稿がThreads側で公開済みだったため、公開済みに直しました。");
         return;
+      }
+      // 確認の失敗（通信エラー・照合が遡り切れない）が続いたまま、予約時刻からも送信開始からも24時間を超えた投稿を「予約済み」のまま永久に残さない。
+      // 公開されたかどうかは分からないままなので、同文なしとは言わず「確認できなかった」と明示して error に移す（自動では送らない。出すなら本文とThreads側を見て承認し直す）
+      // 期限を過ぎてから（予約時刻・送信開始の両方から24時間超）の確認失敗だけを数える。24時間未満の照合は数えない。
+      const scheduledMs = Date.parse(post.scheduledAt || "");
+      const overdue = Number.isFinite(scheduledMs) && Date.now() - scheduledMs > SCHEDULE_STALE_MS && Date.now() - startedAt >= PUBLISHING_EXPIRE_MS;
+      if (overdue && (checkError || !absenceConfirmed)) {
+        post.publishing.checkFailures = (post.publishing.checkFailures || 0) + 1;
+        if (post.publishing.checkFailures >= PUBLISHING_UNCONFIRMED_MAX_CHECKS) {
+          post.status = "error";
+          post.error = "公開されたか確認できないまま24時間を超えました（Threadsへの確認が失敗し続けました）。すでに公開されている可能性があります。Threadsで本文を確かめ、出ていなければ本文を見て承認し直してください。";
+          post.sendFailure = { ...(post.sendFailure || {}), outcome: "unknown", retryable: false };
+          // 失敗時刻は「いま」でなく実際の送信開始時刻に置く。再承認のときの同文照合（失敗時刻の30分前から）と6時間おきの失敗照合が、元の公開時刻を覆うようにする
+          // （sendUncertainAt を残すと手動公開が永久に409で止まり、出し直す道が無くなるので外す。既存の終端と同じ）
+          post.publishFailedAt = startedAt ? new Date(startedAt).toISOString() : nowIso();
+          post.unconfirmedPublish = true; // 再承認の送信前照合を、直近50件でなくページ送りの照合にする印（findDuplicateBeforeResend）
+          post.updatedAt = nowIso();
+          delete post.sendUncertainAt;
+          delete post.publishing;
+          delete post.retryAfter;
+          log(db, "error", "公開結果を確認できないまま24時間を超えた送信を、確認不能のエラーにして知らせます。Threadsで本文を確かめてから、出すか却下するかを選んでください。", { postId: post.id, failure: post.sendFailure, diagnostic: diagnosticMeta({ area: "post_publish", error: checkError || null, targetId: post.id, maybePublished: true }) });
+          return;
+        }
       }
       if (checkError) {
         log(db, "error", "送信中に中断した投稿の状態を確認できませんでした。次回もう一度確認します。", { postId: post.id, diagnostic: diagnosticMeta({ area: "post_publish", error: checkError }) });
@@ -4744,8 +4783,8 @@ async function schedulerTick() {
         let failure;
         try {
           if (claimed.post.publishFailedAt && !claimed.post.textChangedAfterFailure) {
-            // 前回失敗した投稿は、実は届いていることがある（保存失敗・タイムアウト）。送る前に直近の投稿と照合する
-            const dup = await findRecentSameText(claimed.settings, claimed.post.text, Date.parse(claimed.post.publishFailedAt) - 30 * 60 * 1000);
+            // 前回失敗した投稿は、実は届いていることがある（保存失敗・タイムアウト）。送る前に Threads 側の投稿と照合する
+            const dup = await findDuplicateBeforeResend(claimed.settings, claimed.post);
             if (dup) result = { id: String(dup.id), permalink: dup.permalink || "", publishedAt: threadsTimestampIso(dup.timestamp) };
           }
           if (!result) result = await publishThreadsPost(claimed.settings, claimed.post, {
@@ -6393,7 +6432,7 @@ route("POST", "/api/posts/:id/publish", async ({ params }) => {
   let failure;
   try {
     if (target.publishFailedAt && !target.textChangedAfterFailure) {
-      const dup = await findRecentSameText(settings, target.text, Date.parse(target.publishFailedAt) - 30 * 60 * 1000);
+      const dup = await findDuplicateBeforeResend(settings, target);
       if (dup) result = { id: String(dup.id), permalink: dup.permalink || "", publishedAt: threadsTimestampIso(dup.timestamp) };
     }
     if (!result) result = await publishThreadsPost(settings, target, {
@@ -6832,7 +6871,7 @@ export { appendErrorLog };
 export const _internals = {
   classifySendFailure, recordSendAttempt, safeSendError, alreadyRepliedByMe, requeueNetworkFailedReplies, sendReplyNow, publishThreadsPost,
   styleWarnings,
-  recoverPublishing, reconcileFailedPublishes, markPublishError, findSameTextSince, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, sanitizeLogMeta, isTransientThreadsError, isThreadsMissingObjectError, boundedBackoffMs, applyReplyFetchFailures, recordAutoDeleteFailureForTest: recordAutoDeleteFailure, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
+  recoverPublishing, reconcileFailedPublishes, findDuplicateBeforeResend, markPublishError, findSameTextSince, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, sanitizeLogMeta, isTransientThreadsError, isThreadsMissingObjectError, boundedBackoffMs, applyReplyFetchFailures, recordAutoDeleteFailureForTest: recordAutoDeleteFailure, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
   toStrictSchema,
   REPLY_TEXT_BLOCKLIST,
   autoReplyTick, classifySafeError, monitoringStatusPayload, buildDraftPrompt, selectDraftReferences, callAiJson, loadSharedPatterns, selectSharedPatterns, typePerformance, buildSuggestionPrompt, generateSuggestion, HOOK_TYPES, researchTargets, questionQualityIssue,
