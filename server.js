@@ -153,7 +153,7 @@ const defaultSettings = {
   autoDeleteLowLikesEnabled: false,
   autoDeleteAfterHours: 24,
   autoDeleteMaxLikes: 0,
-  autoDeleteMaxReplies: 0, // 2026-10-29 林さん決定（ガイア経由）: 反応が何もない（いいね0かつコメント0）投稿だけを削除対象にする既定。旧既定は9/9（2026-10-03）で、公開投稿の大半を24時間で消していた（監査FT-15）。どちらかが1以上なら残す
+  autoDeleteMaxReplies: 0, // 2026-10-29 林さん決定（ガイア経由）: 既定は0/0。2026-11-05 林さん決定で判定はOR（いいねかコメントのどちらか一方でも上限以下なら削除。残すのは両方とも上限超えのときだけ）。旧既定は9/9（2026-10-03）で、公開投稿の大半を24時間で消していた（監査FT-15）
   lastAutoDeleteFailureAt: "",
   autoDeleteEnabledAt: "",
   autoDeleteBlockedToken: "",
@@ -4225,7 +4225,7 @@ async function collectInsights(snapshot) {
   return { fetched: results.length, failed: failures.length, failures, targets: targets.length };
 }
 
-// 反応の少ない投稿の自動削除: 公開から autoDeleteAfterHours(24以上) 時間たち、いいねが autoDeleteMaxLikes 以下、かつコメント(replies)が autoDeleteMaxReplies 以下の投稿だけを Threads から消す（どちらかがしきい値を超えれば残す。取り消せない操作）。
+// 反応の少ない投稿の自動削除: 公開から autoDeleteAfterHours(24以上) 時間たち、いいねが autoDeleteMaxLikes 以下、またはコメント(replies)が autoDeleteMaxReplies 以下の投稿を Threads から消す（いいねもコメントも上限を超えたときだけ残す。取り消せない操作）。
 // ・既定はOFF。ONにした時刻(autoDeleteEnabledAt)より前に公開した投稿は対象にしない（過去の投稿へ遡って消さない）。
 // ・消す直前に Threads 側のインサイトを取り直していいね数を確かめる。取れない・読めない・しきい値超なら消さない。
 // ・消す前に取り直したインサイトを記録に残す。削除後も投稿の記録（本文・数字）は残し、deletedFromThreadsAt を付けて以後の取得対象から外す（分析の材料に使うため）。
@@ -4333,7 +4333,7 @@ async function deleteLowLikePosts(snapshot) {
       await recordAutoDeleteFailure(post, "コメント数が読めなかったため、この投稿は消しませんでした。", { metrics: JSON.stringify(insight.metrics).slice(0, 200) }, { countAgainstPost: true });
       continue;
     }
-    if (likes > maxLikes || repliesCount > maxReplies) { // 24時間時点の判定で残す。以後は判定し直さない（いいねの取り消しやしきい値の変更で、残した投稿を後から消さない）
+    if (likes > maxLikes && repliesCount > maxReplies) { // 24時間時点の判定で残す（いいねもコメントも上限超えのときだけ。どちらか一方でも上限以下なら削除。2026-11-05 林さん決定）。以後は判定し直さない（いいねの取り消しやしきい値の変更で、残した投稿を後から消さない）
       await withDb(async (d) => {
         const p = d.posts.find((x) => x.id === post.id);
         if (p) { p.autoDeleteJudgedAt = nowIso(); p.autoDeleteJudgedLikes = likes; p.autoDeleteJudgedMax = maxLikes; p.autoDeleteJudgedReplies = repliesCount; p.autoDeleteJudgedMaxReplies = maxReplies; }
@@ -4367,7 +4367,7 @@ async function deleteLowLikePosts(snapshot) {
       break;
     }
     result.deleted += 1;
-    const reason = `公開から${hours}時間たっても、いいねが${maxLikes}以下（${likes}）かつコメントが${maxReplies}以下（${repliesCount}）だったため自動削除`;
+    const reason = `公開から${hours}時間たっても、いいねが${maxLikes}以下（${likes}）またはコメントが${maxReplies}以下（${repliesCount}）だったため自動削除`;
     if (!(await markPostDeleted(post, reason, insight))) {
       deletedButUnrecorded.set(post.threadsId, { post, reason, insight });
       break; // 記録できない状態で削除を進めない
