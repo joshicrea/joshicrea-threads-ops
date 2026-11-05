@@ -2,3 +2,8 @@ data/
 data-*/
 node_modules/
 scripts/patterns_candidates.json
+*.log
+backups/
+.fixtures-*/
+*.pid
+server-ready.txt

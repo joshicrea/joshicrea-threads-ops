@@ -381,6 +381,15 @@ async function writeDbFile(db) {
 }
 
 const LOG_MAX_BYTES = 1_000_000;
+// 未捕捉の例外・拒否をスタックごと server-error.log に残してから終了する（落ちた理由が分からず同じ落ち方を繰り返さないため・FT-43）。終了後は常駐の再起動に任せる
+for (const event of ["uncaughtException", "unhandledRejection"]) {
+  process.on(event, (reason) => {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    Promise.resolve(appendErrorLog(error)).catch(() => {}).finally(() => process.exit(1));
+    setTimeout(() => process.exit(1), 3000).unref();
+  });
+}
+
 async function appendErrorLog(error) {
   const message = redactSecrets(`[${nowIso()}] ${error?.stack || error?.message || String(error)}\n`);
   await mkdir(DATA_DIR, { recursive: true });
@@ -3175,6 +3184,7 @@ async function markPublished(db, post, result, message) {
   delete post.publishing;
   delete post.publishFailedAt;
   delete post.unconfirmedPublish;
+  delete post.unconfirmedSince;
   delete post.textChangedAfterFailure;
   recordMonitoringEvent(db, "post_success");
   log(db, "info", message, { postId: post.id, threadsId: post.threadsId });
@@ -3215,8 +3225,12 @@ async function findRecentSameText(settings, text, sinceMs) {
 // 確認不能のまま24時間を超えて error にした投稿（unconfirmedPublish）は、元の公開が直近50件より奥にあり得るので、ページ送りで遡って照合する。
 // 遡り切れないときは「出ていない」と言えないので送らずに止める（提案254・破壊レビュー2周目）
 async function findDuplicateBeforeResend(settings, post) {
-  if (!post.publishFailedAt || post.textChangedAfterFailure) return null;
-  const sinceMs = Date.parse(post.publishFailedAt) - 30 * 60 * 1000;
+  if (!post.publishFailedAt) return null;
+  // 確認不能の投稿は、本文以外の編集（textChangedAfterFailure）でも照合を免除しない。同じ本文のまま送れば二重投稿になる（提案254・3周目）
+  if (!post.unconfirmedPublish && post.textChangedAfterFailure) return null;
+  // 失敗の記録（publishFailedAt）は再送の失敗で現在時刻に上書きされる。元の送信時刻は unconfirmedSince に固定してあるので、古い方から遡る
+  const originMs = Math.min(Date.parse(post.publishFailedAt) || Infinity, post.unconfirmedPublish ? (Date.parse(post.unconfirmedSince || "") || Infinity) : Infinity);
+  const sinceMs = originMs - 30 * 60 * 1000;
   if (!post.unconfirmedPublish) return findRecentSameText(settings, post.text, sinceMs);
   const { found, complete } = await findSameTextSince(settings, post.text, sinceMs);
   if (found) return found;
@@ -3302,9 +3316,11 @@ async function recoverPublishing(snapshot) {
     try {
       // 先に本文一致で探す（公開後のメディアIDと permalink がそのまま取れる）。無ければコンテナの状態で判定する
       const expired = Date.now() - startedAt >= PUBLISHING_EXPIRE_MS;
+      // 確認不能のエラーから再送して失敗した投稿は startedAt が新しくなっている。元の公開は unconfirmedSince 側にあるので、古い方から遡る（提案254・3周目）
+      const lookFromMs = Math.min(startedAt, item.unconfirmedPublish ? (Date.parse(item.unconfirmedSince || "") || Infinity) : Infinity) - 5 * 60 * 1000;
       const { found, complete } = expired
-        ? await findSameTextSince(snapshot.settings, item.text, startedAt - 5 * 60 * 1000)
-        : { found: await findRecentSameText(snapshot.settings, item.text, startedAt - 5 * 60 * 1000), complete: false };
+        ? await findSameTextSince(snapshot.settings, item.text, lookFromMs)
+        : { found: await findRecentSameText(snapshot.settings, item.text, lookFromMs), complete: false };
       if (found) published = { id: String(found.id), permalink: found.permalink || "", publishedAt: threadsTimestampIso(found.timestamp) };
       absenceConfirmed = expired && complete && !found;
       if (!published && item.publishing.containerId) {
@@ -3343,6 +3359,7 @@ async function recoverPublishing(snapshot) {
           // （sendUncertainAt を残すと手動公開が永久に409で止まり、出し直す道が無くなるので外す。既存の終端と同じ）
           post.publishFailedAt = startedAt ? new Date(startedAt).toISOString() : nowIso();
           post.unconfirmedPublish = true; // 再承認の送信前照合を、直近50件でなくページ送りの照合にする印（findDuplicateBeforeResend）
+          post.unconfirmedSince = post.unconfirmedSince || post.publishFailedAt; // 元の送信時刻。再送の失敗で publishFailedAt が上書きされても、照合はここまで遡る
           post.updatedAt = nowIso();
           delete post.sendUncertainAt;
           delete post.publishing;
@@ -4782,7 +4799,7 @@ async function schedulerTick() {
         let result;
         let failure;
         try {
-          if (claimed.post.publishFailedAt && !claimed.post.textChangedAfterFailure) {
+          if (claimed.post.publishFailedAt) {
             // 前回失敗した投稿は、実は届いていることがある（保存失敗・タイムアウト）。送る前に Threads 側の投稿と照合する
             const dup = await findDuplicateBeforeResend(claimed.settings, claimed.post);
             if (dup) result = { id: String(dup.id), permalink: dup.permalink || "", publishedAt: threadsTimestampIso(dup.timestamp) };
@@ -6431,7 +6448,7 @@ route("POST", "/api/posts/:id/publish", async ({ params }) => {
   let result;
   let failure;
   try {
-    if (target.publishFailedAt && !target.textChangedAfterFailure) {
+    if (target.publishFailedAt) {
       const dup = await findDuplicateBeforeResend(settings, target);
       if (dup) result = { id: String(dup.id), permalink: dup.permalink || "", publishedAt: threadsTimestampIso(dup.timestamp) };
     }
