@@ -272,7 +272,7 @@ if ($nodeExe -and (Test-Path $codexDir)) {
 }
 
 # --- 5. 本体を安定した場所へ配置。データは別フォルダに置き、更新で消えないようにする ---
-$appItems = @("server.js", "research.js", "license.js", "patterns", "start.js", "package.json", "public", "start-hidden.vbs", "register-autostart.ps1", "stop.ps1", "uninstall.ps1", "README.md", "アンインストール.md", "relay")
+$appItems = @("server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "package.json", "public", "start-hidden.vbs", "register-autostart.ps1", "stop.ps1", "uninstall.ps1", "README.md", "アンインストール.md", "relay")
 foreach ($item in $appItems) {
     $src = [IO.Path]::Combine($InstallPath, $item)
     if (Test-Path $src) {
