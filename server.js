@@ -23,7 +23,7 @@ import { extname, join, normalize, sep, dirname, delimiter } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { findChrome, verifyCandidates, filterCandidates, reactionScore, MAX_VERIFY as MAX_VERIFY_PAGES, MAX_VERIFY_MULTI } from "./research.js";
-import { emptyLicenseState, licenseCheckDue, licenseConfigured, licenseDecision, resolveLicenseUrl, runLicenseCheck } from "./license.js";
+import { emptyLicenseState, licenseCheckDue, licenseConfigured, licenseDecision, resolveLicenseUrl, runLicenseCheck, LICENSE_NO_KEY_GRACE_DAYS } from "./license.js";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(ROOT, "public");
@@ -4598,7 +4598,7 @@ function holdPastDueScheduled(db, blockedSince = "") {
 function applyLicenseSettingsChange(db, before) {
   const old = licenseStateOf(db);
   // 最初に試した時刻も残す（キーを入れ直して未確認の猶予をやり直させない）
-  if (before.licenseKey !== db.settings.licenseKey) db.license = { ...emptyLicenseState(), installId: old.installId, blockedSince: old.blockedSince, firstAttemptAt: old.firstAttemptAt };
+  if (before.licenseKey !== db.settings.licenseKey) db.license = { ...emptyLicenseState(), installId: old.installId, blockedSince: old.blockedSince, firstAttemptAt: old.firstAttemptAt, noKeyGraceFrom: old.noKeyGraceFrom };
   else if (before.licenseServerUrl !== db.settings.licenseServerUrl) db.license = { ...old, lastAttemptAt: "" };
 }
 
@@ -4650,6 +4650,16 @@ async function licenseTick() {
     });
   }
   await withDb(async (db) => {
+    // 許可キーが空と初めて分かったときに1回だけ、既に使っている人(投稿か返信の履歴がある)かを決めて残す。
+    // 既に使っている人は、その時から LICENSE_NO_KEY_GRACE_DAYS 日は止めない。新しく入れた人は "-"(猶予なし)。COO決定 D-20261108-003
+    let graceDecided = false;
+    if (!licenseConfigured(db.settings) && !LICENSE_EXEMPT && !licenseStateOf(db).noKeyGraceFrom) {
+      graceDecided = true;
+      // 一度でもキーで照合した人(firstAttemptAt はキーを変えても残る)は対象外。拒否・期限切れの人がキーを空にして猶予を得る抜け道を塞ぐ(破壊役 2026-11-08)
+      const existing = !licenseStateOf(db).firstAttemptAt && ((db.posts || []).length > 0 || (db.replies || []).length > 0);
+      db.license = { ...licenseStateOf(db), noKeyGraceFrom: existing ? nowIso() : "-" };
+      if (existing) log(db, "info", `許可キーがまだ入っていません。${LICENSE_NO_KEY_GRACE_DAYS}日間は今までどおり使えます。提供元から届いた許可キーを設定に入れてください。`);
+    }
     const state = licenseStateOf(db);
     const decision = licenseDecisionOf(db);
     if (!decision.allowed && !state.blockedSince) {
@@ -4664,7 +4674,7 @@ async function licenseTick() {
     } else if (decision.allowed && db.settings.licenseResumeMode === "auto" && db.posts.some((p) => p.licenseHold)) {
       for (const p of db.posts) delete p.licenseHold; // 「そのまま出す」に切り替えたので、保留中のものも通常の予約に戻す
       log(db, "info", "再開時の扱いを「そのまま出す」に変えたため、保留していた予約を通常の予約に戻しました。");
-    } else return { save: false };
+    } else if (!graceDecided) return { save: false }; // 猶予の判定を残したときは保存する
   });
 }
 

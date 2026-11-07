@@ -328,7 +328,7 @@ function renderDashboard() {
   const todos = [];
   const lic = state.license || {};
   if (lic.enforced && !lic.allowed) todos.push({ text: `${lic.message} 自動の投稿・返信・削除は止まっています`, goto: "settings", focus: "licenseKey", tone: "danger" });
-  else if (lic.status === "grace") todos.push({ text: lic.message, goto: "settings", focus: "licenseKey", tone: "warn" });
+  else if (lic.status === "grace" || lic.status === "no_key_grace") todos.push({ text: lic.message, goto: "settings", focus: "licenseKey", tone: "warn" });
   if (countStatus("error")) todos.push({ count: countStatus("error"), text: `エラーになった投稿が${countStatus("error")}件あります。原因を確認して承認し直す`, goto: "queue", filter: "error", tone: "danger" });
   const safetyStopped = state.posts.filter((p) => p.safety?.level === "blocked" && !["published", "rejected"].includes(p.status) && !safetyDeferred(p)).length
     + state.replies.filter((r) => r.safety?.level === "blocked" && r.status !== "responded").length;

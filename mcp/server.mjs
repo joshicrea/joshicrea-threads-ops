@@ -356,7 +356,7 @@ async function handle(msg) {
     return reply(id, {
       protocolVersion: "2025-06-18",
       capabilities: { tools: {} },
-      serverInfo: { name: "threads-ops-assistant", version: "0.4.0" },
+      serverInfo: { name: "threads-ops-assistant", version: "0.4.1" },
       instructions: "Threads運用アシスタント（ローカル常駐サーバー）を操作するツール群。接続したら最初に threads_guide を呼んで指示書を読み、その順で利用者を案内する。続けて threads_status を呼ぶ。承認・公開・返信の送信は利用者が本文を見て明示したときだけ行う。"
     });
   }

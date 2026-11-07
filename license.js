@@ -6,6 +6,9 @@ export const LICENSE_SERVICE_ID = "threads-assistant";
 export const LICENSE_RECHECK_OK_MS = 24 * 60 * 60 * 1000;
 export const LICENSE_RECHECK_RETRY_MS = 15 * 60 * 1000;
 export const LICENSE_DEFAULT_GRACE_DAYS = 7;
+// 許可キーが空でも止めない猶予(既に使っている人だけ・キーが空と初めて分かった時から数える)。
+// COO決定 D-20261108-003。日数は暫定で、林さんの確定でこの値を変えて公開する(2026-11-08: 許可キー空で止める変更が、キーを受け取る手段が無いまま既存利用者に届いた)
+export const LICENSE_NO_KEY_GRACE_DAYS = 14;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHECK_TIMEOUT_MS = 15_000;
 export const LICENSE_DEFAULT_URL = "https://lunettes.co.jp/lic";
@@ -24,7 +27,7 @@ export function resolveLicenseUrl(raw, { allowLoopback = false } = {}) {
 
 // 照合結果の保存形。state は db.license にそのまま入る
 export function emptyLicenseState() {
-  return { installId: "", firstAttemptAt: "", lastAttemptAt: "", lastSuccessAt: "", result: "", reason: "", message: "", expiresOn: "", graceDays: LICENSE_DEFAULT_GRACE_DAYS, capabilities: [], blockedSince: "", detail: "", signed: null };
+  return { installId: "", firstAttemptAt: "", lastAttemptAt: "", lastSuccessAt: "", result: "", reason: "", message: "", expiresOn: "", graceDays: LICENSE_DEFAULT_GRACE_DAYS, capabilities: [], blockedSince: "", detail: "", signed: null, noKeyGraceFrom: "" };
 }
 
 // 署名つきの応答（契約 版0.7・署名は版2）。署名する文字列は台帳側 lic_sign_check と同じ:
@@ -75,7 +78,16 @@ export function licenseCheckDue(settings, state, nowMs) {
 export function licenseDecision(settings, state, nowMs, { serverUrl = "", exempt = false, publicKeyPem = "", serviceId = LICENSE_SERVICE_ID } = {}) {
   if (!licenseConfigured(settings)) {
     if (exempt) return { enforced: false, allowed: true, status: "off", message: "" };
-    return { enforced: true, allowed: false, status: "no_key", reason: "no_license_key", message: "許可キーが入っていません。設定に、提供元から届いた許可キーを入れてください。" };
+    // noKeyGraceFrom: 既存利用者と判定した時刻(ISO)。"-" は対象外(新しく入れた人)。空はまだ判定していない(止める側に倒す)
+    const from = Date.parse(state?.noKeyGraceFrom || "");
+    const graceMs = LICENSE_NO_KEY_GRACE_DAYS * DAY_MS;
+    if (Number.isFinite(from) && from <= nowMs && nowMs - from <= graceMs) {
+      const daysLeft = Math.max(0, Math.ceil((from + graceMs - nowMs) / DAY_MS));
+      return { enforced: true, allowed: true, status: "no_key_grace", daysLeft, message: `許可キーがまだ入っていません。あと${daysLeft}日は今までどおり使えます。提供元から届いた許可キーを設定に入れてください。` };
+    }
+    // 猶予が切れた後なら、停止の始まりは切れた時刻(スリープ明けに気づいても、その間に過ぎた予約を保留できる)
+    const blockedFrom = Number.isFinite(from) && from <= nowMs ? from + graceMs : undefined;
+    return { enforced: true, allowed: false, status: "no_key", reason: "no_license_key", ...(blockedFrom ? { blockedFrom } : {}), message: "許可キーが入っていません。設定に、提供元から届いた許可キーを入れてください。" };
   }
   if (!serverUrl) return { enforced: true, allowed: false, status: "misconfigured", reason: "bad_server_url", message: "ライセンスの確認先が正しくありません。提供元に連絡してください。" };
   // 猶予の長さ・最後の成功の時刻は、署名が通る控え（state.signed）だけを根拠にする。書き換えた控えは使わない（猶予日数を延ばしても通らない）
