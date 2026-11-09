@@ -1,6 +1,6 @@
 // ライセンス照合（段階A・local 型）。契約: AI組織/自走組織/ライセンス台帳API_契約.md 版0.5 の 4-1。
 // 起動時と24時間ごとに check.php を呼び、結果を保存する。最後の成功から7日は、応答なし・5xx・通信失敗でも使い続ける。
-// 401/403 の確定した拒否は猶予なしで実行系を止める（閲覧・書き出しは止めない）。許可キーが未設定なら照合しない（提供元自身の口座）。
+// 401/403 の確定した拒否は猶予なしで実行系を止める（閲覧・書き出しは止めない）。許可キーが空なら実行系を止める（既に使っている人は空と分かってから14日の猶予・提供元自身の口座は exempt で免除）。
 import { createHash, randomBytes, verify as cryptoVerify } from "node:crypto";
 export const LICENSE_SERVICE_ID = "threads-assistant";
 export const LICENSE_RECHECK_OK_MS = 24 * 60 * 60 * 1000;

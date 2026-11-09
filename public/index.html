@@ -432,7 +432,7 @@
               <label>返信の間隔（秒）<input id="autoReplyIntervalSec" type="number" min="5" max="600" /></label>
               <label>1日の返信上限（件）<input id="autoReplyDailyCap" type="number" min="1" max="1000" /></label>
               <label class="toggle-row"><input id="autoInsightsEnabled" type="checkbox" /> インサイトを1日1回自動で取り込む</label>
-              <label class="toggle-row"><input id="autoDeleteLowLikesEnabled" type="checkbox" /> ONにした後に公開した投稿のうち、公開から24時間たって、いいねとコメントがどちらも下の数以下のものだけを、Threadsから自動で削除する（どちらかが下の数より多ければ削除しません）（取り消せません。ONにする前の投稿は消しません。削除には、連携し直して「投稿の削除」の権限を付ける必要があります）</label>
+              <label class="toggle-row"><input id="autoDeleteLowLikesEnabled" type="checkbox" /> ONにした後に公開した投稿のうち、公開から24時間たって、いいねとコメントがどちらも下の数以下のものだけを、Threadsから自動で削除する（どちらかが下の数より多ければ削除しません。初期値は2なので、いいね3・コメント0の投稿は残ります）（取り消せません。ONにする前の投稿は消しません。削除には、連携し直して「投稿の削除」の権限を付ける必要があります）</label>
               <label>自動削除の対象にする「いいね」の数（この数以下）<input id="autoDeleteMaxLikes" type="number" min="0" max="1000" /></label>
               <label>自動削除の対象にする「コメント」の数（この数以下）<input id="autoDeleteMaxReplies" type="number" min="0" max="1000" /></label>
             </div>

@@ -1202,8 +1202,8 @@ function renderSettings() {
   $("#autoReplyDailyCap").value = s.autoReplyDailyCap || 500;
   $("#autoInsightsEnabled").checked = s.autoInsightsEnabled !== false;
   $("#autoDeleteLowLikesEnabled").checked = Boolean(s.autoDeleteLowLikesEnabled);
-  $("#autoDeleteMaxLikes").value = Number.isInteger(s.autoDeleteMaxLikes) ? s.autoDeleteMaxLikes : 9;
-  $("#autoDeleteMaxReplies").value = Number.isInteger(s.autoDeleteMaxReplies) ? s.autoDeleteMaxReplies : 9;
+  $("#autoDeleteMaxLikes").value = Number.isInteger(s.autoDeleteMaxLikes) ? s.autoDeleteMaxLikes : 2;
+  $("#autoDeleteMaxReplies").value = Number.isInteger(s.autoDeleteMaxReplies) ? s.autoDeleteMaxReplies : 2;
   $("#themeRows").innerHTML = (s.themes || []).map((t) => themeRowHtml(t)).join("") || `<p class="empty" data-empty>まだ登録していません。</p>`;
   $("#campaignRows").innerHTML = (s.campaigns || []).map((c, i) => campaignRowHtml(c, i)).join("") || `<p class="empty" data-empty>まだ登録していません。</p>`;
 }
@@ -1608,7 +1608,7 @@ function bindEvents() {
     await loadState();
     $("#generateResultPanel").hidden = false;
     $("#strategyMemo").textContent = result.strategyMemo || "";
-    $("#generatedList").innerHTML = result.posts.map((post) => `<div class="mini-card"><div class="post-meta">${statusPill(post.status)} ${escapeHtml(post.category)}${post.theme ? ` / テーマ: ${escapeHtml(post.theme)}` : ""} / ${fmtDate(post.scheduledAt)}</div><div>${nl2br(post.text)}</div></div>`).join("");
+    $("#generatedList").innerHTML = result.posts.map((post) => `<div class="mini-card"><div class="post-meta">${statusPill(post.status)} ${escapeHtml(post.category)}${post.theme ? ` / テーマ: ${escapeHtml(post.theme)}` : ""}${post.hookType ? ` / 型: ${escapeHtml(Object.hasOwn(HOOK_TYPE_LABEL, post.hookType) ? HOOK_TYPE_LABEL[post.hookType] : String(post.hookType))}` : ""} / ${fmtDate(post.scheduledAt)}</div><div>${nl2br(post.text)}</div></div>`).join("");
     toast(`${result.posts.length}件の投稿案を作りました。投稿キューで承認してください。`);
   }));
 

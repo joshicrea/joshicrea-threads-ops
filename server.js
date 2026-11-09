@@ -130,7 +130,7 @@ const defaultSettings = {
   materialFolder: "", // 素材フォルダ（このPC上のパス）。中の .md/.txt を読んで素材にし、写真・動画はファイル名だけ使う
   replyStyle: "", // 返信だけの文体（口調・絵文字）。空なら writingRules に従う。投稿の生成には効かない（補充の絵文字ゲートと食い違わせないため）
   expectedThreadsUsername: "", // 連携先として期待するユーザー名。設定すると、別のアカウントでの連携を拒否する（運用代行で他人の口座へ投稿しない）
-  licenseKey: "", // 提供元が発行する許可キー。空なら照合しない（提供元自身の口座）。契約: ライセンス台帳API_契約.md 4-1
+  licenseKey: "", // 提供元が発行する許可キー。空なら自動の投稿・返信を止める（既に使っている人は14日の猶予・提供元自身の口座は免除）。画面の設定からだけ入れる（MCP では受け付けない）。契約: ライセンス台帳API_契約.md 4-1
   licenseServerUrl: "", // 照合先（https の /lic まで）。許可キーとセットで提供元が渡す
   licenseResumeMode: "ask", // 停止から再開したとき、過ぎた予約を ask=1件ずつ選ぶ / auto=そのまま出す
   threadsAppId: "",
@@ -152,8 +152,8 @@ const defaultSettings = {
   autoInsightsEnabled: true,
   autoDeleteLowLikesEnabled: false,
   autoDeleteAfterHours: 24,
-  autoDeleteMaxLikes: 0,
-  autoDeleteMaxReplies: 0, // 2026-10-29 林さん決定（ガイア経由）: 既定は0/0。2026-11-05 林さん決定で判定はOR（いいねかコメントのどちらか一方でも上限以下なら削除。残すのは両方とも上限超えのときだけ）。旧既定は9/9（2026-10-03）で、公開投稿の大半を24時間で消していた（監査FT-15）
+  autoDeleteMaxLikes: 2,
+  autoDeleteMaxReplies: 2, // 2026-11-09 林さん確定（REQ-1232）: 既定は2/2。いいねかコメントのどちらかが3以上なら残し、両方とも2以下のときだけ削除する（いいね3・コメント0は残す）。自動削除の既定はOFFのまま（利用者が自分でONにする）。旧: 2026-10-29 は0/0、2026-11-05 は「どちらか一方でも上限以下なら削除」。旧既定は9/9（2026-10-03）で、公開投稿の大半を24時間で消していた（監査FT-15）
   lastAutoDeleteFailureAt: "",
   autoDeleteEnabledAt: "",
   autoDeleteBlockedToken: "",
@@ -2259,6 +2259,54 @@ function sharedPatternLines(patterns) {
   ];
 }
 
+// バズる型メモ（Q681）: 各口座のデータ置き場の buzz-memo.json（環境変数 THREADS_BUZZ_MEMO_PATH で差し替え可）を、区画名が完全一致のキーだけで読む。
+// 形式: {"basic":[文字列...],"hooks":[文字列...],"ng":[文字列...],"examples":[文字列...]}。キーは4つだけ（省略可）。
+// 見出しや行から区分を推測しない（Markdown 方式は、禁止語が候補に入る経路が検証で4回見つかったため廃止）。
+// ファイルが無い・空・形が違うときは null で、生成プロンプトは変更前と1字も変わらない。文面はコードに書かない（差し替えで反映される）
+const BUZZ_MEMO_MAX_CHARS = 20000; // 型メモの上限（ファイルの文字数）
+const BUZZ_MEMO_MAX_ITEMS = 200; // 1区画の項目数の上限
+const BUZZ_MEMO_MAX_ITEM_CHARS = 2000; // 1項目の文字数の上限
+const BUZZ_MEMO_KEYS = ["basic", "hooks", "ng", "examples"];
+function loadBuzzMemo() {
+  const path = process.env.THREADS_BUZZ_MEMO_PATH || join(DATA_DIR, "buzz-memo.json"); // 既定は口座ごとのデータ置き場（data・data-rejeflower）。配布物には入れない
+  let raw;
+  try { raw = readFileSync(path, "utf8"); } catch { return null; } // 無い・読めない: 無かったのと同じ
+  const reject = (why) => { console.warn(`バズる型メモを読みません（${why}）: ${path}`); return null; };
+  if (raw.length > BUZZ_MEMO_MAX_CHARS) return reject(`大きすぎます（${raw.length}文字・上限${BUZZ_MEMO_MAX_CHARS}文字）`);
+  let data;
+  try { data = JSON.parse(raw.replace(/^\uFEFF/, "")); } catch { return reject("JSONとして読めません"); }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return reject("最上位がオブジェクトではありません");
+  for (const k of Object.keys(data)) if (!BUZZ_MEMO_KEYS.includes(k)) return reject(`知らないキー「${k}」があります（使えるのは ${BUZZ_MEMO_KEYS.join("・")} だけ）`);
+  const sections = { basic: [], hooks: [], ng: [], examples: [] };
+  for (const k of BUZZ_MEMO_KEYS) {
+    if (!(k in data)) continue;
+    const arr = data[k];
+    if (!Array.isArray(arr)) return reject(`「${k}」が配列ではありません`);
+    if (arr.length > BUZZ_MEMO_MAX_ITEMS) return reject(`「${k}」の項目が多すぎます（${arr.length}件・上限${BUZZ_MEMO_MAX_ITEMS}件）`);
+    for (const item of arr) {
+      if (typeof item !== "string") return reject(`「${k}」に文字列でない項目があります`);
+      if (item.length > BUZZ_MEMO_MAX_ITEM_CHARS) return reject(`「${k}」の項目が長すぎます（上限${BUZZ_MEMO_MAX_ITEM_CHARS}文字）`);
+      const t = item.replace(/\r/g, "").trim();
+      if (t) sections[k].push(t);
+    }
+  }
+  return sections.basic.length || sections.hooks.length || sections.ng.length || sections.examples.length ? sections : null;
+}
+
+function buzzMemoLines(memo) {
+  if (!memo) return [];
+  const lines = ["## バズる型メモ（提供元の型メモ・差し替え可）"];
+  if (memo.basic.length) lines.push(`基本形: ${memo.basic.join(" / ")}。投稿は3〜6行に収める。`);
+  if (memo.hooks.length) lines.push(`バズりやすいフック・キーワードの候補（今回のテーマに合うものだけを、発信者の言葉で使う。全部を使わない）: ${memo.hooks.join(" ／ ")}`);
+  if (memo.ng.length) lines.push(`次の種類の投稿は作らない・提案しない: ${memo.ng.join(" ／ ")}`);
+  if (memo.examples.length) {
+    lines.push("事例（構造を学ぶ参考。文言はそのまま使わず、必ず自分の言葉と題材に書き換える。事例と同じ文・同じ言い回しを出力に入れない）:");
+    memo.examples.forEach((ex, i) => lines.push(`- 事例${i + 1}: ${ex.replace(/\n/g, " / ")}`));
+  }
+  lines.push("");
+  return lines;
+}
+
 // 型別の実績。再投稿・返信・公開24時間未満・公開日時の無い投稿・数字の無い投稿は除く。
 // 本数が TYPE_PERF_MIN_POSTS 未満の型、または口座全体の中央値が0・無いときは「判定不能」で比率を出さない。
 // 「出ている／出ていない」の 1.2倍・0.8倍は暫定の目安（実測で決めた値ではない）
@@ -2350,6 +2398,7 @@ function buildDraftPrompt(db, request) {
     lines.push(`## リサーチ「${run.theme}」で反応の大きい投稿に共通する型`, run.commonPatterns, "");
   }
   lines.push(...sharedPatternLines(selectSharedPatterns(db, { topic: request.topic, themes: (request.themePlan || []).map((t) => t.name), count: 3 })));
+  lines.push(...buzzMemoLines(loadBuzzMemo()));
   const latestSuggestion = db.suggestions?.[0];
   if (latestSuggestion) {
     lines.push("## 直近の実績分析からの方針（従う）");
@@ -4225,7 +4274,7 @@ async function collectInsights(snapshot) {
   return { fetched: results.length, failed: failures.length, failures, targets: targets.length };
 }
 
-// 反応の少ない投稿の自動削除: 公開から autoDeleteAfterHours(24以上) 時間たち、いいねが autoDeleteMaxLikes 以下、またはコメント(replies)が autoDeleteMaxReplies 以下の投稿を Threads から消す（いいねもコメントも上限を超えたときだけ残す。取り消せない操作）。
+// 反応の少ない投稿の自動削除: 公開から autoDeleteAfterHours(24以上) 時間たち、いいねが autoDeleteMaxLikes 以下、かつコメント(replies)が autoDeleteMaxReplies 以下の投稿だけを Threads から消す（どちらか一方でも上限を超えたら残す。既定の上限は2＝3以上で残す。取り消せない操作）。
 // ・既定はOFF。ONにした時刻(autoDeleteEnabledAt)より前に公開した投稿は対象にしない（過去の投稿へ遡って消さない）。
 // ・消す直前に Threads 側のインサイトを取り直していいね数を確かめる。取れない・読めない・しきい値超なら消さない。
 // ・消す前に取り直したインサイトを記録に残す。削除後も投稿の記録（本文・数字）は残し、deletedFromThreadsAt を付けて以後の取得対象から外す（分析の材料に使うため）。
@@ -4333,7 +4382,7 @@ async function deleteLowLikePosts(snapshot) {
       await recordAutoDeleteFailure(post, "コメント数が読めなかったため、この投稿は消しませんでした。", { metrics: JSON.stringify(insight.metrics).slice(0, 200) }, { countAgainstPost: true });
       continue;
     }
-    if (likes > maxLikes && repliesCount > maxReplies) { // 24時間時点の判定で残す（いいねもコメントも上限超えのときだけ。どちらか一方でも上限以下なら削除。2026-11-05 林さん決定）。以後は判定し直さない（いいねの取り消しやしきい値の変更で、残した投稿を後から消さない）
+    if (likes > maxLikes || repliesCount > maxReplies) { // 24時間時点の判定で残す（いいねかコメントのどちらか一方でも上限を超えたら残す。削除するのは両方とも上限以下のときだけ。2026-11-09 林さん確定: 上限2＝いいね3・コメント0は残す。2026-11-05 の「どちらか一方でも上限以下なら削除」を置き換え）。以後は判定し直さない（いいねの取り消しやしきい値の変更で、残した投稿を後から消さない）
       await withDb(async (d) => {
         const p = d.posts.find((x) => x.id === post.id);
         if (p) { p.autoDeleteJudgedAt = nowIso(); p.autoDeleteJudgedLikes = likes; p.autoDeleteJudgedMax = maxLikes; p.autoDeleteJudgedReplies = repliesCount; p.autoDeleteJudgedMaxReplies = maxReplies; }
@@ -4367,7 +4416,7 @@ async function deleteLowLikePosts(snapshot) {
       break;
     }
     result.deleted += 1;
-    const reason = `公開から${hours}時間たっても、いいねが${maxLikes}以下（${likes}）またはコメントが${maxReplies}以下（${repliesCount}）だったため自動削除`;
+    const reason = `公開から${hours}時間たっても、いいねが${maxLikes}以下（${likes}）かつコメントが${maxReplies}以下（${repliesCount}）だったため自動削除`;
     if (!(await markPostDeleted(post, reason, insight))) {
       deletedButUnrecorded.set(post.threadsId, { post, reason, insight });
       break; // 記録できない状態で削除を進めない
@@ -6901,7 +6950,7 @@ export const _internals = {
   recoverPublishing, reconcileFailedPublishes, findDuplicateBeforeResend, markPublishError, findSameTextSince, findRecentSameText, redactSecrets, ngramOverlap, buildStats, log, sanitizeLogMeta, isTransientThreadsError, isThreadsMissingObjectError, boundedBackoffMs, applyReplyFetchFailures, recordAutoDeleteFailureForTest: recordAutoDeleteFailure, isExposed, readDbFileWithRecovery, backupDbIfNeeded, DB_PATH, BACKUP_DIR,
   toStrictSchema,
   REPLY_TEXT_BLOCKLIST,
-  autoReplyTick, classifySafeError, monitoringStatusPayload, buildDraftPrompt, selectDraftReferences, callAiJson, loadSharedPatterns, selectSharedPatterns, typePerformance, buildSuggestionPrompt, generateSuggestion, HOOK_TYPES, researchTargets, questionQualityIssue,
+  autoReplyTick, classifySafeError, monitoringStatusPayload, buildDraftPrompt, selectDraftReferences, callAiJson, loadSharedPatterns, loadBuzzMemo, buzzMemoLines, selectSharedPatterns, typePerformance, buildSuggestionPrompt, generateSuggestion, HOOK_TYPES, researchTargets, questionQualityIssue,
   diagnosticMeta, endpointKindForThreadsPath,
   evaluateSafety,
   safetyMessage, safetySummary, safetyTextKey, allocateThemes, sanitizeThemes, sanitizeCampaigns, assertCampaignWindow, applyCampaignLink, campaignSlots, buildCampaignPrompt, autoRepostTick, rebuzzTopUp, SAFETY_DEFAULT_WORDS,
