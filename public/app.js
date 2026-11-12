@@ -835,7 +835,7 @@ async function transition(id, action, button) {
     if (!scheduledAt) return;
   }
   if (action === "reject") {
-    // 却下理由を一言だけ聞く（Q044で新設）。あとで「書き直せば出せる」かを判断する材料にする。空欄でも却下できる。
+    // 却下理由を一言だけ聞く。あとで「書き直せば出せる」かを判断する材料にする。空欄でも却下できる。
     reason = window.prompt("却下する理由を一言で（あとで書き直すかの判断材料にします。空でもOK）", "");
     if (reason === null) return;
   }

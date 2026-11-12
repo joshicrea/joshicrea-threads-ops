@@ -23,6 +23,8 @@ const SETTINGS_PROPS = {
   brandName: { type: "string" }, profile: { type: "string" }, writingRules: { type: "string" }, defaultCta: { type: "string" },
   replyStyle: { type: "string", description: "返信だけの文体（任意）。空なら投稿の文体ルールに合わせる" }, materials: { type: "string", description: "見せられるもの・素材（作品・商品・日常・実績・こだわり。任意）" }, materialFolder: { type: "string", description: "素材フォルダ（このPC上のパス。任意）。中の .md/.txt を読む" },
   scheduleTimes: { type: "string", description: "例: 07:00,12:00,20:00（日本時間）" },
+  dailyDraftsCount: { type: "integer", description: "毎日自動で作る下書きの本数（0〜12・既定0=作らない）。運用代行サロンでは導入のときにお客様ごとに決める。作るのは確認待ちの下書きだけで、承認・予約・自動送信のONはしない" },
+  dailyDraftsTime: { type: "string", description: "毎日の下書きを作る時刻（日本時間・HH:mm・既定 09:00）。PC が止まっていた日は、次の起動後の最初の時計で1回だけ作る" },
   aiProvider: { type: "string", enum: ["claude-code", "codex", "gemini", "claude-api"] }, claudeModel: { type: "string", enum: ["sonnet", "opus", "haiku"] },
   autoPublishEnabled: { type: "boolean" }, autoFetchRepliesEnabled: { type: "boolean" }, autoFetchRepliesMinutes: { type: "integer" },
   autoReplyEnabled: { type: "boolean" }, autoReplyIntervalSec: { type: "integer" }, autoReplyDailyCap: { type: "integer" }, autoInsightsEnabled: { type: "boolean" },
@@ -300,7 +302,7 @@ const tools = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     run: async () => {
       const s = (await api("/api/state")).settings;
-      const pick = ["expectedThreadsUsername", "threadsOAuthExchangeUrl", "aiProvider", "claudeModel", "brandName", "profile", "writingRules", "defaultCta", "scheduleTimes", "autoPublishEnabled", "autoFetchRepliesEnabled", "autoFetchRepliesMinutes", "autoReplyEnabled", "autoReplyIntervalSec", "autoReplyDailyCap", "autoInsightsEnabled", "threadsUsername", "threadsTokenExpiresAt", "threadsRedirectUri"];
+      const pick = ["expectedThreadsUsername", "threadsOAuthExchangeUrl", "aiProvider", "claudeModel", "brandName", "profile", "writingRules", "defaultCta", "scheduleTimes", "dailyDraftsCount", "dailyDraftsTime", "dailyDraftsLastDate", "autoPublishEnabled", "autoFetchRepliesEnabled", "autoFetchRepliesMinutes", "autoReplyEnabled", "autoReplyIntervalSec", "autoReplyDailyCap", "autoInsightsEnabled", "threadsUsername", "threadsTokenExpiresAt", "threadsRedirectUri"];
       return Object.fromEntries(pick.map((k) => [k, s[k]]));
     }
   },
@@ -356,7 +358,7 @@ async function handle(msg) {
     return reply(id, {
       protocolVersion: "2025-06-18",
       capabilities: { tools: {} },
-      serverInfo: { name: "threads-ops-assistant", version: "0.4.2" },
+      serverInfo: { name: "threads-ops-assistant", version: "0.4.3" },
       instructions: "Threads運用アシスタント（ローカル常駐サーバー）を操作するツール群。接続したら最初に threads_guide を呼んで指示書を読み、その順で利用者を案内する。続けて threads_status を呼ぶ。承認・公開・返信の送信は利用者が本文を見て明示したときだけ行う。"
     });
   }

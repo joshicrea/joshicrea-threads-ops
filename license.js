@@ -7,7 +7,7 @@ export const LICENSE_RECHECK_OK_MS = 24 * 60 * 60 * 1000;
 export const LICENSE_RECHECK_RETRY_MS = 15 * 60 * 1000;
 export const LICENSE_DEFAULT_GRACE_DAYS = 7;
 // 許可キーが空でも止めない猶予(既に使っている人だけ・キーが空と初めて分かった時から数える)。
-// COO決定 D-20261108-003。日数は暫定で、林さんの確定でこの値を変えて公開する(2026-11-08: 許可キー空で止める変更が、キーを受け取る手段が無いまま既存利用者に届いた)
+// COO決定。日数は暫定で、林さんの確定でこの値を変えて公開する(2026-11-08: 許可キー空で止める変更が、キーを受け取る手段が無いまま既存利用者に届いた)
 export const LICENSE_NO_KEY_GRACE_DAYS = 14;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHECK_TIMEOUT_MS = 15_000;

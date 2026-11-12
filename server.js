@@ -68,7 +68,7 @@ const MAX_BODY_BYTES = 1_000_000;
 // 日本のユーザー向けツールのため、予約時刻は日本時間（UTC+9）で解釈する。
 const JST_OFFSET = "+09:00";
 
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const GEMINI_BASE = process.env.THREADS_GEMINI_BASE || "https://generativelanguage.googleapis.com/v1beta"; // 環境変数は試験用（偽のAPIに向ける）
 const THREADS_GRAPH = process.env.THREADS_GRAPH_BASE || "https://graph.threads.net"; // 検証用の偽APIへ向けるときだけ上書きする
 const THREADS_API = `${THREADS_GRAPH}/v1.0`;
 
@@ -85,12 +85,12 @@ const TOKEN_REFRESH_BEFORE_MS = 7 * 24 * 60 * 60 * 1000;
 const SCHEDULE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
 const SCHEDULE_STALE_MS = 24 * 60 * 60 * 1000;
 const SCHEDULE_RETRY_MAX = 5;
-// 予約から1時間を超えて遅れた投稿（24時間以内）は、その場で出さず空き枠へ振り直す（PC停止明けに前後10分以内でまとめ出しになるのを防ぐ・Q319/Q333）。
+// 予約から1時間を超えて遅れた投稿（24時間以内）は、その場で出さず空き枠へ振り直す（PC停止明けに前後10分以内でまとめ出しになるのを防ぐ）。
 // 1時間・30分・7日は暫定値で、林さんの確定値ではない
 const SCHEDULE_LATE_RESCHEDULE_MS = 60 * 60 * 1000;
 const SCHEDULE_RESCHEDULE_MIN_GAP_MS = 30 * 60 * 1000;
 const SCHEDULE_RESCHEDULE_MAX_DAYS = 7;
-// 振り直しを繰り返して、最初の予約から7日を超えて遅れ続けた投稿は、これ以上振り直さず止める（暫定・林さん未確定。Q527）
+// 振り直しを繰り返して、最初の予約から7日を超えて遅れ続けた投稿は、これ以上振り直さず止める（暫定・林さん未確定）
 const SCHEDULE_RESCHEDULE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const MONITORING_HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -153,7 +153,7 @@ const defaultSettings = {
   autoDeleteLowLikesEnabled: false,
   autoDeleteAfterHours: 24,
   autoDeleteMaxLikes: 2,
-  autoDeleteMaxReplies: 2, // 2026-11-09 林さん確定（REQ-1232）: 既定は2/2。いいねかコメントのどちらかが3以上なら残し、両方とも2以下のときだけ削除する（いいね3・コメント0は残す）。自動削除の既定はOFFのまま（利用者が自分でONにする）。旧: 2026-10-29 は0/0、2026-11-05 は「どちらか一方でも上限以下なら削除」。旧既定は9/9（2026-10-03）で、公開投稿の大半を24時間で消していた（監査FT-15）
+  autoDeleteMaxReplies: 2, // 2026-11-09 林さん確定: 既定は2/2。いいねかコメントのどちらかが3以上なら残し、両方とも2以下のときだけ削除する（いいね3・コメント0は残す）。自動削除の既定はOFFのまま（利用者が自分でONにする）。旧: 2026-10-29 は0/0、2026-11-05 は「どちらか一方でも上限以下なら削除」。旧既定は9/9（2026-10-03）で、公開投稿の大半を24時間で消していた（監査FT-15）
   lastAutoDeleteFailureAt: "",
   autoDeleteEnabledAt: "",
   autoDeleteBlockedToken: "",
@@ -173,6 +173,13 @@ const defaultSettings = {
   writingRules: "断言しすぎない。体験談を起点にする。最後はコメントしやすい問いで終える。",
   defaultCta: "",
   scheduleTimes: ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"],
+  dailyDraftsCount: 0, // 毎日自動で作る下書きの本数（0〜12・0=作らない）。運用代行サロンでは導入のときにお客様ごとに決める。作るのは確認待ち(review)の下書きだけで、承認・予約・自動送信のONはしない
+  dailyDraftsTime: "09:00", // 下書きを作る時刻（JST・HH:mm）。この時刻を過ぎて今日まだ作っていなければ、次の1分ごとの時計で1回作る（止まっていた日の補いも同じ）
+  dailyDraftsLastDate: "", // 最後に作った日（JST・YYYY-MM-DD）。同じ日に2回作らない判定に使う。画面からは変えない
+  dailyDraftsAttemptAt: "", // 最後に作ろうとした時刻。失敗したとき30分あけて再試行するための印。画面からは変えない
+  dailyDraftsAttempts: 0, // 上の日に作ろうとした回数。1日4回まで。画面からは変えない
+  dailyDraftsKept: 0, // 上の日に確認待ちに残せた本数（本数に届かなかった日の持ち越し）。画面からは変えない
+  dailyDraftsLastSkip: "", // 確認待ちが上限に達して作らなかったときの理由（1行）。作れたら空に戻る。画面からは変えない
   postsPerDay: 0, // 1以上なら scheduleTimes ではなく、開始時〜終了時を本数ぶんに等分し、各枠の中でランダムな時刻にする
   scheduleFromHour: 7,
   scheduleToHour: 21,
@@ -357,7 +364,9 @@ async function saveDb(db) {
   rememberSecrets(db.settings || {});
 }
 
+let dbWriteHook = null; // 試験用: 書き込まれる状態を1回ずつ受け取る
 async function writeDbFile(db) {
+  if (dbWriteHook) dbWriteHook(db);
   const tmp = `${DB_PATH}.${process.pid}.tmp`;
   await writeFile(tmp, `${JSON.stringify(db, null, 2)}\n`, "utf8");
   restrictPermissions(tmp, 0o600);
@@ -872,16 +881,29 @@ function geminiSerial(task) {
   return run;
 }
 
+// Gemini / Claude の API 呼び出し1回あたりの時間切れ（応答が来ないまま固まらないように）。環境変数は試験用
+const AI_API_TIMEOUT_MS = Number(process.env.THREADS_AI_TIMEOUT_MS) || 120_000;
+function aiTimeoutError(error, label) {
+  if (error?.name === "TimeoutError" || error?.name === "AbortError") return new HttpError(504, `${label} の応答が${Math.round(AI_API_TIMEOUT_MS / 1000)}秒以内に返りませんでした。時間をおいて再実行してください。`);
+  return error;
+}
 async function geminiFetch(settings, path, init) {
   if (!settings.geminiApiKey) throw new HttpError(400, "Gemini APIキーが未設定です。設定画面で保存してください。");
   let lastError;
   for (let attempt = 0; attempt <= GEMINI_MAX_RETRY; attempt += 1) {
-    const res = await fetch(`${GEMINI_BASE}${path}`, {
-      ...init,
-      headers: { "content-type": "application/json", "x-goog-api-key": settings.geminiApiKey, ...(init?.headers || {}) }
-    });
-    if (res.ok) return res.json();
-    const error = new ExternalApiError("Gemini", res.status, await res.text());
+    const signal = AbortSignal.timeout(AI_API_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(`${GEMINI_BASE}${path}`, {
+        ...init,
+        signal,
+        headers: { "content-type": "application/json", "x-goog-api-key": settings.geminiApiKey, ...(init?.headers || {}) }
+      });
+      if (res.ok) return await res.json();
+    } catch (error) {
+      throw aiTimeoutError(error, "Gemini");
+    }
+    const error = new ExternalApiError("Gemini", res.status, await res.text().catch((e) => { throw aiTimeoutError(e, "Gemini"); }));
     lastError = error;
     const retryable = res.status === 429 || res.status === 503;
     if (!retryable || attempt === GEMINI_MAX_RETRY) break;
@@ -1056,7 +1078,7 @@ export function claudeCommandPath() {
 }
 const CLAUDE_CODE_TIMEOUT_MS = 180_000;
 const CLAUDE_CONFIG_DIR = join(DATA_DIR, "claude-config");
-const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API = process.env.THREADS_ANTHROPIC_API || "https://api.anthropic.com/v1/messages"; // 環境変数は試験用
 export const CLAUDE_CODE_MODELS = ["sonnet", "opus", "haiku"];
 
 function jsonOnlySystemPrompt(schema) {
@@ -1191,18 +1213,24 @@ async function callClaudeCodeText(settings, prompt, { system, tools = "", maxTur
 
 async function callClaudeApiText(settings, prompt, { system, maxTokens = 8192 } = {}) {
   if (!settings.anthropicApiKey) throw new HttpError(400, "Claude APIキーが未設定です。設定画面で保存してください。");
-  const res = await fetch(ANTHROPIC_API, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": settings.anthropicApiKey, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({
-      model: settings.anthropicModel || "claude-sonnet-5",
-      max_tokens: maxTokens,
-      system: system || "",
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
-  if (!res.ok) throw new ExternalApiError("Claude", res.status, await res.text());
-  const data = await res.json();
+  let res, data;
+  try {
+    res = await fetch(ANTHROPIC_API, {
+      method: "POST",
+      signal: AbortSignal.timeout(AI_API_TIMEOUT_MS),
+      headers: { "content-type": "application/json", "x-api-key": settings.anthropicApiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: settings.anthropicModel || "claude-sonnet-5",
+        max_tokens: maxTokens,
+        system: system || "",
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+    if (!res.ok) throw new ExternalApiError("Claude", res.status, await res.text());
+    data = await res.json();
+  } catch (error) {
+    throw aiTimeoutError(error, "Claude");
+  }
   const text = (data.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
   if (!text) throw new HttpError(502, `Claude APIから本文が返りませんでした（stop_reason: ${data.stop_reason || "不明"}）。`);
   return { text, model: data.model || "", usage: data.usage || {} };
@@ -2259,7 +2287,7 @@ function sharedPatternLines(patterns) {
   ];
 }
 
-// バズる型メモ（Q681）: 各口座のデータ置き場の buzz-memo.json（環境変数 THREADS_BUZZ_MEMO_PATH で差し替え可）を、区画名が完全一致のキーだけで読む。
+// バズる型メモ: 各口座のデータ置き場の buzz-memo.json（環境変数 THREADS_BUZZ_MEMO_PATH で差し替え可）を、区画名が完全一致のキーだけで読む。
 // 形式: {"basic":[文字列...],"hooks":[文字列...],"ng":[文字列...],"examples":[文字列...]}。キーは4つだけ（省略可）。
 // 見出しや行から区分を推測しない（Markdown 方式は、禁止語が候補に入る経路が検証で4回見つかったため廃止）。
 // ファイルが無い・空・形が違うときは null で、生成プロンプトは変更前と1字も変わらない。文面はコードに書かない（差し替えで反映される）
@@ -2936,7 +2964,7 @@ function normalizePost(input) {
     updatedAt: nowIso(),
     publishedAt: input.publishedAt || "",
     error: input.error || "",
-    // 却下（reject）した理由を一言で残す。書き直せば出せるか後から判断するための材料（Q044で新設）。
+    // 却下（reject）した理由を一言で残す。書き直せば出せるか後から判断するための材料。
     // reject時にapplyTransitionが書き込み、restoreで承認待ちへ戻すときにクリアする。
     rejectReason: input.rejectReason || "",
     copyOverlapWarning: input.copyOverlapWarning || null,
@@ -3067,7 +3095,7 @@ function applyTransition(post, action, options = {}) {
     post.safety = safety;
     if (safety.level === "blocked") throw Object.assign(new HttpError(409, safetyMessage(safety)), { safety });
   }
-  // 却下理由（Q044で新設）。reject時に残し、restoreで承認待ちへ戻したら次の却下まで持ち越さずクリアする。
+  // 却下理由。reject時に残し、restoreで承認待ちへ戻したら次の却下まで持ち越さずクリアする。
   if (action === "reject") post.rejectReason = String(options.reason || "").slice(0, 200);
   if (action === "restore") post.rejectReason = "";
   post.status = rule.to;
@@ -4629,7 +4657,7 @@ function assertLicenseAllows(db) {
   const decision = licenseDecisionOf(db);
   if (!decision.allowed) throw new HttpError(403, decision.message);
 }
-// 停止中に予約時刻を過ぎた投稿に印を付ける。再開しても自動では出さず、画面で1件ずつ「出す」「破棄」を選ぶ（COO裁定 D-20261029-012）
+// 停止中に予約時刻を過ぎた投稿に印を付ける。再開しても自動では出さず、画面で1件ずつ「出す」「破棄」を選ぶ（COO裁定）
 function holdPastDueScheduled(db, blockedSince = "") {
   if (db.settings.licenseResumeMode === "auto") return 0;
   const since = (Date.parse(blockedSince || "") || 0) - 10 * 60_000; // 停止とは関係なく過ぎていた予約（自動公開OFF・連携切れ）は対象にしない
@@ -4700,7 +4728,7 @@ async function licenseTick() {
   }
   await withDb(async (db) => {
     // 許可キーが空と初めて分かったときに1回だけ、既に使っている人(投稿か返信の履歴がある)かを決めて残す。
-    // 既に使っている人は、その時から LICENSE_NO_KEY_GRACE_DAYS 日は止めない。新しく入れた人は "-"(猶予なし)。COO決定 D-20261108-003
+    // 既に使っている人は、その時から LICENSE_NO_KEY_GRACE_DAYS 日は止めない。新しく入れた人は "-"(猶予なし)。COO決定
     let graceDecided = false;
     if (!licenseConfigured(db.settings) && !LICENSE_EXEMPT && !licenseStateOf(db).noKeyGraceFrom) {
       graceDecided = true;
@@ -4784,7 +4812,7 @@ async function schedulerTick() {
         log(db, "error", `予約時刻を過ぎても承認・予約されていない投稿が ${n} 件あります。承認して予約し直すか、却下してください。`, { count: n });
       });
     }
-    // 予約から1時間を超えて遅れた投稿（24時間以内）は、その場で出さず空き枠へ振り直す。PC停止明けに前後10分以内でまとめ出しになるのを防ぐ（Q319/Q333）。
+    // 予約から1時間を超えて遅れた投稿（24時間以内）は、その場で出さず空き枠へ振り直す。PC停止明けに前後10分以内でまとめ出しになるのを防ぐ。
     // 計画は最新の DB を持つロックの中で立て、そのまま書く。空き枠が無く振り直せない投稿は従来どおり今すぐ出す（印を1回だけ残す）
     if (snapshot.settings.autoPublishEnabled && snapshot.settings.threadsAccessToken && !tokenExpired && licenseAllowed) {
       await withDb(async (db) => {
@@ -5117,6 +5145,20 @@ function sanitizeSettings(current, rawInput) {
     }
     if (key === "campaigns") {
       next.campaigns = sanitizeCampaigns(value);
+      continue;
+    }
+    // 毎日の下書き。作成日・試行の印は内部の記録なので、設定の保存では変えさせない
+    if (["dailyDraftsLastDate", "dailyDraftsAttemptAt", "dailyDraftsAttempts", "dailyDraftsKept", "dailyDraftsLastSkip"].includes(key)) continue;
+    if (key === "dailyDraftsCount") {
+      const raw = String(value ?? "").trim();
+      if (!/^\d{1,2}$/.test(raw) || Number(raw) > DAILY_DRAFTS_MAX) throw new HttpError(400, `毎日の下書きの本数は、0〜${DAILY_DRAFTS_MAX}の整数で入力してください（0なら作りません）。`);
+      next[key] = Number(raw);
+      continue;
+    }
+    if (key === "dailyDraftsTime") {
+      const hm = String(value ?? "").trim();
+      if (!DAILY_DRAFTS_TIME_RE.test(hm)) throw new HttpError(400, `毎日の下書きを作る時刻の形式が正しくありません: ${hm || "（空）"}（例: 09:00）`);
+      next[key] = hm;
       continue;
     }
     if (key === "scheduleTimes") {
@@ -6154,7 +6196,9 @@ function questionQualityIssue(post) {
   return "";
 }
 
-route("POST", "/api/generate-posts", async ({ body }) => {
+// 毎日の下書き(dailyDraftsTick)からも同じ処理を呼ぶため、名前を付けて取り出してある（中身は変えていない）
+// inTx: 呼び出し側が、下書きを保存する同じ書き込みの中で動かす処理 (d, created) => void（毎日の下書きが、検査での却下と持ち越し本数の更新を作成と同時に行うため）
+async function generatePostsHandler({ body, inTx }) {
   const count = Math.min(Math.max(Number(body.count) || 8, 1), 12);
   const db = await readDb();
   const clean = (v) => String(v || "").replace(/\s+/g, " ").trim().slice(0, 300);
@@ -6215,6 +6259,7 @@ route("POST", "/api/generate-posts", async ({ body }) => {
     if (usedReferenceIds.length) for (const post of created) post.referenceIds = usedReferenceIds;
     for (const post of created) post.safety = evaluateSafety(post, { settings: d.settings, posts: d.posts, stage: "generate" });
     d.posts.unshift(...created);
+    if (inTx) inTx(d, created);
     log(d, "info", `${aiProviderLabel(d.settings.aiProvider || "gemini")}で投稿案を${created.length}件生成しました（承認待ち）。`, { count: created.length });
     if (themeMismatch.length) log(d, "info", `AI が返したテーマ名が割り当てと違う案が${themeMismatch.length}件ありました。割り当てどおりのテーマを付けています。`, { themeMismatch });
     const missing = [...new Set(themePlan.filter((t) => t.required).map((t) => t.name))].filter((name) => !created.some((p) => p.theme === name));
@@ -6223,7 +6268,126 @@ route("POST", "/api/generate-posts", async ({ body }) => {
     return { value: { created, themeWarnings } };
   });
   return { status: 200, body: { posts: posts.created, strategyMemo: result.strategyMemo || "", ...(themePlan.length ? { themePlan: themePlan.map((t) => t.name), themeWarnings: posts.themeWarnings } : {}) } };
-});
+}
+route("POST", "/api/generate-posts", generatePostsHandler);
+
+// 毎日の下書き（運用代行サロン）。サーバーが動いている間、1分ごとの時計から呼ぶ。
+// 設定の時刻（JST・既定 09:00）を過ぎていて今日まだ作っていなければ、設定の本数ぶんの下書きを作る。
+// PC が止まっていた日は、起動後の最初の時計で作る（数日分を一度には作らない）。作るのは確認待ち(review)の下書きだけで、
+// 承認・予約・自動送信のONはしない。
+// 検査: generate-posts と同じ検査（丸写し・質問・安全確認）に加えて、絵文字・長さ・一人称・成果の断言を通す（scripts/daily_refill.py の
+//   同名の検査と同じ判定）。通らなかった下書きは却下して確認待ちに残さない。1回の試行は最大3回の生成まで。
+//   本数に届かなかった日は作成日を進めず、作れた分を同じ日の再試行へ持ち越す（30分あけて・1日4回まで）。
+// 積み上がり防止: 確認待ちが本数の3倍以上のときは作らない（理由を設定 dailyDraftsLastSkip に残す。承認・却下で減れば再び作る）。
+// 守備範囲: 5文字組の重なりでの過去投稿との重複検査（py版の DUP_LIMIT）は、generate-posts 側の安全確認（類似）に任せていて、同じ判定ではない。
+//   意味の同じ言い換え・事実の誤りは検査できない。
+const DAILY_DRAFTS_MAX = 12; // generate-posts の1回の上限に合わせる
+const DAILY_DRAFTS_RETRY_MS = 30 * 60_000;
+const DAILY_DRAFTS_MAX_ATTEMPTS = 4;
+const DAILY_DRAFTS_MAX_ROUNDS = 3; // 1回の試行で生成を呼ぶ最大回数
+const DAILY_DRAFTS_REVIEW_CAP_RATIO = 3; // 確認待ちが 本数×3 以上なら作らない
+const DAILY_DRAFTS_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const DAILY_DRAFTS_GOAL = "短く読める投稿。日本語で3〜4行・1行は20字前後・全体で110字以内。絵文字は使わない。体験談ではなく、読者がすぐ真似できる小さな工夫や気づきを書く。成果（増えた・伸びたなど）を断言しない。読者がコメントしやすい短い問いで終える。";
+// 下書きの検査（scripts/daily_refill.py の EMOJI・FIRST_PERSON・OUTCOME_CLAIM・too_long と同じ判定。日本語の上限は 4行・110字・1行26字）
+const DAILY_DRAFTS_EMOJI = /[\u{1F000}-\u{1FAFF}☀-➿️]/u;
+const DAILY_DRAFTS_FIRST_PERSON = /(私は|私が|私も|私の(?:場合|経験)|自分は.{0,6}(?:した|でした)|悩んだ|迷って|やってみたら)/;
+const DAILY_DRAFTS_OUTCOME_CLAIM = /(減りました|増えました|広がりました|伸びました|上がりました|去年より|以前より)/;
+const DAILY_DRAFTS_LIMITS = { lines: 4, chars: 110, line: 26 };
+function dailyDraftIssue(text) {
+  const t = String(text || "");
+  if (DAILY_DRAFTS_EMOJI.test(t)) return "絵文字";
+  const lines = t.split("\n").filter((l) => l.trim());
+  if (lines.length > DAILY_DRAFTS_LIMITS.lines || [...t].length > DAILY_DRAFTS_LIMITS.chars || lines.some((l) => [...l].length > DAILY_DRAFTS_LIMITS.line)) return "長すぎる（行数・文字数・1行の長さ）";
+  if (DAILY_DRAFTS_OUTCOME_CLAIM.test(t)) return "確認できない成果の主張";
+  if (DAILY_DRAFTS_FIRST_PERSON.test(t)) return "一人称の体験表現";
+  return "";
+}
+let dailyDraftsRunning = false;
+function jstHm(ms) {
+  return new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(ms));
+}
+function dailyDraftsDue(settings, nowMs) {
+  const count = Math.min(Math.floor(Number(settings.dailyDraftsCount)) || 0, DAILY_DRAFTS_MAX);
+  if (count < 1) return { due: false, reason: "本数が0" };
+  const time = String(settings.dailyDraftsTime || "");
+  if (!DAILY_DRAFTS_TIME_RE.test(time)) return { due: false, reason: "時刻の形式が正しくない" };
+  if (settings.autoStoppedByIdentity) return { due: false, reason: "連携先を確認できず自動停止中" };
+  const today = jstYmd(nowMs);
+  if (settings.dailyDraftsLastDate === today) return { due: false, reason: "今日は作成済み" };
+  if (jstHm(nowMs) < time) return { due: false, reason: "時刻前" };
+  const attemptMs = Date.parse(settings.dailyDraftsAttemptAt || "") || 0;
+  const sameDay = Boolean(attemptMs) && jstYmd(attemptMs) === today;
+  if (sameDay) {
+    if ((Number(settings.dailyDraftsAttempts) || 0) >= DAILY_DRAFTS_MAX_ATTEMPTS) return { due: false, reason: "今日は4回試して作れなかった" };
+    if (nowMs >= attemptMs && nowMs - attemptMs < DAILY_DRAFTS_RETRY_MS) return { due: false, reason: "再試行は30分あける" };
+  }
+  return { due: true, reason: "", count, today, attemptsBefore: sameDay ? Number(settings.dailyDraftsAttempts) || 0 : 0, keptBefore: sameDay ? Number(settings.dailyDraftsKept) || 0 : 0 };
+}
+async function dailyDraftsTick(nowMs = Date.now()) {
+  if (dailyDraftsRunning) return { ran: false, reason: "実行中" };
+  dailyDraftsRunning = true;
+  try {
+    const db = await readDb();
+    const due = dailyDraftsDue(db.settings, nowMs);
+    if (!due.due) return { ran: false, reason: due.reason };
+    // 積み上がり防止: 確認待ちが 本数×3 以上なら、その時計では作らない（AI も呼ばない）。作成日は進めず、減ったら次の時計で作る
+    const cap = due.count * DAILY_DRAFTS_REVIEW_CAP_RATIO;
+    const reviewing = db.posts.filter((p) => p.status === "review").length;
+    if (reviewing >= cap) {
+      const note = `確認待ちが${reviewing}本あり、上限${cap}本（本数${due.count}×${DAILY_DRAFTS_REVIEW_CAP_RATIO}）以上のため、毎日の下書きを作っていません。承認か却下で減らすと作ります。`;
+      if (db.settings.dailyDraftsLastSkip !== note) await withDb(async (d) => { d.settings.dailyDraftsLastSkip = note; });
+      return { ran: false, reason: "確認待ちが上限" };
+    }
+    // AI を呼ぶ前に試行を記録する（AI が固まっても、毎分くり返さない）
+    await withDb(async (d) => {
+      d.settings.dailyDraftsAttemptAt = new Date(nowMs).toISOString();
+      d.settings.dailyDraftsAttempts = due.attemptsBefore + 1;
+      d.settings.dailyDraftsKept = due.keptBefore;
+    });
+    let keptNow = 0;
+    let aiError = "";
+    const rejectedReasons = [];
+    for (let round = 0; round < DAILY_DRAFTS_MAX_ROUNDS && due.keptBefore + keptNow < due.count; round++) {
+      // 作成・検査での却下・持ち越し本数(Kept)の更新は、下書きを保存する同じ書き込みの中で行う（途中で止まっても記録がずれない）
+      const roundBad = [];
+      let roundGood = 0;
+      const inTx = (d, created) => {
+        for (const post of created) {
+          const reason = dailyDraftIssue(post.text);
+          if (reason) {
+            roundBad.push(reason);
+            applyTransition(post, "reject", { reason: `毎日の下書きの検査: ${reason}` });
+          } else roundGood++;
+        }
+        d.settings.dailyDraftsKept = due.keptBefore + keptNow + roundGood;
+      };
+      try {
+        await generatePostsHandler({ body: { count: due.count - due.keptBefore - keptNow, goal: DAILY_DRAFTS_GOAL }, inTx });
+      } catch (error) {
+        aiError = String(error?.message || error).slice(0, 200);
+        break;
+      }
+      keptNow += roundGood;
+      rejectedReasons.push(...roundBad);
+    }
+    const kept = due.keptBefore + keptNow;
+    const done = kept >= due.count;
+    await withDb(async (d) => {
+      d.settings.dailyDraftsKept = kept;
+      if (done) {
+        d.settings.dailyDraftsLastDate = due.today;
+        d.settings.dailyDraftsLastSkip = "";
+        log(d, "info", `毎日の下書きを${kept}本作りました（確認待ち・設定は${due.count}本）。`, { kept, count: due.count });
+      } else {
+        const why = aiError ? `AIの呼び出しに失敗（${aiError}）` : `検査に通らず${rejectedReasons.length}本を却下（${[...new Set(rejectedReasons)].join("・")}）`;
+        log(d, "error", `毎日の下書きが本数に届きませんでした（${due.attemptsBefore + 1}回目・${kept}/${due.count}本）: ${why}`);
+      }
+    });
+    return done ? { ran: true, created: keptNow } : { ran: true, created: keptNow, error: aiError || "検査に通る下書きが足りない" };
+  } finally {
+    dailyDraftsRunning = false;
+  }
+}
 
 // 期間つき宣伝投稿をまとめて作る。全部「承認待ち」で入れる（自動で承認・予約しない）。予約時刻は期間内の各日にばらす
 route("POST", "/api/campaigns/:id/generate", async ({ params }) => {
@@ -6956,8 +7120,10 @@ export const _internals = {
   safetyMessage, safetySummary, safetyTextKey, allocateThemes, sanitizeThemes, sanitizeCampaigns, assertCampaignWindow, applyCampaignLink, campaignSlots, buildCampaignPrompt, autoRepostTick, rebuzzTopUp, SAFETY_DEFAULT_WORDS,
   findFreeSlots, planLateReschedules,
   reconcileUncertainReply, reconcileUncertainReplies, replyDraftHold, retryEchoHeldReplies, REPLY_ECHO_HOLD,
+  dailyDraftsDue, dailyDraftsTick,
   draftRepliesBatch, pickAiFailedForRecovery, recoverAiFailedReplies, REPLY_AI_RECOVERY_EVERY_MS, schedulerTick, assignSchedule, sanitizeSettings, applyTransition, normalizePost, readDb, withDb,
   licenseTick, licenseDecisionOf, holdPastDueScheduled, applyLicenseHold, assertLicenseAllows, sendAutoReplies, applyLicenseSettingsChange, releaseHoldIfRescheduled,
+  setDbWriteHook: (fn) => { dbWriteHook = fn; },
   pauseBackgroundScheduler: () => { backgroundSchedulerPaused = true; } };
 
 // 自己署名証明書（localhost・10年）。openssl が無ければ https は立てず、手動トークン運用を案内する。
@@ -7040,7 +7206,7 @@ export async function startServer(port = PORT, host = HOST) {
     throw new Error("外へ公開する形（HOST が 127.0.0.1 以外、または THREADS_PUBLIC_ORIGIN あり）では、アクセスキーが必要です。環境変数 THREADS_ACCESS_KEY（8文字以上）を設定して起動してください。");
   }
   recordMonitoringHeartbeat().catch((error) => appendErrorLog(error));
-  const timer = setInterval(() => { if (!backgroundSchedulerPaused) schedulerTick(); }, 60_000);
+  const timer = setInterval(() => { if (!backgroundSchedulerPaused) { schedulerTick(); dailyDraftsTick().catch((error) => appendErrorLog(error)); } }, 60_000);
   const monitoringTimer = setInterval(() => { recordMonitoringHeartbeat().catch((error) => appendErrorLog(error)); }, MONITORING_HEARTBEAT_INTERVAL_MS);
   timer.unref();
   monitoringTimer.unref();

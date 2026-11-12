@@ -1,5 +1,5 @@
 ﻿# Threads Ops Assistant: register (or remove) the logon task that starts the server hidden.
-param([switch]$Remove, [string]$Vbs = "start-hidden.vbs")
+param([switch]$Remove, [string]$Vbs = "start-hidden.vbs", [string]$MorningTime = "09:00")
 $name = if ($env:THREADS_TASK_NAME) { $env:THREADS_TASK_NAME } else { "ThreadsOpsAssistant" }
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($Remove) {
@@ -22,10 +22,13 @@ $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $every5 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(-1) `
   -RepetitionInterval (New-TimeSpan -Minutes 5) `
   -RepetitionDuration (New-TimeSpan -Days 3650)
+# 3. 毎朝1回（サロンの毎日の下書きの時刻）。時刻は -MorningTime "HH:mm" の1か所だけで変えられる。
+#    PC が止まっていた日は、次に起動したとき1回だけ補う（下の StartWhenAvailable）。
+$morning = New-ScheduledTaskTrigger -Daily -At $MorningTime
 
 # 異常終了したときも3回まで1分間隔で復帰させる（次の5分が来るまでの穴を埋める）。
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName $name -Action $action -Trigger @($logon, $every5) -Settings $settings -RunLevel Limited -Force | Out-Null
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName $name -Action $action -Trigger @($logon, $every5, $morning) -Settings $settings -RunLevel Limited -Force | Out-Null
 
 # 設定が入ったことと、実際にスケジュールされたことは別。NextRunTime で後者を確かめる
 $t = Get-ScheduledTask -TaskName $name
@@ -33,4 +36,4 @@ $rep = ($t.Triggers | ForEach-Object { $_.Repetition.Interval } | Where-Object {
 $next = (Get-ScheduledTaskInfo -TaskName $name).NextRunTime
 if (-not $rep) { Write-Warning "繰り返し設定が入らなかった。落ちたときの自動復帰は効かない" }
 if (-not $next) { Write-Warning "次回実行が予定されていない。繰り返しトリガーが開始していない（落ちても戻らない）" }
-Write-Output ("registered: " + $t.State + " | repeat=" + $rep + " | next=" + $next + " | " + $t.Actions[0].Execute + " " + $t.Actions[0].Arguments)
+Write-Output ("registered: " + $t.State + " | repeat=" + $rep + " | morning=" + $MorningTime + " | next=" + $next + " | " + $t.Actions[0].Execute + " " + $t.Actions[0].Arguments)

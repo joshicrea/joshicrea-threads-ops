@@ -11,7 +11,7 @@ sh.CurrentDirectory = dir
 Set env = sh.Environment("PROCESS")
 ' The gateway (multi-account front door) exists only on the provider PC. Customer installs do not ship it.
 If fso.FileExists(dir & "\start-hidden-gateway.vbs") Then sh.Run "wscript //nologo """ & dir & "\start-hidden-gateway.vbs""", 0, False
-' Provider PC only (the gateway file is not shipped): the provider's own accounts run without a license key (D-20261029-015).
+' Provider PC only (the gateway file is not shipped): the provider's own accounts run without a license key.
 If fso.FileExists(dir & "\start-hidden-gateway.vbs") Then env("THREADS_LICENSE_EXEMPT") = "1"
 
 wantBrowser = (WScript.Arguments.Count > 0)
