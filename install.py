@@ -268,12 +268,129 @@ def port_in_use(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_:
         s_.settimeout(1)
         return s_.connect_ex(("127.0.0.1", port)) == 0
+# >>> 1行切り替え（0.4.4）: 旧ZIP版の自動停止と、旧データの自動引っ越し。ここから END までを関数にしてあり、試験はこの区間を取り出して実走する
+import hashlib, re as _re2
+def listener_pids(port):
+    pids = set()
+    try:
+        out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=10).stdout
+        pids |= {int(t) for t in out.split() if t.isdigit()}
+    except Exception:
+        pass
+    if not pids and shutil.which("ss"):
+        try:
+            out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True, timeout=10).stdout
+            pids |= {int(m) for m in _re2.findall(r"pid=(\d+)", out)}
+        except Exception:
+            pass
+    return pids
+
+def proc_cmdline(pid):
+    try:
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+def is_threads_node(cmd):
+    # node で動く Threads 本体（server.js か start.js）だけを対象にする。ほかのプログラムは止めない
+    parts = cmd.split()
+    if not parts or os.path.basename(parts[0]) not in ("node", "nodejs"):
+        return False
+    return bool(_re2.search(r"(?:^|[\s/])(?:server|start)\.js(?:\s|$)", cmd))
+
+def stop_legacy_listener(port):
+    # ポートを塞いでいるのが全部 Threads 本体のときだけ止める。1つでも別のプログラムなら何も止めない（現行どおり案内して終わる）
+    pids = {p for p in listener_pids(port) if p != os.getpid()}
+    if not pids:
+        return False
+    if not all(is_threads_node(proc_cmdline(p)) for p in pids):
+        return False
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except Exception:
+            pass
+    for _ in range(8):
+        time.sleep(1)
+        if not port_in_use(port):
+            break
+    if port_in_use(port):
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except Exception:
+                pass
+        time.sleep(2)
+    print(f"動いていた旧版を自動で止めました（{len(pids)} 件）")
+    return True
+
+LEGACY_SKIP_DIRS = {"Library", ".claude", ".cache", "node_modules", ".git"}
+def find_legacy_db(home, data_dir, max_depth=5, budget_sec=60):
+    # ホーム配下・深さ5まで。「_data の下にある db.json」のうち更新時刻が最新のもの。シンボリックリンクはたどらない
+    home = Path(home)
+    best = None
+    t0 = time.time()
+    for root, dirs, files in os.walk(home):
+        rel = Path(root).relative_to(home)
+        dirs[:] = [d for d in dirs if d not in LEGACY_SKIP_DIRS] if len(rel.parts) < max_depth else []
+        if time.time() - t0 > budget_sec:
+            break
+        if "db.json" in files and "_data" in rel.parts:
+            p = Path(root) / "db.json"
+            try:
+                if Path(data_dir) in p.parents:
+                    continue
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if best is None or m > best[0]:
+                best = (m, p)
+    return best[1] if best else None
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def migrate_legacy_data(home, data_dir):
+    # 新しい置き場に db.json が無いときだけ、旧データの db.json をコピーする。あるときは絶対に上書きしない。中身と値は表示しない
+    dst = Path(data_dir) / "db.json"
+    if dst.exists():
+        print("新しい置き場にデータが既にあるため、旧データの引っ越しは行いません（上書きしません）")
+        return "kept"
+    src = find_legacy_db(home, data_dir)
+    if not src:
+        print("旧データは見つかりませんでした。新規として進めます")
+        return "none"
+    tmp = Path(data_dir) / "db.json.migrating"
+    shutil.copyfile(src, tmp)
+    same = _sha256(src) == _sha256(tmp)
+    if not same:
+        tmp.unlink(missing_ok=True)
+        print(f"旧データのコピーが一致しなかったため、引っ越しを取り消しました（コピー元: {src} / ファイル 1 件 / ハッシュ一致 いいえ）。同じ1行をもう一度貼ってください")
+        sys.exit(1)
+    if dst.exists():
+        tmp.unlink(missing_ok=True)
+        print("新しい置き場にデータが先に作られたため、引っ越しは行いません（上書きしません）")
+        return "kept"
+    os.rename(tmp, dst)
+    dst.chmod(0o600)
+    print(f"旧データを引き継ぎました（コピー元: {src} / ファイル 1 件 / ハッシュ一致 はい）")
+    return "migrated"
+# <<< END 1行切り替え
+
 busy = port_in_use(4173)
 for _ in range(5):
     if not busy:
         break
     time.sleep(1)
     busy = port_in_use(4173)
+if busy:
+    # 旧ZIP版（node の server.js / start.js）なら自動で止めて続行する。別のプログラムなら止めず、下の案内で終わる
+    if stop_legacy_listener(4173):
+        busy = port_in_use(4173)
 if busy:
     print()
     print("ポート 4173 を、別のプログラムがすでに使っています（以前に ZIP で入れた運用アシスタントが動いている、など）。")
