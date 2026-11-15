@@ -390,7 +390,7 @@ async function writeDbFile(db) {
 }
 
 const LOG_MAX_BYTES = 1_000_000;
-// 未捕捉の例外・拒否をスタックごと server-error.log に残してから終了する（落ちた理由が分からず同じ落ち方を繰り返さないため・FT-43）。終了後は常駐の再起動に任せる
+// 未捕捉の例外・拒否をスタックごと server-error.log に残してから終了する（落ちた理由が分からず同じ落ち方を繰り返さないため）。終了後は常駐の再起動に任せる
 for (const event of ["uncaughtException", "unhandledRejection"]) {
   process.on(event, (reason) => {
     const error = reason instanceof Error ? reason : new Error(String(reason));

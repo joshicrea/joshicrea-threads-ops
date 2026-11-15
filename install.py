@@ -397,6 +397,9 @@ if busy:
     print("そのプログラムを止めてから、同じ1行をもう一度貼ってください。ZIP 版なら、起動したときに出た画面を閉じると止まります。")
     sys.exit(1)
 
+# 旧版を止めた後・新版を起動する前に、旧データを引き継ぐ（新しい置き場に db.json が無いときだけ。あれば上書きしない）
+migrate_legacy_data(HOME_DIR, DATA_DIR)
+
 # --- 6. ログイン時の自動起動 ---
 log_path = DATA_DIR / "autostart.log"
 if platform.system() == "Darwin":
