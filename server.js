@@ -3107,6 +3107,23 @@ function applyTransition(post, action, options = {}) {
   delete post.retryCount;
 }
 
+// 承認のあと、自動送信がONで予約日時が未来なら、そのまま予約まで進める（2026-11-16 林さん決定「承認だけで予約まで進める」）。
+// 人の承認は必ず先に要る（review→approved は人の操作で、ここは承認の後ろだけ）。予約に進めない理由（日時が過去・安全確認・案件ルール）があれば、
+// 承認済みのまま残して理由を記録する（承認自体は取り消さない）。自動送信がOFFなら何もしない。
+function autoScheduleAfterApprove(d, post) {
+  if (post.status !== "approved" || !d.settings.autoPublishEnabled) return false;
+  const at = Date.parse(post.scheduledAt || "");
+  if (!Number.isFinite(at) || at < Date.now() - 60_000) return false;
+  try {
+    applyTransition(post, "schedule", { safetyContext: { settings: d.settings, posts: d.posts } });
+    return true;
+  } catch (error) {
+    if (error.safety) noteSafetyBlock(d, post, error.safety, "承認後の自動予約", { postId: post.id });
+    else log(d, "info", `承認しましたが、自動の予約はできませんでした: ${error.message}`, { postId: post.id });
+    return false;
+  }
+}
+
 function statusLabel(status) {
   return { draft: "下書き", review: "承認待ち", approved: "承認済み", scheduled: "予約済み", published: "公開済み", rejected: "却下", error: "エラー" }[status] || status;
 }
@@ -6525,6 +6542,17 @@ route("POST", "/api/posts/:id/transition", async ({ params, body }) => {
   const post = await withDb(async (d) => {
     const found = findOr404(d.posts, params.id, "投稿");
     assertNotInFlight(found.id);
+    // 承認と同時に自動で予約された投稿へ「予約して」が重ねて来たとき（承認→日時つきの予約、の順に呼ぶ画面・会話の流れ）:
+    // 日時なし・同じ分の日時ならそのまま成功。別の日時なら、予約を解除してから新しい日時で予約し直す。失敗したら予約済みに戻す
+    let rescheduling = false;
+    if (body.action === "schedule" && found.status === "scheduled") {
+      if (!body.scheduledAt) return { value: found };
+      const want = Date.parse(normalizePost({ scheduledAt: body.scheduledAt }).scheduledAt || "");
+      if (Math.floor(want / 60000) === Math.floor(Date.parse(found.scheduledAt || "") / 60000)) return { value: found };
+      if (!Number.isFinite(want) || want < Date.now() - 60_000) throw new HttpError(400, "予約日時が過去です。編集で日時を直してください。");
+      applyTransition(found, "unschedule");
+      rescheduling = true;
+    }
     const previousScheduledAt = found.scheduledAt;
     if (body.action === "schedule" && body.scheduledAt) {
       found.scheduledAt = normalizePost({ scheduledAt: body.scheduledAt }).scheduledAt;
@@ -6536,11 +6564,13 @@ route("POST", "/api/posts/:id/transition", async ({ params, body }) => {
       // 失敗した予約の日時は残さない（変更前の状態のまま 409 を返す）
       if (previousScheduledAt === undefined) delete found.scheduledAt;
       else found.scheduledAt = previousScheduledAt;
+      if (rescheduling) found.status = "scheduled"; // 予約し直しに失敗したら、解除した予約を元に戻す
       if (!error.safety) throw error;
       noteSafetyBlock(d, found, error.safety, "投稿の" + actionLabel(body.action), { postId: found.id });
       return { value: { blockedError: error } };
     }
     log(d, "info", `投稿を${actionLabel(body.action)}しました。`, { postId: found.id, status: found.status });
+    if (body.action === "approve" && autoScheduleAfterApprove(d, found)) log(d, "info", "自動送信がONのため、承認と同時に予約しました。", { postId: found.id, status: found.status });
     // トピックタグが空のまま承認・予約されるのを、気づかず素通りさせない（弾かず記録に残すだけ）。
     // 2026-09-23: 予約16本が全てtopicTag空のまま予約されていた原因分析(71_原因分析.md)対策。
     if ((body.action === "approve" || body.action === "schedule") && !found.topicTag) {
@@ -6560,6 +6590,7 @@ route("POST", "/api/posts/bulk-approve", async () => {
       if (post.status !== "review" || inFlight.has(post.id)) continue;
       try {
         applyTransition(post, "approve", { safetyContext: { settings: d.settings, posts: d.posts } });
+        autoScheduleAfterApprove(d, post);
         n += 1;
       } catch (error) {
         if (error.safety) noteSafetyBlock(d, post, error.safety, "まとめて承認", { postId: post.id });

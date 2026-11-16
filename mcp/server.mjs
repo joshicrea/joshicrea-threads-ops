@@ -213,7 +213,7 @@ const tools = [
   },
   {
     name: "threads_post_action",
-    description: "投稿の状態を変える。action: approve=承認（利用者が本文を見て承認すると言ったときだけ）, reject=却下, restore=却下から承認待ちへ戻す, schedule=予約（scheduledAt を ISO 8601 で。省略時は次の予約枠）, unschedule=予約解除。",
+    description: "投稿の状態を変える。action: approve=承認（利用者が本文を見て承認すると言ったときだけ。予約の自動送信がONで予約日時が未来なら、承認と同時に予約まで進む）, reject=却下, restore=却下から承認待ちへ戻す, schedule=予約（scheduledAt を ISO 8601 で。省略時は次の予約枠）, unschedule=予約解除。",
     inputSchema: { type: "object", properties: { id: { type: "string" }, action: { type: "string", enum: ["approve", "reject", "restore", "schedule", "unschedule"] }, scheduledAt: { type: "string" } }, required: ["id", "action"], additionalProperties: false },
     run: async ({ id, action, scheduledAt }) => ({ post: briefPost((await api(`/api/posts/${encodeURIComponent(id)}/transition`, { method: "POST", body: { action, scheduledAt } })).post) })
   },
