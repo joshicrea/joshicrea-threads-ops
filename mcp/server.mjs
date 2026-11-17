@@ -16,6 +16,8 @@ import { createInterface } from "node:readline";
 const PORT = Number(process.env.PORT || 4173);
 const BASE = `http://127.0.0.1:${PORT}`;
 const here = dirname(fileURLToPath(import.meta.url));
+// 版数の出どころは package.json の1か所（本体 server.js と同じ）。ここに版数を直書きしない（0.4.3 のまま取り残された・2026-11-17）
+const APP_VERSION = (() => { try { return JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")).version || "0.0.0"; } catch { return "0.0.0"; } })();
 const START_HINT = process.platform === "win32" ? "起動.cmd" : "起動.command";
 
 // threads_update_settings が受け付けるキー。ここに無いもの（accessKey・トークン・API キー等の秘密）は本体へ送らない
@@ -358,7 +360,7 @@ async function handle(msg) {
     return reply(id, {
       protocolVersion: "2025-06-18",
       capabilities: { tools: {} },
-      serverInfo: { name: "threads-ops-assistant", version: "0.4.3" },
+      serverInfo: { name: "threads-ops-assistant", version: APP_VERSION },
       instructions: "Threads運用アシスタント（ローカル常駐サーバー）を操作するツール群。接続したら最初に threads_guide を呼んで指示書を読み、その順で利用者を案内する。続けて threads_status を呼ぶ。承認・公開・返信の送信は利用者が本文を見て明示したときだけ行う。"
     });
   }
