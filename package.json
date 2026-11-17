@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs && python3 test/install_migrate_test.py"
   },
   "engines": {
     "node": ">=20"

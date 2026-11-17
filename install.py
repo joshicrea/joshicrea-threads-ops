@@ -40,6 +40,287 @@ if "--local-source" in sys.argv:
 
 EXCLUDE = {"data", ".git", "node_modules", "test", "Meta審査申請"}
 
+# >>> 1行切り替え（0.4.4）: 旧ZIP版の自動停止と、旧データの自動引っ越し。ここから END までを関数にしてあり、試験はこの区間を取り出して実走する
+import hashlib, json, re as _re2, socket
+def listener_pids(port):
+    pids = set()
+    try:
+        out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=10).stdout
+        pids |= {int(t) for t in out.split() if t.isdigit()}
+    except Exception:
+        pass
+    if not pids and shutil.which("ss"):
+        try:
+            out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True, timeout=10).stdout
+            pids |= {int(m) for m in _re2.findall(r"pid=(\d+)", out)}
+        except Exception:
+            pass
+    return pids
+
+def proc_cmdline(pid):
+    try:
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+def is_threads_node(cmd):
+    # node で動く Threads 本体（server.js か start.js）だけを対象にする。ほかのプログラムは止めない
+    parts = cmd.split()
+    if not parts or os.path.basename(parts[0]) not in ("node", "nodejs"):
+        return False
+    return bool(_re2.search(r"(?:^|[\s/])(?:server|start)\.js(?:\s|$)", cmd))
+
+def stop_pid_if_threads(pid):
+    # server.pid の番号が別のプログラムに使い回されていたら止めない（node で動く server.js / start.js のときだけ SIGTERM）
+    if not is_threads_node(proc_cmdline(pid)):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except Exception:
+        return False
+
+def stop_legacy_listener(port):
+    # ポートを塞いでいるのが全部 Threads 本体のときだけ止める。1つでも別のプログラムなら何も止めない（現行どおり案内して終わる）
+    pids = {p for p in listener_pids(port) if p != os.getpid()}
+    if not pids:
+        return False
+    if not all(is_threads_node(proc_cmdline(p)) for p in pids):
+        return False
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except Exception:
+            pass
+    for _ in range(8):
+        time.sleep(1)
+        if not port_in_use(port):
+            break
+    if port_in_use(port):
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except Exception:
+                pass
+        time.sleep(2)
+    print(f"動いていた旧版を自動で止めました（{len(pids)} 件）")
+    return True
+
+LEGACY_SKIP_DIRS = {"Library", ".claude", ".cache", "node_modules", ".git"}
+# 景子さんのもう1つの口座。旧データの候補に入れず・読まず・複製せず・消さない。試験用の置き場(fixtures)も候補から外す(正本 150分岐手順 第1-1・第3節)
+EXCLUDED_DIR_WORDS = ("keke.pharmacist", "fixtures")
+LEGACY_FOUND = []    # find_legacy_db が見つけた「使える」候補(JSONとして読めて posts を持つもの)。呼ぶたびに作り直す
+LEGACY_BROKEN = []   # 候補のうち JSON として読めなかった・posts が無く判別できなかったもの(分岐E)。呼ぶたびに作り直す
+LEGACY_INCOMPLETE = []   # 探索が尽きなかった理由(時間切れ・読めない場所)。空でなければ「見つからなかった」を「無い」と読まない。呼ぶたびに作り直す
+def _switch_stop(message):
+    # 分岐E・Fで止めるときの共通の出口。先頭は必ず「[切り替え]」。何も書き換えずに終わる
+    print("[切り替え] " + message)
+    sys.exit(1)
+
+def _walk_bases(home, unreadable):
+    # ホームの下。Library は除外するが、iCloud Drive(Library/Mobile Documents)は旧ZIPの置き場になりうるので、別に探す
+    bases = [home]
+    mobile = home / "Library" / "Mobile Documents"
+    if mobile.is_dir():
+        bases.append(mobile)
+    for base in bases:
+        for root, dirs, files in os.walk(base, onerror=unreadable.append):
+            yield base, root, dirs, files
+
+def find_legacy_db(home, data_dir, max_depth=8, budget_sec=60):
+    # ホーム配下・深さ8まで。「_data の下にある db.json」のうち更新時刻が最新のもの。シンボリックリンクはたどらない
+    # 深さの上限で打ち切った場所に threads か _data を含むときは、探索が尽きていない(見つからなくても「無い」と読まない)
+    home = Path(home)
+    best = None
+    t0 = time.time()
+    unreadable = []
+    timed_out = False
+    depth_cut = False
+    del LEGACY_FOUND[:]
+    del LEGACY_BROKEN[:]
+    del LEGACY_INCOMPLETE[:]
+    for base, root, dirs, files in _walk_bases(home, unreadable):
+        rel = Path(root).relative_to(base)
+        if len(rel.parts) < max_depth:
+            dirs[:] = [d for d in dirs if d not in LEGACY_SKIP_DIRS and not any(w in d for w in EXCLUDED_DIR_WORDS)]
+        else:
+            if dirs and not depth_cut and any("threads" in x.lower() or x == "_data" for x in rel.parts):
+                depth_cut = True
+                LEGACY_INCOMPLETE.append(f"深さ {max_depth} より下に探せていない場所があります（例: {root}）")
+            dirs[:] = []
+        if time.time() - t0 > budget_sec:
+            timed_out = True
+            break
+        if "db.json" in files and "_data" in rel.parts:
+            p = Path(root) / "db.json"
+            try:
+                if Path(data_dir) in p.parents:
+                    continue
+                m = p.stat().st_mtime
+                # 別のプログラムの _data/db.json(Jekyll・json-server 等)を拾わない: JSON として読めて posts を持つものだけ
+                # 空ファイルも拾わない(空の _data/db.json だけで止まらない)
+                if p.stat().st_size == 0:
+                    continue
+                body = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(body, dict) or "posts" not in body:
+                    LEGACY_BROKEN.append(p)   # 判別できない中身(posts が無い)も黙って捨てない。別のプログラムのファイルか、以前の版のデータかを、人が見分ける
+                    continue
+            except (OSError, ValueError):
+                LEGACY_BROKEN.append(p)   # 読めない・JSON として壊れている候補は黙って捨てない(分岐E: 呼び出し側が止める)
+                continue
+            LEGACY_FOUND.append((m, p))
+            if best is None or m > best[0]:
+                best = (m, p)
+    if unreadable:
+        LEGACY_INCOMPLETE.append(f"読めない場所 {len(unreadable)} か所")
+        print(f"注意: 読めないフォルダが {len(unreadable)} か所あり、旧データの探索から外れました（Mac は「ターミナル」にフォルダへのアクセスを許可すると探せます）")
+    if timed_out:
+        LEGACY_INCOMPLETE.append(f"{budget_sec} 秒で時間切れ")
+        print(f"注意: 旧データの探索が {budget_sec} 秒で打ち切られました。見つからなかった場合も、旧データが無いとは限りません")
+    return best[1] if best else None
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def db_summary(path):
+    # 件数と有無だけ(引っ越しの前後の照合用)。トークン・許可キー等の値は保持せず、表示もしない
+    body = json.loads(Path(path).read_text(encoding="utf-8"))
+    out = {}
+    for k, v in body.items():
+        if isinstance(v, list):
+            out[k] = len(v)
+        elif isinstance(v, dict):
+            out[k] = "項目%d" % len(v)
+        else:
+            out[k] = "有" if v not in (None, "", 0, False) else "無"
+    posts = body.get("posts")
+    if isinstance(posts, list):
+        c = {}
+        for p in posts:
+            s = str(p.get("status")) if isinstance(p, dict) else "?"
+            c[s] = c.get(s, 0) + 1
+        out["_状態別"] = sorted(c.items())
+    return out
+
+def _broken_legacy_stop():
+    _switch_stop(f"以前の版のデータの候補が JSON として読めませんでした（{len(LEGACY_BROKEN)} か所・例: {LEGACY_BROKEN[0]}）。どれも消したり書き換えたりしていません。この画面の文言をそのまま運営へ送ってください。")
+
+def _incomplete_stop():
+    # 旧データが見つからなかったが、探索が尽きていない(時間切れ・読めない場所)とき。「無い」と読んで新規で進むと、次回から新しい置き場が「有る」になり、旧データは二度と拾われない
+    _switch_stop("旧データを探しきれませんでした（" + "・".join(LEGACY_INCOMPLETE) + "）。旧データが探せなかった場所にあるかもしれないため、新規としては進めずに止めます。データには何も書いていません（db.json も作っていません）。Mac は「ターミナル」にフォルダ（デスクトップ・書類・ダウンロード）へのアクセスを許可してから、同じ1行をもう一度貼ってください。それでも止まるときは、この画面の文言をそのまま運営へ送ってください。")
+
+MIGRATED_MARKER = "migrated-from.sha256"   # 引き継いだ旧データの SHA256 を1行ずつ残す(データ置き場の中)。複製方式で旧データの原本が残るため、同じ1行の再実行を見分ける
+def _has_posts(dst):
+    try:
+        b = json.loads(Path(dst).read_text(encoding="utf-8"))
+        return isinstance(b, dict) and isinstance(b.get("posts"), list) and len(b["posts"]) > 0
+    except (OSError, ValueError):
+        return False
+
+def _already_migrated(data_dir, old):
+    try:
+        return _sha256(old) in (Path(data_dir) / MIGRATED_MARKER).read_text(encoding="utf-8").split()
+    except OSError:
+        return False
+
+def migrate_legacy_data(home, data_dir, keep_current=False):
+    # 新しい置き場に db.json が無い(または空)ときだけ、旧データの db.json を複製する。あるときは絶対に上書きしない。中身と値は表示しない
+    dst = Path(data_dir) / "db.json"
+    if dst.exists() and dst.stat().st_size > 0:
+        # 新しい置き場に有効な db.json が有るとき: ここでは探さず止まらない(止まる判定は stop_if_both_present の1か所だけ。2回探すと、1回目の見落としの後に差し替え済みの状態で止まる)
+        print("[分岐 A] 新しい置き場にデータが既にあるため、旧データの引っ越しは行いません（上書きしません）")
+        return "kept"
+    src = find_legacy_db(home, data_dir)
+    if LEGACY_BROKEN:
+        _broken_legacy_stop()
+    if not src and LEGACY_INCOMPLETE and not keep_current:
+        _incomplete_stop()
+    if not src:
+        print("[分岐 D] 新規適用・データなし。旧データは見つかりませんでした（探した範囲: ホームの下の「_data」フォルダ内・深さ5まで。keke.pharmacist と fixtures は対象外）。許可キーは未設定です（この手順では作らず、探しません）。新規として進めます")
+        return "none"
+    for m_, p_ in sorted(LEGACY_FOUND, key=lambda t: -t[0]):
+        print(f"旧データの候補: {p_} / {p_.stat().st_size} バイト / 更新 {time.strftime('%Y-%m-%d %H:%M', time.localtime(m_))} / ハッシュ先頭16桁 {_sha256(p_)[:16]}")
+    branch = "C" if len(LEGACY_FOUND) > 1 else "B"
+    before = db_summary(src)
+    bak = Path(data_dir).parent / ("db-backup-" + time.strftime("%Y%m%d-%H%M%S") + ".json")   # 切り戻し専用の控え(データ置き場の外・原本は消さない)
+    shutil.copyfile(src, bak)
+    bak.chmod(0o600)
+    tmp = Path(data_dir) / "db.json.migrating"
+    shutil.copyfile(src, tmp)
+    if _sha256(src) != _sha256(tmp):
+        tmp.unlink(missing_ok=True)
+        _switch_stop(f"旧データのコピーが一致しなかったため、引っ越しを取り消しました（コピー元: {src} / ファイル 1 件 / ハッシュ一致 いいえ）。同じ1行をもう一度貼ってください")
+    after = db_summary(tmp)
+    if after != before:
+        tmp.unlink(missing_ok=True)
+        _switch_stop(f"引っ越しの前後で件数が一致しなかったため、引っ越しを取り消しました（コピー元: {src}）。どちらのデータも消したり書き換えたりしていません。この画面の文言をそのまま運営へ送ってください。")
+    if dst.exists() and dst.stat().st_size > 0:
+        tmp.unlink(missing_ok=True)
+        print("新しい置き場にデータが先に作られたため、引っ越しは行いません（上書きしません）")
+        return "kept"
+    os.replace(tmp, dst)
+    dst.chmod(0o600)
+    with open(Path(data_dir) / MIGRATED_MARKER, "a", encoding="utf-8") as mf:
+        mf.write(_sha256(src) + "\n")   # 同じ1行の再実行で「新旧そろい」と取り違えて毎回止まらないための記録(値は入っていない・ハッシュだけ)
+    more = f" / ほかの候補 {len(LEGACY_FOUND) - 1} 件には触れていません" if branch == "C" else ""
+    print(f"[分岐 {branch}] 旧データを引き継ぎました（コピー元: {src} / 控え: {bak} / ファイル 1 件 / ハッシュ一致 はい / 件数の照合 一致{more}）")
+    print(f"件数（値は表示しません）: {before}")
+    return "migrated"
+
+def stop_if_both_present(home, data_dir, keep_current=False):
+    # 新旧のデータがそろっているときは、何も変更しないうちに止まる(本体の差し替え・旧本体の停止より前に1回だけ呼ぶ)。
+    # 運営と確認して今のデータを使い続けると決まった人は --keep-current-data を付けて先へ進む(このとき旧データには触らない)
+    if keep_current:
+        return None
+    dst = Path(data_dir) / "db.json"
+    present = dst.exists() and dst.stat().st_size > 0   # 空ファイルは「ある」と数えない
+    if present:
+        try:
+            json.loads(dst.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _switch_stop(f"今使っているデータ（{dst}）が JSON として読めません。消したり書き換えたりしていません。この時点では、インストールは何も変更していません。この画面の文言をそのまま運営へ送ってください。")
+    # 新しい置き場にデータが有るときの探索は5秒まで(見落としても新しいデータを使って続く・上書きしない)。無いときは、本体の入れ替えの前に全部判定する(60秒)
+    # 「新しいデータが有る」と数えるのは、投稿が1件以上ある、または旧データの引き継ぎ記録がある場合だけ。投稿が空の骨組み(失敗した版・分岐Dで一度起動した後など)は、無いのと同じに厳しく判定する
+    has_data = present and (_has_posts(dst) or (Path(data_dir) / MIGRATED_MARKER).exists())
+    old = find_legacy_db(home, data_dir, budget_sec=5 if has_data else 60)
+    if LEGACY_BROKEN and not has_data:
+        _broken_legacy_stop()
+    if not has_data and not old and LEGACY_INCOMPLETE and not keep_current:
+        _incomplete_stop()
+    if present and old:
+        if _already_migrated(data_dir, old):
+            print("[分岐 A] 以前の版のデータは、すでに今のデータへ引き継ぎ済みです（同じ内容）。続けます")
+            return None
+        st = dst.stat()
+        _switch_stop(f"今使っているデータ（{st.st_size} バイト・更新 {time.strftime('%Y-%m-%d %H:%M', time.localtime(st.st_mtime))}）があり、以前の版のデータも {old} に見つかりました。どちらも消したり書き換えたりしていません。この時点では、インストールは何も変更していません（今動いている本体もそのままです）。どちらのデータを使うか運営が確認しますので、この画面の文言をそのまま運営へ送ってください。")
+    return None
+
+def port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_:
+        s_.settimeout(1)
+        return s_.connect_ex(("127.0.0.1", port)) == 0
+
+def stop_if_port_busy(port=4173, wait=5):
+    # 分岐F: ポートを別のプログラムが使っていたら止める。旧ZIP版(node の server.js / start.js)だけは自動で止めて続行する。別のプログラムには触れない
+    busy = port_in_use(port)
+    for _ in range(wait):
+        if not busy:
+            break
+        time.sleep(1)
+        busy = port_in_use(port)
+    if busy and stop_legacy_listener(port):
+        busy = port_in_use(port)
+    if busy:
+        _switch_stop(f"ポート {port} を、別のプログラムがすでに使っています（以前に ZIP で入れた運用アシスタントが動いている、など）。そのプログラムを止めてから、同じ1行をもう一度貼ってください。ZIP 版なら、起動したときに出た画面を閉じると止まります。")
+# <<< END 1行切り替え
+
+KEEP_CURRENT_DATA = "--keep-current-data" in sys.argv
+stop_if_both_present(HOME_DIR, DATA_DIR, keep_current=KEEP_CURRENT_DATA)
+
 # --- 1. プラグイン本体を取得 ---
 if local_source:
     short_sha = "local-" + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -254,151 +535,19 @@ print(f"本体を配置しました: {APP_DIR}")
 pid_file = DATA_DIR / "server.pid"
 if pid_file.exists():
     try:
-        os.kill(int(pid_file.read_text().strip()), signal.SIGTERM)
-        time.sleep(2)
-        print("動いていた旧版を止めました")
+        if stop_pid_if_threads(int(pid_file.read_text().strip())):
+            time.sleep(2)
+            print("動いていた旧版を止めました")
     except Exception:
         pass
     pid_file.unlink(missing_ok=True)
 
 # 起動の前に、ポート 4173 を別の本体が使っていないか確かめる（以前に ZIP で入れた版が動いていると、
 # 新版は起動できず、古い版の応答を見て成功と出てしまう）。自分の旧版は上で止めたので、待ち受けが残っていれば他人
-import socket
-def port_in_use(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_:
-        s_.settimeout(1)
-        return s_.connect_ex(("127.0.0.1", port)) == 0
-# >>> 1行切り替え（0.4.4）: 旧ZIP版の自動停止と、旧データの自動引っ越し。ここから END までを関数にしてあり、試験はこの区間を取り出して実走する
-import hashlib, re as _re2
-def listener_pids(port):
-    pids = set()
-    try:
-        out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=10).stdout
-        pids |= {int(t) for t in out.split() if t.isdigit()}
-    except Exception:
-        pass
-    if not pids and shutil.which("ss"):
-        try:
-            out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True, timeout=10).stdout
-            pids |= {int(m) for m in _re2.findall(r"pid=(\d+)", out)}
-        except Exception:
-            pass
-    return pids
-
-def proc_cmdline(pid):
-    try:
-        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout.strip()
-    except Exception:
-        return ""
-
-def is_threads_node(cmd):
-    # node で動く Threads 本体（server.js か start.js）だけを対象にする。ほかのプログラムは止めない
-    parts = cmd.split()
-    if not parts or os.path.basename(parts[0]) not in ("node", "nodejs"):
-        return False
-    return bool(_re2.search(r"(?:^|[\s/])(?:server|start)\.js(?:\s|$)", cmd))
-
-def stop_legacy_listener(port):
-    # ポートを塞いでいるのが全部 Threads 本体のときだけ止める。1つでも別のプログラムなら何も止めない（現行どおり案内して終わる）
-    pids = {p for p in listener_pids(port) if p != os.getpid()}
-    if not pids:
-        return False
-    if not all(is_threads_node(proc_cmdline(p)) for p in pids):
-        return False
-    for p in pids:
-        try:
-            os.kill(p, signal.SIGTERM)
-        except Exception:
-            pass
-    for _ in range(8):
-        time.sleep(1)
-        if not port_in_use(port):
-            break
-    if port_in_use(port):
-        for p in pids:
-            try:
-                os.kill(p, signal.SIGKILL)
-            except Exception:
-                pass
-        time.sleep(2)
-    print(f"動いていた旧版を自動で止めました（{len(pids)} 件）")
-    return True
-
-LEGACY_SKIP_DIRS = {"Library", ".claude", ".cache", "node_modules", ".git"}
-def find_legacy_db(home, data_dir, max_depth=5, budget_sec=60):
-    # ホーム配下・深さ5まで。「_data の下にある db.json」のうち更新時刻が最新のもの。シンボリックリンクはたどらない
-    home = Path(home)
-    best = None
-    t0 = time.time()
-    for root, dirs, files in os.walk(home):
-        rel = Path(root).relative_to(home)
-        dirs[:] = [d for d in dirs if d not in LEGACY_SKIP_DIRS] if len(rel.parts) < max_depth else []
-        if time.time() - t0 > budget_sec:
-            break
-        if "db.json" in files and "_data" in rel.parts:
-            p = Path(root) / "db.json"
-            try:
-                if Path(data_dir) in p.parents:
-                    continue
-                m = p.stat().st_mtime
-            except OSError:
-                continue
-            if best is None or m > best[0]:
-                best = (m, p)
-    return best[1] if best else None
-
-def _sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def migrate_legacy_data(home, data_dir):
-    # 新しい置き場に db.json が無いときだけ、旧データの db.json をコピーする。あるときは絶対に上書きしない。中身と値は表示しない
-    dst = Path(data_dir) / "db.json"
-    if dst.exists():
-        print("新しい置き場にデータが既にあるため、旧データの引っ越しは行いません（上書きしません）")
-        return "kept"
-    src = find_legacy_db(home, data_dir)
-    if not src:
-        print("旧データは見つかりませんでした。新規として進めます")
-        return "none"
-    tmp = Path(data_dir) / "db.json.migrating"
-    shutil.copyfile(src, tmp)
-    same = _sha256(src) == _sha256(tmp)
-    if not same:
-        tmp.unlink(missing_ok=True)
-        print(f"旧データのコピーが一致しなかったため、引っ越しを取り消しました（コピー元: {src} / ファイル 1 件 / ハッシュ一致 いいえ）。同じ1行をもう一度貼ってください")
-        sys.exit(1)
-    if dst.exists():
-        tmp.unlink(missing_ok=True)
-        print("新しい置き場にデータが先に作られたため、引っ越しは行いません（上書きしません）")
-        return "kept"
-    os.rename(tmp, dst)
-    dst.chmod(0o600)
-    print(f"旧データを引き継ぎました（コピー元: {src} / ファイル 1 件 / ハッシュ一致 はい）")
-    return "migrated"
-# <<< END 1行切り替え
-
-busy = port_in_use(4173)
-for _ in range(5):
-    if not busy:
-        break
-    time.sleep(1)
-    busy = port_in_use(4173)
-if busy:
-    # 旧ZIP版（node の server.js / start.js）なら自動で止めて続行する。別のプログラムなら止めず、下の案内で終わる
-    if stop_legacy_listener(4173):
-        busy = port_in_use(4173)
-if busy:
-    print()
-    print("ポート 4173 を、別のプログラムがすでに使っています（以前に ZIP で入れた運用アシスタントが動いている、など）。")
-    print("そのプログラムを止めてから、同じ1行をもう一度貼ってください。ZIP 版なら、起動したときに出た画面を閉じると止まります。")
-    sys.exit(1)
+stop_if_port_busy(4173)   # 旧ZIP版（node の server.js / start.js）なら自動で止めて続行。別のプログラムなら止めず「[切り替え]」で始まる案内で終わる（関数は上の区間にある）
 
 # 旧版を止めた後・新版を起動する前に、旧データを引き継ぐ（新しい置き場に db.json が無いときだけ。あれば上書きしない）
-migrate_legacy_data(HOME_DIR, DATA_DIR)
+migrate_legacy_data(HOME_DIR, DATA_DIR, keep_current=KEEP_CURRENT_DATA)
 
 # --- 6. ログイン時の自動起動 ---
 log_path = DATA_DIR / "autostart.log"

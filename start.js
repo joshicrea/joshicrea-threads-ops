@@ -100,6 +100,10 @@ try {
       console.log(`ポート${port}を別のプログラムが使っています。そのプログラムを終了するか、環境変数 PORT で別の番号を指定してください。`);
       await writeStartupErrorLog(error);
     }
+  } else if (error.code === "ELOCKED") {
+    // 同じデータ置き場を別の本体がすでに動かしている（別のポート・別の黒い画面）。異常ではなく、二重起動を止めた正常な動き
+    console.log(error.message);
+    console.log("すでに起動している本体を使ってください。止めるときは 停止.cmd。");
   } else {
     console.error("起動に失敗しました:", error.message);
     if (await writeStartupErrorLog(error)) {

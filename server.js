@@ -15,7 +15,7 @@
 import { createServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { execFile } from "node:child_process";
-import { readFile, writeFile, mkdir, rename, stat, copyFile, unlink, readdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename, stat, copyFile, unlink, readdir, utimes, link } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { existsSync, chmodSync, readFileSync, unlinkSync, readdirSync, statSync } from "node:fs";
@@ -173,8 +173,8 @@ const defaultSettings = {
   writingRules: "断言しすぎない。体験談を起点にする。最後はコメントしやすい問いで終える。",
   defaultCta: "",
   scheduleTimes: ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"],
-  dailyDraftsCount: 0, // 毎日自動で作る下書きの本数（0〜12・0=作らない）。運用代行サロンでは導入のときにお客様ごとに決める。作るのは確認待ち(review)の下書きだけで、承認・予約・自動送信のONはしない
-  dailyDraftsTime: "09:00", // 下書きを作る時刻（JST・HH:mm）。この時刻を過ぎて今日まだ作っていなければ、次の1分ごとの時計で1回作る（止まっていた日の補いも同じ）
+  dailyDraftsCount: 0, // 確認待ち(review)の下書きを常に何本そろえておくか（0〜12・0=作らない）。確認待ちがこの本数を下回ったら、不足分だけ作る。運用代行サロンでは導入のときにお客様ごとに決める。作るのは確認待ちの下書きだけで、承認・予約・自動送信のONはしない
+  dailyDraftsTime: "09:00", // 毎日の下書きを作り始める時刻の目安（JST・HH:mm）。この時刻より前は作らない。この時刻を過ぎたあとは、確認待ちが本数を下回っているときだけ、次の時計で不足分を作る
   dailyDraftsLastDate: "", // 最後に作った日（JST・YYYY-MM-DD）。同じ日に2回作らない判定に使う。画面からは変えない
   dailyDraftsAttemptAt: "", // 最後に作ろうとした時刻。失敗したとき30分あけて再試行するための印。画面からは変えない
   dailyDraftsAttempts: 0, // 上の日に作ろうとした回数。1日4回まで。画面からは変えない
@@ -3521,6 +3521,8 @@ async function recoverPublishing(snapshot) {
 // 外部API呼び出し中はDBロックを持たない（読み取り→外部→書き戻し）。UIが固まらないようにするため。
 // ---------------------------------------------------------------------------
 let schedulerRunning = false;
+// 外から(見張り役が) /api/tick を最後に呼んだ時刻と結果の種類(件数と止まりの理由だけ)。/api/state に出し、止まったのが本体か見張り役かを見分ける。再起動で空に戻る
+let lastExternalTick = null;
 // 試験専用: 同じプロセスで試験が schedulerTick / autoReplyTick を直接呼ぶとき、60秒ごとの裏のティックと重なると結果が揺れる（重なると直接呼んだ方が何もせず戻る）
 let backgroundSchedulerPaused = false;
 
@@ -4772,15 +4774,23 @@ async function licenseTick() {
   });
 }
 
+// 戻り値: 実行したか(ran)と、この1回で公開できた/失敗した予約投稿の件数だけ。POST /api/tick（利用者のAIの見張り役）がそのまま返すので、トークン・本文・エラー文は入れない
 async function schedulerTick() {
-  if (schedulerRunning) return;
+  if (schedulerRunning) return { ran: false, reason: "実行中" };
   schedulerRunning = true;
+  const tickResult = { ran: true, published: 0, failed: 0 };
   try {
     await licenseTick().catch((error) => appendErrorLog(error));
     const snapshot = await readDb();
     const licenseAllowed = licenseDecisionOf(snapshot).allowed;
     const tokenExpiry = Date.parse(snapshot.settings.threadsTokenExpiresAt || "");
     const tokenExpired = Boolean(snapshot.settings.threadsAccessToken) && Boolean(tokenExpiry) && tokenExpiry < Date.now();
+    // 止まりの理由(見張り役が「動いているのに出ない」を見分けるため)。種類の名前だけを入れ、本文・トークン・エラー文は入れない
+    tickResult.blocked = [
+      ...(!snapshot.settings.threadsAccessToken ? ["連携なし"] : []),
+      ...(tokenExpired ? ["連携切れ"] : []),
+      ...(!licenseAllowed ? ["ライセンス停止"] : [])
+    ];
     if (tokenExpired) {
       const lastNotice = Date.parse(snapshot.settings.lastTokenExpiredNoticeAt || "") || 0;
       if (Date.now() - lastNotice > 24 * 60 * 60 * 1000) {
@@ -4922,6 +4932,8 @@ async function schedulerTick() {
             });
           }
         }
+        // 件数は保存が成功したあとに数える(保存に失敗した回を「公開できた」と数えない)
+        let outcome = null;
         await withDb(async (db) => {
           const post = db.posts.find((item) => item.id === postId);
           if (!post) {
@@ -4937,6 +4949,7 @@ async function schedulerTick() {
           delete post.publishing;
           if (result) {
             await markPublished(db, post, result, "予約投稿を公開しました。");
+            outcome = "published";
             delete post.retryAfter;
             delete post.retryCount;
           } else if (classifySendFailure(failure).retryable && !post.sendUncertainAt && (post.retryCount || 0) < SCHEDULE_RETRY_MAX) {
@@ -4945,8 +4958,13 @@ async function schedulerTick() {
             post.retryAfter = new Date(Date.now() + SCHEDULE_RETRY_INTERVAL_MS).toISOString();
             post.error = `${safeSendError(failure).message}（${post.retryCount}回目・10分後に再試行します）`;
             log(db, "error", "予約投稿が一時的に送れませんでした。10分後に限定再試行します。", { postId: post.id, retryCount: post.retryCount, failure: post.sendFailure, diagnostic: diagnosticMeta({ area: "post_publish_rate_limit", endpointKind: failure?.diagnostic?.endpointKind || "unknown", method: failure?.diagnostic?.method || "POST", error: failure, targetId: post.id, transient: true, terminal: false, maybePublished: false }) });
-          } else markPublishError(db, post, failure, "予約投稿に失敗しました。");
+          } else {
+            markPublishError(db, post, failure, "予約投稿に失敗しました。");
+            outcome = "failed";
+          }
         }).finally(() => inFlight.delete(postId));
+        if (outcome === "published") tickResult.published += 1;
+        else if (outcome === "failed") tickResult.failed += 1;
       }
     }
     const expiresAt = Date.parse(snapshot.settings.threadsTokenExpiresAt || "");
@@ -4976,9 +4994,11 @@ async function schedulerTick() {
     if (!tokenExpired) await autoReplyTick();
   } catch (error) {
     await appendErrorLog(error);
+    tickResult.error = true;
   } finally {
     schedulerRunning = false;
   }
+  return tickResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -5331,7 +5351,7 @@ function route(method, pattern, handler) {
   routes.push({ method, pattern, handler });
 }
 
-route("GET", "/api/state", async () => readDbForState().then((entry) => ({ status: 200, body: statePayload(entry.db, entry) })));
+route("GET", "/api/state", async () => readDbForState().then((entry) => ({ status: 200, body: { ...statePayload(entry.db, entry), lastTick: lastExternalTick, schedulerLock: schedulerLockHeld ? "held" : (schedulerLockLost ? "lost" : "starting") } })));
 
 route("GET", "/api/monitoring/status", async () => {
   const db = await readDb();
@@ -6289,9 +6309,9 @@ async function generatePostsHandler({ body, inTx }) {
 route("POST", "/api/generate-posts", generatePostsHandler);
 
 // 毎日の下書き（運用代行サロン）。サーバーが動いている間、1分ごとの時計から呼ぶ。
-// 設定の時刻（JST・既定 09:00）を過ぎていて今日まだ作っていなければ、設定の本数ぶんの下書きを作る。
-// PC が止まっていた日は、起動後の最初の時計で作る（数日分を一度には作らない）。作るのは確認待ち(review)の下書きだけで、
-// 承認・予約・自動送信のONはしない。
+// ストック方式: 確認待ち(review)が設定の本数を下回っていたら、不足分だけ作る。設定の時刻（JST・既定 09:00）は作り始める時刻の目安で、
+// それより前は作らない。PC が止まっていた間の分も、起動後の最初の時計で不足分だけ作る（数日分を一度には作らない）。
+// 作るのは確認待ち(review)の下書きだけで、承認・予約・自動送信のONはしない。
 // 検査: generate-posts と同じ検査（丸写し・質問・安全確認）に加えて、絵文字・長さ・一人称・成果の断言を通す（scripts/daily_refill.py の
 //   同名の検査と同じ判定）。通らなかった下書きは却下して確認待ちに残さない。1回の試行は最大3回の生成まで。
 //   本数に届かなかった日は作成日を進めず、作れた分を同じ日の再試行へ持ち越す（30分あけて・1日4回まで）。
@@ -6323,48 +6343,46 @@ let dailyDraftsRunning = false;
 function jstHm(ms) {
   return new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(ms));
 }
-function dailyDraftsDue(settings, nowMs) {
+// ストック方式: 確認待ち(review)が設定の本数を下回っていたら、不足分だけ作る（reviewing=今の確認待ちの本数）。
+// 時刻(dailyDraftsTime)は「作り始める時刻の目安」で、この時刻より前は作らない。
+function dailyDraftsDue(settings, nowMs, reviewing = 0) {
   const count = Math.min(Math.floor(Number(settings.dailyDraftsCount)) || 0, DAILY_DRAFTS_MAX);
   if (count < 1) return { due: false, reason: "本数が0" };
   const time = String(settings.dailyDraftsTime || "");
   if (!DAILY_DRAFTS_TIME_RE.test(time)) return { due: false, reason: "時刻の形式が正しくない" };
   if (settings.autoStoppedByIdentity) return { due: false, reason: "連携先を確認できず自動停止中" };
   const today = jstYmd(nowMs);
-  if (settings.dailyDraftsLastDate === today) return { due: false, reason: "今日は作成済み" };
   if (jstHm(nowMs) < time) return { due: false, reason: "時刻前" };
+  const need = count - (Number(reviewing) || 0);
+  if (need < 1) return { due: false, reason: "確認待ちが本数以上" };
   const attemptMs = Date.parse(settings.dailyDraftsAttemptAt || "") || 0;
   const sameDay = Boolean(attemptMs) && jstYmd(attemptMs) === today;
   if (sameDay) {
     if ((Number(settings.dailyDraftsAttempts) || 0) >= DAILY_DRAFTS_MAX_ATTEMPTS) return { due: false, reason: "今日は4回試して作れなかった" };
     if (nowMs >= attemptMs && nowMs - attemptMs < DAILY_DRAFTS_RETRY_MS) return { due: false, reason: "再試行は30分あける" };
   }
-  return { due: true, reason: "", count, today, attemptsBefore: sameDay ? Number(settings.dailyDraftsAttempts) || 0 : 0, keptBefore: sameDay ? Number(settings.dailyDraftsKept) || 0 : 0 };
+  return { due: true, reason: "", count, need, today, attemptsBefore: sameDay ? Number(settings.dailyDraftsAttempts) || 0 : 0 };
 }
 async function dailyDraftsTick(nowMs = Date.now()) {
   if (dailyDraftsRunning) return { ran: false, reason: "実行中" };
   dailyDraftsRunning = true;
   try {
     const db = await readDb();
-    const due = dailyDraftsDue(db.settings, nowMs);
-    if (!due.due) return { ran: false, reason: due.reason };
-    // 積み上がり防止: 確認待ちが 本数×3 以上なら、その時計では作らない（AI も呼ばない）。作成日は進めず、減ったら次の時計で作る
-    const cap = due.count * DAILY_DRAFTS_REVIEW_CAP_RATIO;
+    // ストック方式: 確認待ちが本数を下回るときだけ、不足分を作る。確認待ちが本数以上なら AI も呼ばない
+    // （本数×3 の積み上がり上限は、本数以上で作らないこの判定が包んでいる）
     const reviewing = db.posts.filter((p) => p.status === "review").length;
-    if (reviewing >= cap) {
-      const note = `確認待ちが${reviewing}本あり、上限${cap}本（本数${due.count}×${DAILY_DRAFTS_REVIEW_CAP_RATIO}）以上のため、毎日の下書きを作っていません。承認か却下で減らすと作ります。`;
-      if (db.settings.dailyDraftsLastSkip !== note) await withDb(async (d) => { d.settings.dailyDraftsLastSkip = note; });
-      return { ran: false, reason: "確認待ちが上限" };
-    }
+    const due = dailyDraftsDue(db.settings, nowMs, reviewing);
+    if (!due.due) return { ran: false, reason: due.reason };
     // AI を呼ぶ前に試行を記録する（AI が固まっても、毎分くり返さない）
     await withDb(async (d) => {
       d.settings.dailyDraftsAttemptAt = new Date(nowMs).toISOString();
       d.settings.dailyDraftsAttempts = due.attemptsBefore + 1;
-      d.settings.dailyDraftsKept = due.keptBefore;
+      d.settings.dailyDraftsKept = 0;
     });
     let keptNow = 0;
     let aiError = "";
     const rejectedReasons = [];
-    for (let round = 0; round < DAILY_DRAFTS_MAX_ROUNDS && due.keptBefore + keptNow < due.count; round++) {
+    for (let round = 0; round < DAILY_DRAFTS_MAX_ROUNDS && keptNow < due.need; round++) {
       // 作成・検査での却下・持ち越し本数(Kept)の更新は、下書きを保存する同じ書き込みの中で行う（途中で止まっても記録がずれない）
       const roundBad = [];
       let roundGood = 0;
@@ -6376,10 +6394,10 @@ async function dailyDraftsTick(nowMs = Date.now()) {
             applyTransition(post, "reject", { reason: `毎日の下書きの検査: ${reason}` });
           } else roundGood++;
         }
-        d.settings.dailyDraftsKept = due.keptBefore + keptNow + roundGood;
+        d.settings.dailyDraftsKept = keptNow + roundGood;
       };
       try {
-        await generatePostsHandler({ body: { count: due.count - due.keptBefore - keptNow, goal: DAILY_DRAFTS_GOAL }, inTx });
+        await generatePostsHandler({ body: { count: due.need - keptNow, goal: DAILY_DRAFTS_GOAL }, inTx });
       } catch (error) {
         aiError = String(error?.message || error).slice(0, 200);
         break;
@@ -6387,17 +6405,20 @@ async function dailyDraftsTick(nowMs = Date.now()) {
       keptNow += roundGood;
       rejectedReasons.push(...roundBad);
     }
-    const kept = due.keptBefore + keptNow;
-    const done = kept >= due.count;
+    const kept = keptNow;
+    const done = kept >= due.need;
     await withDb(async (d) => {
       d.settings.dailyDraftsKept = kept;
       if (done) {
+        // 不足分を作り終えた: 試行の印を戻す（同じ日にあとで不足が出ても、4回の上限に数えない）
         d.settings.dailyDraftsLastDate = due.today;
         d.settings.dailyDraftsLastSkip = "";
-        log(d, "info", `毎日の下書きを${kept}本作りました（確認待ち・設定は${due.count}本）。`, { kept, count: due.count });
+        d.settings.dailyDraftsAttemptAt = "";
+        d.settings.dailyDraftsAttempts = 0;
+        log(d, "info", `毎日の下書きの不足分を${kept}本作りました（確認待ちは設定の${due.count}本にそろいました）。`, { kept, count: due.count });
       } else {
         const why = aiError ? `AIの呼び出しに失敗（${aiError}）` : `検査に通らず${rejectedReasons.length}本を却下（${[...new Set(rejectedReasons)].join("・")}）`;
-        log(d, "error", `毎日の下書きが本数に届きませんでした（${due.attemptsBefore + 1}回目・${kept}/${due.count}本）: ${why}`);
+        log(d, "error", `毎日の下書きが不足分に届きませんでした（${due.attemptsBefore + 1}回目・${kept}/${due.need}本）: ${why}`);
       }
     });
     return done ? { ran: true, created: keptNow } : { ran: true, created: keptNow, error: aiError || "検査に通る下書きが足りない" };
@@ -6737,6 +6758,26 @@ route("POST", "/api/posts/:id/publish", async ({ params }) => {
 });
 
 // --- インサイト・返信 ---
+// 外から「1回分の tick」を呼ぶ入口（利用者のAIのスケジュールが見張り役として呼ぶ）。
+// 返すのは実行の有無と件数だけ。トークン・本文・エラー文は返さない。認証は全APIと同じ（アクセスキー設定時は x-threads-key 必須）。
+// 重なった呼び出しは何もせず「実行中」を返す（schedulerTick・dailyDraftsTick の入口の印）
+route("POST", "/api/tick", async () => {
+  // 定期処理(60秒の時計)と同じく、動かす直前に錠を確かめ直す。メモリ上の「持っている」は最大60秒古く、奪われた直後に呼ばれると二重に出る(第3周 同種1)
+  await touchSchedulerLock();
+  // 錠を取る前(2つ目の本体が待ち受けだけ始めた間)に呼ばれても、定期処理は動かさない(二重送信の窓を作らない)
+  if (!schedulerLockHeld && schedulerLockLost) return { status: 503, body: { ok: false, error: "同じデータ置き場を別の本体が使っているため、この本体は定期処理を止めています。錠が空けば自動で再開します。続くときは本体を1つだけにしてください。", reason: "lock-lost" } };
+  if (!schedulerLockHeld) return { status: 503, body: { ok: false, error: "起動の途中です。少し待ってからもう一度呼んでください。", reason: "starting" } };
+  const scheduler = await schedulerTick();
+  lastExternalTick = { at: nowIso(), ran: Boolean(scheduler?.ran), published: Number(scheduler?.published) || 0, failed: Number(scheduler?.failed) || 0, blocked: Array.isArray(scheduler?.blocked) ? scheduler.blocked : [] };
+  let dailyDrafts;
+  try {
+    const r = await dailyDraftsTick();
+    dailyDrafts = { ran: Boolean(r?.ran), created: Number(r?.created) || 0, ...(r?.reason ? { reason: String(r.reason) } : {}), ...(r?.error ? { error: true } : {}) };
+  } catch {
+    dailyDrafts = { ran: false, error: true };
+  }
+  return { status: 200, body: { ok: true, scheduler, dailyDrafts } };
+});
 route("POST", "/api/refresh-insights", async () => {
   const snapshot = await readDb();
   if (!snapshot.posts.some((post) => post.status === "published" && post.threadsId)) throw new HttpError(400, "公開済みの投稿がまだありません。");
@@ -7155,7 +7196,8 @@ export const _internals = {
   draftRepliesBatch, pickAiFailedForRecovery, recoverAiFailedReplies, REPLY_AI_RECOVERY_EVERY_MS, schedulerTick, assignSchedule, sanitizeSettings, applyTransition, normalizePost, readDb, withDb,
   licenseTick, licenseDecisionOf, holdPastDueScheduled, applyLicenseHold, assertLicenseAllows, sendAutoReplies, applyLicenseSettingsChange, releaseHoldIfRescheduled,
   setDbWriteHook: (fn) => { dbWriteHook = fn; },
-  pauseBackgroundScheduler: () => { backgroundSchedulerPaused = true; } };
+  pauseBackgroundScheduler: () => { backgroundSchedulerPaused = true; },
+  touchSchedulerLock: () => touchSchedulerLock(), schedulerLockHeldNow: () => schedulerLockHeld, restoreSchedulerLockForTest: () => { schedulerLockHeld = true; schedulerLockLost = false; } };
 
 // 自己署名証明書（localhost・10年）。openssl が無ければ https は立てず、手動トークン運用を案内する。
 function findOpenssl() {
@@ -7220,8 +7262,104 @@ async function cleanupTmpFiles() {
   } catch { /* data/ が無いときは何もしない */ }
 }
 
+// 同じデータ置き場を2つのプロセスが同時に動かすと、予約投稿を両方が取って二重に出しうる（schedulerRunning・inFlight・withDb はプロセス内の変数）。
+// 置き場に scheduler.lock（持ち主のPID）を置き、生きている別の持ち主がいれば起動しない。持ち主が死んでいる/10分更新されない錠は外して取り直す。
+// 原理的に取りこぼす型: 持ち主が固まって10分以上更新できないまま生きていて、後から別の本体が錠を奪った場合（両方が動く）。PIDの使い回しは更新時刻で外す。
+const SCHEDULER_LOCK_STALE_MS = 10 * 60_000;
+const STARTUP_TICK_DELAY_MS = Number(process.env.THREADS_STARTUP_TICK_DELAY_MS ?? 5000);
+let schedulerLockPath = "";
+let schedulerLockHeld = false;
+let schedulerLockLost = false; // 一度は錠を持っていたが、別の本体に取られた(起動の途中と見分ける)
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === "EPERM"; }
+}
+function releaseSchedulerLockSync() {
+  if (!schedulerLockPath) return;
+  try {
+    if (JSON.parse(readFileSync(schedulerLockPath, "utf8")).pid === process.pid) unlinkSync(schedulerLockPath);
+  } catch { /* 無い・他人の錠なら何もしない */ }
+}
+// 錠は「中身を書き終えた一時ファイルを link で置く」形で作る(作った瞬間に中身が揃う。wx で作ってから書くと、その間に読んだ側が空の錠を壊れた印と誤読して消す)。
+// link が使えない置き場(ハードリンク非対応)だけ、従来の wx 書き込みに戻す。
+async function createLockFileAtomically(path) {
+  const body = JSON.stringify({ pid: process.pid, startedAt: nowIso() });
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, body, "utf8");
+  try {
+    await link(tmp, path);
+  } catch (error) {
+    if (error.code === "EEXIST") throw error;
+    await writeFile(path, body, { flag: "wx" }); // link が使えない置き場
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}
+async function acquireSchedulerLock() {
+  const path = join(DATA_DIR, "scheduler.lock");
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await createLockFileAtomically(path);
+      schedulerLockPath = path;
+      schedulerLockHeld = true;
+      process.once("exit", releaseSchedulerLockSync);
+      return;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    let owner = null;
+    let ageMs = Infinity;
+    let rawRead = null;
+    try {
+      rawRead = await readFile(path, "utf8");
+      owner = JSON.parse(rawRead);
+      ageMs = Date.now() - (await stat(path)).mtimeMs;
+    } catch { /* 読めない・消えた錠は、壊れた印として外して取り直す */ }
+    if (owner && Number.isInteger(owner.pid) && pidAlive(owner.pid) && ageMs < SCHEDULER_LOCK_STALE_MS) {
+      if (owner.pid === process.pid) { schedulerLockPath = path; schedulerLockHeld = true; return; } // 同じプロセスの2回目の startServer（試験）
+      const error = new Error(`同じデータ置き場を、すでに別の本体（PID ${owner.pid}）が使っています。二重に動かすと予約投稿が二重に出るため、この本体は起動しません。`);
+      error.code = "ELOCKED";
+      throw error;
+    }
+    // 外す前に、読んだときと同じ中身か確かめる(別の本体が先に取り直した新しい錠を消さない)。確かめた直後の入れ替わりは残る(原理的に取りこぼす型)
+    const nowRaw = await readFile(path, "utf8").catch(() => null);
+    if (nowRaw !== rawRead) continue;
+    await unlink(path).catch(() => {});
+  }
+  const error = new Error("scheduler.lock を取得できませんでした。");
+  error.code = "ELOCKED";
+  throw error;
+}
+async function touchSchedulerLock() {
+  if (!schedulerLockPath) return;
+  // 持ち主が自分のときだけ更新時刻を延ばす(錠を奪われたあとに、他人の錠を生かし続けない)
+  const ownerPid = await readFile(schedulerLockPath, "utf8").then((t) => JSON.parse(t).pid).catch(() => null);
+  if (ownerPid !== process.pid) {
+    // 錠が別の本体に取られた(または消えた): この本体は定期処理と /api/tick を止める(二重送信を防ぐ)。止めたことはエラーログに残す
+    if (schedulerLockHeld) {
+      schedulerLockHeld = false;
+      schedulerLockLost = true;
+      appendErrorLog(new Error("scheduler.lock が別の本体に取られたため、この本体は予約投稿などの定期処理を止めました。錠が空けば自動で取り直して再開します。"));
+    }
+    // 錠が消えた・持ち主が止まった・10分更新されない錠なら取り直す(生きている別の本体の新しい錠は取らず、ELOCKED で何もしない)
+    try {
+      await acquireSchedulerLock();
+    } catch {
+      return;
+    }
+  }
+  if (!schedulerLockHeld || schedulerLockLost) {
+    schedulerLockHeld = true;
+    schedulerLockLost = false;
+    appendErrorLog(new Error("scheduler.lock を取り戻したため、予約投稿などの定期処理を再開しました。"));
+  }
+  const now = new Date();
+  await utimes(schedulerLockPath, now, now).catch(() => {});
+}
+
 export async function startServer(port = PORT, host = HOST) {
   await mkdir(DATA_DIR, { recursive: true });
+  // 錠を最初に取る(データに触る処理より前)。錠を取れない2つ目の本体は、1つ目の一時ファイルや db.json に触らずに止まる
+  await acquireSchedulerLock();
   await cleanupTmpFiles();
   await readDb();
   if (process.env.THREADS_ACCESS_KEY) {
@@ -7237,24 +7375,40 @@ export async function startServer(port = PORT, host = HOST) {
     throw new Error("外へ公開する形（HOST が 127.0.0.1 以外、または THREADS_PUBLIC_ORIGIN あり）では、アクセスキーが必要です。環境変数 THREADS_ACCESS_KEY（8文字以上）を設定して起動してください。");
   }
   recordMonitoringHeartbeat().catch((error) => appendErrorLog(error));
-  const timer = setInterval(() => { if (!backgroundSchedulerPaused) { schedulerTick(); dailyDraftsTick().catch((error) => appendErrorLog(error)); } }, 60_000);
+  const timer = setInterval(async () => { await touchSchedulerLock(); if (!backgroundSchedulerPaused && schedulerLockHeld) { schedulerTick(); dailyDraftsTick().catch((error) => appendErrorLog(error)); } }, 60_000);
   const monitoringTimer = setInterval(() => { recordMonitoringHeartbeat().catch((error) => appendErrorLog(error)); }, MONITORING_HEARTBEAT_INTERVAL_MS);
   timer.unref();
   monitoringTimer.unref();
   server.requestTimeout = 300_000;
   listeningPort = port;
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, host, () => {
-      writeFile(join(DATA_DIR, "server-ready.txt"), `http://localhost:${port}\n${nowIso()}\n`, "utf8").catch(() => {});
-      writeFile(join(DATA_DIR, "server.pid"), `${process.pid}\n`, "utf8").catch(() => {}); // 停止.cmd が読む
-      const removePid = () => { try { unlinkSync(join(DATA_DIR, "server.pid")); } catch { /* 無ければ何もしない */ } };
-      process.once("SIGINT", () => { removePid(); process.exit(0); });
-      process.once("SIGTERM", () => { removePid(); process.exit(0); });
-      process.once("exit", removePid);
-      resolve();
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, () => resolve());
     });
-  });
+  } catch (error) {
+    // 待ち受けに失敗(ポート使用中など): 取った錠を外して止まる(錠を残すと、次の起動が10分止まる)
+    clearInterval(timer);
+    clearInterval(monitoringTimer);
+    releaseSchedulerLockSync();
+    schedulerLockHeld = false;
+    throw error;
+  }
+  // server-ready.txt と server.pid は錠を取ったあとに書く(錠を取れずに止まる2つ目の本体が、動いている1つ目の印を上書き・削除しない)
+  writeFile(join(DATA_DIR, "server-ready.txt"), `http://localhost:${port}\n${nowIso()}\n`, "utf8").catch(() => {});
+  writeFile(join(DATA_DIR, "server.pid"), `${process.pid}\n`, "utf8").catch(() => {}); // 停止.cmd が読む
+  const removePid = () => { try { unlinkSync(join(DATA_DIR, "server.pid")); } catch { /* 無ければ何もしない */ } };
+  process.once("SIGINT", () => { removePid(); process.exit(0); });
+  process.once("SIGTERM", () => { removePid(); process.exit(0); });
+  process.once("exit", removePid);
+  // 起動直後に1回 tick する（利用者のAIが「動いていなければ起動して1回 tick」する形で、最初の60秒待ちで取りこぼさない）。停止中の試験では走らない
+  const startupTick = setTimeout(async () => {
+    await touchSchedulerLock(); // 定期処理と同じく、動かす直前に錠を確かめ直す(第3周 同種1)
+    if (backgroundSchedulerPaused || !schedulerLockHeld) return;
+    schedulerTick();
+    dailyDraftsTick().catch((error) => appendErrorLog(error));
+  }, STARTUP_TICK_DELAY_MS);
+  startupTick.unref();
   const https = await startHttps(host);
   if (https) {
     const closeOriginal = server.close.bind(server);
