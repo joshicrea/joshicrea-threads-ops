@@ -7,3 +7,9 @@ backups/
 .fixtures-*/
 *.pid
 server-ready.txt
+Microsoft/
+relay/Microsoft/
+/{}
+/shot_ui.py
+配布準備_知人向け_2026-10-04/**/*.zip
+配布準備_知人向け_2026-10-04/*.zip

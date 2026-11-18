@@ -26,6 +26,10 @@ if platform.system() == "Darwin":
     subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
     if plist.exists():
         plist.unlink()
+    wd_plist = HOME / "Library" / "LaunchAgents" / "com.joshicrea.threads-ops-watchdog.plist"
+    subprocess.run(["launchctl", "unload", str(wd_plist)], capture_output=True)
+    if wd_plist.exists():
+        wd_plist.unlink()
 else:
     subprocess.run(["systemctl", "--user", "disable", "--now", "threads-ops"], capture_output=True)
     unit = HOME / ".config" / "systemd" / "user" / "threads-ops.service"

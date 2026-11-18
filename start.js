@@ -3,7 +3,7 @@
 // 同じフォルダに threads-ops.env（KEY=VALUE・1行1件）があれば、未設定の環境変数だけそこから補う。
 // プラグイン配布ではデータの置き場所（THREADS_DATA_DIR）をここで渡す。
 import { exec } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { setPriority, constants as osConstants } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,6 +88,8 @@ try {
   appendLifecycle("start-attempt");
   await startServer(port);
   appendLifecycle("start-listening");
+  // 利用者が「停止」で止めたときの印(見張り役が起こし直さないための印)は、本体が起動したら消す。ログイン時の自動起動で戻るのは従来どおり
+  try { unlinkSync(join(dataDir, "watchdog.stopped")); } catch { /* 印が無ければ何もしない */ }
 } catch (error) {
   process.exitCode = 1;
   appendLifecycle("start-error", { code: error.code || "", message: String(error.message || "").slice(0, 200) });

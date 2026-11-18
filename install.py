@@ -506,7 +506,7 @@ except Exception as e:
     print(f"注意: Codex への登録に失敗しました（Claude Code の方は使えます）: {e}")
 
 # --- 5. 本体を安定した場所へ配置。データは別フォルダ ---
-for name in ["server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "package.json", "public", "README.md", "relay", "uninstall.py", "アンインストール.md"]:
+for name in ["server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "watchdog.js", "package.json", "public", "README.md", "relay", "uninstall.py", "アンインストール.md"]:
     src = install_path / name
     if not src.exists():
         continue
@@ -524,7 +524,7 @@ start_sh = APP_DIR / "起動.command"
 start_sh.write_text(f'#!/bin/bash\ncd "{APP_DIR}"\nTHREADS_NO_BROWSER= "{node_path}" start.js\n', encoding="utf-8")
 start_sh.chmod(0o755)
 stop_sh = APP_DIR / "停止.command"
-stop_sh.write_text(f'#!/bin/bash\nif [ -f "{DATA_DIR}/server.pid" ]; then kill "$(cat "{DATA_DIR}/server.pid")" && echo "止めました"; else echo "起動していません"; fi\n', encoding="utf-8")
+stop_sh.write_text(f'#!/bin/bash\n# 見張り役が起こし直さないための印。本体が次に起動したとき start.js が消す\ntouch "{DATA_DIR}/watchdog.stopped"\nif [ -f "{DATA_DIR}/server.pid" ]; then kill "$(cat "{DATA_DIR}/server.pid")" && echo "止めました"; else echo "起動していません"; fi\n', encoding="utf-8")
 stop_sh.chmod(0o755)
 uninst_sh = APP_DIR / "アンインストール.command"
 uninst_sh.write_text(f'#!/bin/bash\n"{sys.executable}" "{APP_DIR}/uninstall.py"\n', encoding="utf-8")
@@ -571,6 +571,35 @@ if platform.system() == "Darwin":
     subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
     subprocess.run(["launchctl", "load", str(plist)], capture_output=True)
     print("自動起動を登録しました（launchd）")
+    # 見張り役: 5分ごとに本体の様子を見る別ジョブ。本体が固まって応答しなくなったとき（launchd の KeepAlive は異常終了しか拾えない）、
+    # 応答なしが2回続いたら launchctl kickstart で起こし直す。起こし直しはシェルを通さず、実行ファイルと引数の配列で渡す
+    wd_plist = plist_dir / "com.joshicrea.threads-ops-watchdog.plist"
+    # plist は文字列を手で組まず plistlib で書く（パスに & や < が入っても壊れない）。ユーザー番号は焼き込まず、見張り役が実行時に {uid} を置き換える。
+    # 待ち受けが無いときは動いていれば何もしない起こし方（-k なし）、固まっているときだけ -k で殺して起こす
+    import plistlib
+    _label = "com.joshicrea.threads-ops"
+    wd_plist.write_bytes(plistlib.dumps({
+        "Label": "com.joshicrea.threads-ops-watchdog",
+        "ProgramArguments": [str(node_path), f"{APP_DIR}/watchdog.js"],
+        "WorkingDirectory": str(APP_DIR),
+        "EnvironmentVariables": {
+            "THREADS_DATA_DIR": str(DATA_DIR),
+            "WATCHDOG_RESTART_BIN": "/bin/launchctl",
+            "WATCHDOG_RESTART_ARGS": json.dumps(["kickstart", f"gui/{{uid}}/{_label}"]),
+            "WATCHDOG_RESTART_ARGS_HUNG": json.dumps(["kickstart", "-k", f"gui/{{uid}}/{_label}"]),
+        },
+        "StartInterval": 300,
+        "StandardOutPath": f"{DATA_DIR}/watchdog.out.log",
+        "StandardErrorPath": f"{DATA_DIR}/watchdog.out.log",
+    }))
+    subprocess.run(["launchctl", "unload", str(wd_plist)], capture_output=True)
+    subprocess.run(["launchctl", "load", str(wd_plist)], capture_output=True)
+    # 登録できたかを launchctl の一覧で確かめてから知らせる（書いただけで「登録しました」と出さない）
+    _listed = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+    if "com.joshicrea.threads-ops-watchdog" in _listed:
+        print("見張り役を登録しました（5分ごとに本体の様子を見て、固まっていれば起こし直します）")
+    else:
+        print("注意: 見張り役の登録を確認できませんでした。本体は使えますが、固まったときの自動の起こし直しは効きません。運営へこの画面の文言をそのまま送ってください。")
 else:
     unit_dir = HOME_DIR / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
