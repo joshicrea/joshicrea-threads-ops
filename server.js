@@ -112,6 +112,7 @@ const HOSTED_DEFAULT_SCOPES = "threads_basic,threads_content_publish,threads_rea
 // 方式Bの利用者か（loadDb のたびに更新）。権限エラーの案内を、アプリを持たないお客様向けに切り替えるのに使う
 let hostedOAuthInUse = false;
 
+const AI_PROVIDER_CHOICES = ["claude-code", "gemini", "codex"]; // 設定画面の選択肢（public/index.html の #aiProvider と一致させる）
 const defaultSettings = {
   aiProvider: "claude-code", // 既定は利用者のPCの Claude Code（APIキー不要。プラグイン配布の前提が Claude Code のため）
   claudeModel: "sonnet",
@@ -331,6 +332,9 @@ async function loadDb() {
   const db = { ...structuredClone(defaultDb), ...raw };
   db.schemaVersion = SCHEMA_VERSION;
   db.settings = { ...defaultSettings, ...(raw.settings || {}) };
+  // 設定画面の選択肢に無いAIプロバイダ（廃止した claude-api・不正な値）が保存されていたら、既定の claude-code へ寄せて読み込む（2026-11-19 林さん指示・REQ-1810）。
+  // 読み込んだ値だけを寄せ、キー（anthropicApiKey 等）の値と保存先は変えない
+  if (!AI_PROVIDER_CHOICES.includes(db.settings.aiProvider)) db.settings.aiProvider = defaultSettings.aiProvider;
   // アカバン防止ガードの既定ONは新規（投稿0件）だけに入れる。鍵の無い既存データ（投稿が1件でもある＝公開前で予約だけの稼働中も含む）はOFFにし、
   // 1回だけ鍵を書いて保存する（本人の確認なしに新しい既定を入れない・2026-10-21 破壊検証の致命傷2・弱点9）
   let safetyMigrated = false;
@@ -5114,7 +5118,7 @@ function sanitizeSettings(current, rawInput) {
     if (!(key in input)) continue;
     const value = input[key];
     if (key === "aiProvider") {
-      if (!["gemini", "claude-code", "claude-api", "codex"].includes(value)) throw new HttpError(400, `AIプロバイダの値が不正です: ${value}`);
+      if (!AI_PROVIDER_CHOICES.includes(value)) throw new HttpError(400, `AIプロバイダの値が不正です: ${value}`);
       next.aiProvider = value;
       continue;
     }

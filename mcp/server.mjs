@@ -20,7 +20,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 // 読めなかったときは「0.0.0」に落ちるが、利用者からは版数の誤りに見えるだけなので、標準エラー出力(通信路の標準出力とは別)に理由を1行だけ残す
 const APP_VERSION = (() => {
   try { return JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")).version || "0.0.0"; }
-  catch { process.stderr.write("[threads-ops-mcp] package.json を読めないため版数を 0.0.0 としました。mcp フォルダが本体フォルダの直下にあるか確認してください\n"); return "0.0.0"; }
+  catch { process.stderr.on("error", () => {}); process.stderr.write("[threads-ops-mcp] package.json を読めないため版数を 0.0.0 としました。mcp フォルダが本体フォルダの直下にあるか確認してください\n"); return "0.0.0"; }
 })();
 const START_HINT = process.platform === "win32" ? "起動.cmd" : "起動.command";
 
