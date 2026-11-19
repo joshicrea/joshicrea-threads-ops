@@ -178,7 +178,7 @@
               <div class="form-grid">
                 <label class="wide">キーワード<input id="researchKeyword" placeholder="例: ハンドメイド 集客 トレンド 2026" /></label>
               </div>
-              <p class="notice">Web検索で参照元候補を集めます（Gemini は Google検索、Claude Code / Codex は各自の Web検索。Claude API では使えません）。チェックした参照元は投稿生成で「事実の根拠」として渡されます。</p>
+              <p class="notice">Web検索で参照元候補を集めます（Gemini は Google検索、Claude Code / Codex は各自の Web検索。Muse を選んでいるときは使えません）。チェックした参照元は投稿生成で「事実の根拠」として渡されます。</p>
             </div>
             <div class="panel">
               <div class="panel-head"><h3>参照元の候補 <span class="count-chip" id="srcSelectedCount"></span></h3></div>
@@ -304,8 +304,9 @@
               <label>AIプロバイダ
                 <select id="aiProvider">
                   <option value="claude-code">Claude Code</option>
-                  <option value="gemini">Gemini API（Google AI Studio のキー）</option>
+                  <option value="muse">Muse</option>
                   <option value="codex">Codex CLI</option>
+                  <option value="gemini">Gemini API（Google AI Studio のキー）</option>
                 </select>
               </label>
               <label data-provider="claude-code">Claude Code のモデル
@@ -319,8 +320,6 @@
               <label data-provider="gemini">Gemini APIキー<input id="geminiApiKey" type="password" autocomplete="off" placeholder="AIza..." /></label>
               <label data-provider="gemini">Gemini モデル<input id="geminiModel" placeholder="自動選択" /></label>
               <label class="toggle-row" data-provider="gemini"><input id="geminiModelAuto" type="checkbox" /> モデルを自動で選ぶ（無料枠で詰まりにくい Flash Lite 系を優先）</label>
-              <label data-provider="claude-api">Claude APIキー<input id="anthropicApiKey" type="password" autocomplete="off" placeholder="sk-ant-..." /></label>
-              <label data-provider="claude-api">Claude モデル<input id="anthropicModel" placeholder="claude-sonnet-5" /></label>
             </div>
             <div class="row-actions" data-provider="gemini">
               <button class="button secondary" id="autoGeminiModelBtn">モデル一覧を取得して自動選択</button>
@@ -329,8 +328,12 @@
             <p class="notice" data-provider="claude-code">このPCにインストール済みの Claude Code を裏で呼びます。Claude Code でログイン済みなら追加設定は不要です。利用量は Claude の契約枠から消費されます。</p>
             <p class="notice" data-provider="codex">このPCにインストール済みの Codex CLI（OpenAI）を裏で呼びます。ターミナルで <code>codex</code> を起動して ChatGPT アカウントでログイン済みなら追加設定は不要です。利用量は ChatGPT の契約枠から消費されます（1回あたり Claude Code より多め）。Webで集めた参考・参考投稿の Web検索も使えます。</p>
             <p class="notice" data-provider="gemini">無料枠には1分あたり・1日あたりの回数制限があります。上限に達すると自動で待って再試行しますが、続けて使う場合はGoogle AI Studioで課金設定を入れてください。</p>
-            <p class="notice" data-provider="claude-api">Webで集めた参考の検索（Google検索）は Claude API では使えません。参考投稿のThreads検索・手動貼り付けは使えます。</p>
+            <p class="notice" data-provider="muse">文章は、お客様ご自身の Muse が作ります。このツールは文章を作りません。
+              Muse が作った投稿案は、ここで内容を確認して承認してから公開されます。Muse が作った返信文も、自動では送られません。内容を確認して送信を押してください。このため、下の「AIが判定して自動で返信する」と「毎日の下書き」の設定は、Muse のときは動きません。
+              予約した投稿の公開と、Threads 連携の更新は、このツールが自分で行います。
+              Muse 側の設定として、Muse に「15分ごとに、このツール（この画面と同じアドレス）へ POST /api/tick を送る」予定を入れてください。送るときは、ヘッダ x-threads-ops: 1 と x-threads-caller: muse を付けます（アクセスキーを設定している場合は x-threads-key も）。呼ばれた時刻がここの「接続テスト」に出ます。まだ呼ばれていない間は「Muse からの接続待ち」と出ます。</p>
             <p class="notice inline" id="researchProviderNote"></p>
+            <p class="notice" id="providerMigratedNote" hidden><span id="providerMigratedText"></span> <button class="button secondary" id="providerMigratedAckBtn" type="button">確認した</button></p>
           </div>
 
           <div class="panel">

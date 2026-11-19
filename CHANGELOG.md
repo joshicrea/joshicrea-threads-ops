@@ -1,8 +1,16 @@
 # CHANGELOG
 
+## 0.4.11 (2026-11-19)
+- 設定画面の AI プロバイダの選択肢を、Claude Code・Muse・Codex CLI・Gemini API の4つにした(0.4.10 では Muse が抜けていた)。Claude API は外したまま
+- Muse を選ぶと、このツールは文章を作らない。文章はお客様ご自身の Muse が作り、投稿案は POST /api/posts(承認待ちで入る)、返信文は threads_set_reply で渡す。Muse が渡した返信文は自動では送られず、利用者が内容を見て送信を押す。予約投稿の公開とトークン更新はこのツールが自分で回し、Muse が POST /api/tick を呼ぶとその場でも1回動く。Muse からこのツールへ送るときは、ヘッダ x-threads-ops: 1(アクセスキーを設定している場合は x-threads-key も)が要る。投稿案を足す MCP ツールは無く、Muse は HTTP で送る。Muse のときは「AIが判定して自動で返信する」と「毎日の下書き」は動かない。投稿案・返信文(まとめて下書きを含む)・宣伝投稿・Web検索の生成を呼ぶ操作は、Muse が作る旨のメッセージで断る(別のプロバイダに黙って回さない・断る前に状態を変えない)
+- Muse のときの「接続テスト」と画面の接続表示は、Muse が x-threads-caller: muse を付けて tick を呼んだ時刻(保存される)で答える(60分以内なら接続あり。再起動しても、その時刻から60分以内なら接続ありのまま)。見張り役(watchdog.js)など、このヘッダの無い tick では「接続あり」にならない。プロバイダを切り替えると、Muse で付いた印は消える
+- 選べなくなった設定(Claude API など)から Claude Code に切り替えたとき、画面に通知を1つ出す(「今やること」と設定画面。0.4.10 を一度起動していて Claude API のキーが残っている場合も含む)。「確認した」を押すか、AI プロバイダを選び直すと消える。Claude Code が入っていない PC では、Muse・Codex CLI・Gemini API から選び直す
+- 画面に残っていた Claude API の入力欄と説明を外した。保存済みのキーの値と、Threads 連携は変えない
+- 試験: provider_options(画面・サーバー・MCP の一覧が同じ4件であること、読み替えの印)と smoke(Muse で tick・投稿の追加・接続テストが動くこと)
+
 ## 0.4.10 (2026-11-19)
 - 設定画面の AI プロバイダの選択肢から「Claude API」を外した。選べるのは Claude Code・Gemini API・Codex CLI の3つ
-- 選択肢の表示から「このPCの契約で動く・追加費用なし」の記載を外した。表示は「Claude Code」「Codex CLI」だけ
+- 選択肢の表示から、費用についての記載を外した。表示は「Claude Code」「Codex CLI」だけ
 - すでに Claude API を選んでいた場合は、設定画面が開けて文章生成も止まるよう、Claude Code に切り替えて読み込む。保存されているキーの値は変えない。Claude Code が使えない PC では、設定画面で Gemini API か Codex CLI を選び直す
 - 選択肢に無い値は保存できず、エラーで断る
 - 試験: test/provider_options.test.mjs(7件・修正前の版では4件が落ちることを確認)

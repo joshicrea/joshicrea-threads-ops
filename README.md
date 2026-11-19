@@ -10,7 +10,7 @@ Threadsの「リサーチ → 投稿生成 → 承認 → 投稿 → 分析 → 
 
 | 項目 | 内容 |
 |---|---|
-| Claude Code | https://claude.ai/download からインストールしてサインイン（有料プランの契約。文章の生成はこの契約枠で動くので追加費用はありません）。文章の生成に `claude` コマンドを使うので、ターミナル（CLI）版が要ります。デスクトップアプリだけの環境は未確認 |
+| Claude Code | https://claude.ai/download からインストールしてサインイン（有料プランの契約。文章の生成はこの契約の利用枠を使います）。文章の生成に `claude` コマンドを使うので、ターミナル（CLI）版が要ります。デスクトップアプリだけの環境は未確認 |
 | パソコン | Windows 10/11、または macOS。起動している間だけ自動処理（予約投稿・コメント返信）が動きます |
 | Threads アカウント | 投稿に使うアカウント。提供元にユーザー名（@ から始まる名前）を伝え、届いた「テスター招待」を Threads アプリの 設定 → アカウント → ウェブサイトの権限 → テスター招待 で承認しておきます |
 | 連携コード | 提供元から届く TOPS1. で始まる1行。Threads 連携のときに設定タブ「2. Threads連携」の連携コード欄へ貼ります（チャットには貼らない） |
@@ -54,7 +54,7 @@ Claude Code のチャットに次の1行を貼って Enter:
 |---|---|
 | PC | Windows 10/11（macOS でも動きますが、cmd ファイルは Windows 用です） |
 | Node.js | LTS 版（20以上）。https://nodejs.org からインストール |
-| AI | 次のどれか1つ。Claude Code（このPCにインストールしてログイン済み・追加費用なし）／Codex CLI（ChatGPT の有料プランの契約で動く）／Gemini API キー／Claude API キー |
+| AI | 次のどれか1つ。Claude Code（このPCにインストールしてログイン済み）／Muse（お客様ご自身の Muse が文章を作る。返信は自動では送られず、毎日の下書きと自動返信は使えない）／Codex CLI（ChatGPT の有料プランの契約で動く）／Gemini API キー |
 | Threads | 投稿に使う Threads アカウント。連携時に「テスター招待」の承認が要ります（下の「Threads連携」参照） |
 
 置き場所は、OneDrive・Dropbox などの同期フォルダと Program Files を避けてください（同期ロックで保存に失敗したり、書き込み権限で止まります）。`C:\Users\<名前>\Threads運用アシスタント` のような場所が向いています。日本語のパスでも動きます。ZIP は必ず「すべて展開」してから使ってください（ZIP の中身を開いた状態で 起動.cmd を押しても動きません）。既に同期フォルダに置いて使い始めてしまった場合は、`停止.cmd` → フォルダごと移動 → `起動.cmd` の順で移せます（設定・データは `data/` ごと付いてきます）。
@@ -195,7 +195,7 @@ ZIP で入れた場合:
 
 ## 提供元・開発者向け
 
-- AIプロバイダの実測: Claude Code（接続3秒/生成30秒・1回 約450トークン）／Codex CLI（接続30秒/生成31秒/Web検索34秒・1回 約6,900トークン。Codex 内蔵のコーディング指示を `model_instructions_file` でツールの短い指示に差し替えて 22,567→6,942）／Gemini API／Claude API（Web参照元の検索には使えない）
+- AIプロバイダの実測: Claude Code（接続3秒/生成30秒・1回 約450トークン）／Codex CLI（接続30秒/生成31秒/Web検索34秒・1回 約6,900トークン。Codex 内蔵のコーディング指示を `model_instructions_file` でツールの短い指示に差し替えて 22,567→6,942）／Gemini API（Claude API は 0.4.10 で選択肢から外した。実測は当時のもの）
 - Claude Code 経由の仕組み: `claude -p`（非対話モード）を専用の設定フォルダ `data/claude-config/` で起動する。利用者の `~/.claude/CLAUDE.md` やルールは読み込まず、ログイン情報だけを `~/.claude/.credentials.json` から片方向でコピーする。実体は `%USERPROFILE%\.local\bin\claude.exe` → npm グローバル → PATH 上の `claude.cmd`（中の cli.js を node で起動）の順に探し、shell は経由しない。環境変数 `THREADS_CLAUDE_CMD` で「コマンド 引数...」の形で明示できる（値が実在するファイルのパスなら空白を含んでいても分割しない）。Codex も同じ形（`data/codex-home`・`THREADS_CODEX_CMD`。`.js` のパスを指すときは node で起動する）
 - Threads API: 長期トークン（60日）は期限の7日前から自動更新（サーバー起動中のみ）。送信中に中断した投稿の復旧は、直近50件の自分の投稿と本文一致で探し（公開後のメディアIDと permalink が取れる）、無ければコンテナの状態（PUBLISHED）で判定する。キーワード検索は Meta の審査を通るまで「自分の投稿」しか返さない（公式仕様・2026-09-20 実測 0件）。0件または権限不足のときは、Claude Code / Codex なら自動で Web検索経由（threads.com 限定の検索→投稿ページの読み取り）に切り替わり、公開投稿を最大8件取り込む。返信の上限は 1,000/日、検索は 2,200/日。DM の API は無い
 - Redirect URI: Meta の設定フォームは localhost の URL を保存できない（Uninstall / Delete Callback URL が必須のため）。`relay/` の4ファイルを公開ドメイン（https）に置き、Meta の3欄とツールの Redirect URI にその公開URLを登録する。既定値は `https://bizcrea.com/threads/callback.html`（環境変数 `THREADS_REDIRECT_URI` で変更可）。中継ページはブラウザを `http://localhost:4173/oauth/callback` へ転送するだけで、コードは外部に残らない。詳細は [relay/README.md](relay/README.md)

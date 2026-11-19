@@ -112,9 +112,13 @@ const HOSTED_DEFAULT_SCOPES = "threads_basic,threads_content_publish,threads_rea
 // 方式Bの利用者か（loadDb のたびに更新）。権限エラーの案内を、アプリを持たないお客様向けに切り替えるのに使う
 let hostedOAuthInUse = false;
 
-const AI_PROVIDER_CHOICES = ["claude-code", "gemini", "codex"]; // 設定画面の選択肢（public/index.html の #aiProvider と一致させる）
+const AI_PROVIDER_CHOICES = ["claude-code", "muse", "codex", "gemini"]; // 設定画面の選択肢（public/index.html の #aiProvider と一致させる。2026-11-19 REQ-1819: Muse を追加して4件）
+// Muse を選んだときは、本体は文章を作らない。文章はお客様の Muse が作り、投稿の追加(POST /api/posts)と返信文の保存(threads_set_reply)で本体へ渡す。定期処理は Muse が POST /api/tick で回す
+const MUSE_NO_GENERATE_MESSAGE = "AIプロバイダが Muse のため、本体は文章を作りません。投稿案・返信文は Muse が作り、投稿の追加(POST /api/posts)と返信文の保存(threads_set_reply)で本体へ渡します。本体で文章を作るには、設定でプロバイダを Claude Code・Codex CLI・Gemini API のいずれかにしてください。";
+const museHandsOff = (settings) => (settings && settings.aiProvider) === "muse";
 const defaultSettings = {
   aiProvider: "claude-code", // 既定は利用者のPCの Claude Code（APIキー不要。プラグイン配布の前提が Claude Code のため）
+  providerMigratedFrom: "", // 選択肢に無い値(廃止した claude-api など)から読み替えたとき、元の値を残す。画面で「確認した」を押すと空に戻る（画面の通知を1つ出すための印）
   claudeModel: "sonnet",
   codexModel: "",
   anthropicApiKey: "",
@@ -334,7 +338,16 @@ async function loadDb() {
   db.settings = { ...defaultSettings, ...(raw.settings || {}) };
   // 設定画面の選択肢に無いAIプロバイダ（廃止した claude-api・不正な値）が保存されていたら、既定の claude-code へ寄せて読み込む（2026-11-19 林さん指示・REQ-1810）。
   // 読み込んだ値だけを寄せ、キー（anthropicApiKey 等）の値と保存先は変えない
-  if (!AI_PROVIDER_CHOICES.includes(db.settings.aiProvider)) db.settings.aiProvider = defaultSettings.aiProvider;
+  // 読み替えたら、元の値を providerMigratedFrom に残す（画面に通知を出す。確認するまで残り、確認後は読み替え済みの値が保存されているので再発しない）
+  const rawSettings = raw.settings || {};
+  if (!AI_PROVIDER_CHOICES.includes(db.settings.aiProvider)) {
+    // 保存されていた値が空・null でも(aiProvider の項目はあるのに選択肢に無い)、読み替えとして通知を出す。項目そのものが無い古い db は読み替えではない
+    if (!db.settings.providerMigratedFrom && "aiProvider" in rawSettings) db.settings.providerMigratedFrom = String(db.settings.aiProvider || "不明").slice(0, 40);
+    db.settings.aiProvider = defaultSettings.aiProvider;
+  } else if (db.settings.aiProvider === "claude-code" && !("providerMigratedFrom" in rawSettings) && String(rawSettings.anthropicApiKey || "").trim()) {
+    // 0.4.10 を一度起動した利用者は、claude-api が claude-code に書き換わって保存済みで、上の条件には入らない。Claude API のキーが残っているのに通知の印の項目が無い利用者に、1回だけ通知を出す
+    db.settings.providerMigratedFrom = "claude-api";
+  }
   // アカバン防止ガードの既定ONは新規（投稿0件）だけに入れる。鍵の無い既存データ（投稿が1件でもある＝公開前で予約だけの稼働中も含む）はOFFにし、
   // 1回だけ鍵を書いて保存する（本人の確認なしに新しい既定を入れない・2026-10-21 破壊検証の致命傷2・弱点9）
   let safetyMigrated = false;
@@ -1028,7 +1041,7 @@ async function callGeminiGroundedSearch(settings, keyword) {
 // ---------------------------------------------------------------------------
 // AIプロバイダの切り替え
 //   gemini      : Gemini API（既定。Google検索 grounding が使える）
-//   claude-code : このPCの Claude Code（`claude -p`）を裏で呼ぶ。林さんの契約枠で動くので追加費用なし。
+//   claude-code : このPCの Claude Code（`claude -p`）を裏で呼ぶ。利用者の契約の利用枠を使う。
 //                 専用の設定フォルダ（data/claude-config）を使い、ユーザーの CLAUDE.md やルールは読み込まない
 //   claude-api  : Anthropic API（APIキー・従量課金）。外部提供版向け
 // どのプロバイダも「JSONだけを返す」契約で呼び、返答を JSON.parse する。
@@ -1243,6 +1256,7 @@ async function callClaudeApiText(settings, prompt, { system, maxTokens = 8192 } 
 // 生成系の入口。プロバイダに関わらず「JSONで返す」。
 async function callAiJson(settings, prompt, schema, options = {}) {
   const provider = settings.aiProvider || "gemini";
+  if (provider === "muse") throw new HttpError(409, MUSE_NO_GENERATE_MESSAGE);
   if (provider === "gemini") return callGeminiJson(settings, prompt, schema, options);
   const system = jsonOnlySystemPrompt(schema);
   if (provider === "claude-code") {
@@ -1263,6 +1277,7 @@ async function callAiJson(settings, prompt, schema, options = {}) {
 // Web参照元の検索。Gemini は Google検索 grounding、Claude Code は WebSearch ツール、Codex は --search（web_search）を使う。Claude API は未対応。
 async function callAiGroundedSearch(settings, keyword) {
   const provider = settings.aiProvider || "gemini";
+  if (provider === "muse") throw new HttpError(409, MUSE_NO_GENERATE_MESSAGE);
   if (provider === "gemini") return callGeminiGroundedSearch(settings, keyword);
   if (provider === "claude-api") {
     throw new HttpError(400, "Web参照元の検索は Claude API では使えません。設定のAIプロバイダを Gemini・Claude Code・Codex のいずれかにするか、参考投稿の手動貼り付けを使ってください。");
@@ -1297,7 +1312,7 @@ function claudeSerial(task) {
 }
 
 function aiProviderLabel(provider) {
-  return { gemini: "Gemini", "claude-code": "Claude Code", "claude-api": "Claude API", codex: "Codex" }[provider] || provider;
+  return { gemini: "Gemini", "claude-code": "Claude Code", "claude-api": "Claude API", codex: "Codex", muse: "Muse" }[provider] || provider;
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,6 +1475,7 @@ const THREADS_WEB_SEARCH_TIMEOUT_MS = 300_000;
 
 async function searchThreadsPostsViaWeb(settings, keyword, { max = 8 } = {}) {
   const provider = settings.aiProvider || "gemini";
+  if (provider === "muse") throw new HttpError(409, MUSE_NO_GENERATE_MESSAGE);
   if (provider !== "claude-code" && provider !== "codex") {
     throw new HttpError(400, "Threads の公開投稿を Web 経由で探す機能は、AIプロバイダが Claude Code か Codex のときだけ使えます。設定で切り替えるか、参考投稿の「手動で貼り付け」を使ってください。");
   }
@@ -4263,6 +4279,7 @@ const AUTO_REPLY_MAX_PER_TICK = 3;
 async function sendAutoReplies(snapshot) {
   const s = snapshot.settings;
   if (!s.autoReplyEnabled || !s.threadsAccessToken) return { sent: 0 };
+  if (museHandsOff(s)) return { sent: 0, museHandsOff: true }; // Muse のときは自動で送らない(Muse が渡した返信は利用者が見て送る。切り替え前の他プロバイダの下書きも、ここでは送らない)
   if (!licenseDecisionOf(snapshot).allowed) return { sent: 0, licenseStopped: true };
   if (s.autoReplyPausedUntil && Date.parse(s.autoReplyPausedUntil) > Date.now()) return { sent: 0, paused: true };
   const intervalMs = Math.max(5, Number(s.autoReplyIntervalSec) || 20) * 1000;
@@ -4489,7 +4506,9 @@ async function autoReplyTick() {
     await collectNewReplies(current);
     current = await readDb();
   }
-  if (s.autoReplyEnabled && (await recoverAiFailedReplies(current))) current = await readDb();
+  // Muse を選んでいる間、本体は文章を作らない（返信文は Muse が threads_set_reply で渡す）ので、下書き・作り直し・提案の自動作成は呼ばない
+  const museOwnsText = museHandsOff(s);
+  if (s.autoReplyEnabled && !museOwnsText && (await recoverAiFailedReplies(current))) current = await readDb();
   // 先に送る。下書き作成はAIの応答待ちが長く、先に走ると、できあがっている下書きの送信まで遅れてコメントが溜まる
   await requeueNetworkFailedReplies(current);
   await reconcileUncertainReplies(current);
@@ -4497,12 +4516,12 @@ async function autoReplyTick() {
   if (licenseDecisionOf(current).allowed) await sendAutoReplies(current);
   current = await readDb();
   const lastFailure = Date.parse(current.settings.lastDraftFailureAt || "") || 0;
-  if (s.autoReplyEnabled && Date.now() - lastFailure >= REPLY_DRAFT_FAILURE_BACKOFF_MS && pickPendingReplies(current.replies).length) {
+  if (s.autoReplyEnabled && !museOwnsText && Date.now() - lastFailure >= REPLY_DRAFT_FAILURE_BACKOFF_MS && pickPendingReplies(current.replies).length) {
     await draftRepliesBatch(current);
     current = await readDb();
     if (licenseDecisionOf(current).allowed) await sendAutoReplies(current);
   }
-  if (s.autoReplyEnabled && current.replies.some((r) => r.status === "held" && r.holdReason === REPLY_ECHO_HOLD && !r.echoRetriedAt)) {
+  if (s.autoReplyEnabled && !museOwnsText && current.replies.some((r) => r.status === "held" && r.holdReason === REPLY_ECHO_HOLD && !r.echoRetriedAt)) {
     const retry = await retryEchoHeldReplies(current);
     current = await readDb();
     if (retry.drafted && licenseDecisionOf(current).allowed) await sendAutoReplies(current);
@@ -4530,7 +4549,7 @@ async function autoReplyTick() {
   // 取得の直後に分析まで回す（1日1回・失敗時は6時間空ける）。結果は次の投稿生成の方針に自動で入る（buildDraftPrompt）
   const lastSuggestion = Date.parse(current.suggestions?.[0]?.at || "") || 0;
   const lastAttempt = Date.parse(s.lastSuggestionAttemptAt || "") || 0;
-  if (s.autoInsightsEnabled && Date.now() - lastSuggestion >= 20 * 60 * 60 * 1000 && Date.now() - lastAttempt >= 6 * 60 * 60 * 1000
+  if (s.autoInsightsEnabled && !museOwnsText && Date.now() - lastSuggestion >= 20 * 60 * 60 * 1000 && Date.now() - lastAttempt >= 6 * 60 * 60 * 1000
     && buildStats(current).publishedWithInsights >= 3) {
     await withDb(async (d) => { d.settings.lastSuggestionAttemptAt = nowIso(); });
     try {
@@ -5117,9 +5136,16 @@ function sanitizeSettings(current, rawInput) {
   for (const key of SETTINGS_KEYS) {
     if (!(key in input)) continue;
     const value = input[key];
+    if (key === "lastAiCheckAt" || key === "lastAiCheckProvider") continue; // 接続確認の印は、接続テストと Muse の tick だけが書く(画面や外部から書いて「接続あり」を偽らせない)
     if (key === "aiProvider") {
       if (!AI_PROVIDER_CHOICES.includes(value)) throw new HttpError(400, `AIプロバイダの値が不正です: ${value}`);
+      if (value !== current.aiProvider) { next.providerMigratedFrom = ""; if (current.lastAiCheckProvider === "muse") { next.lastAiCheckProvider = ""; next.lastAiCheckAt = ""; } } // 利用者が選び直したので、読み替えの通知は終わり（画面は保存のたびに同じ値を送るので、変わったときだけ）。前に Muse で付いた「接続あり」の印は、切り替えで消す
       next.aiProvider = value;
+      continue;
+    }
+    if (key === "providerMigratedFrom") {
+      if (value !== "") throw new HttpError(400, "providerMigratedFrom は空文字（確認した）だけ受け付けます。");
+      next.providerMigratedFrom = "";
       continue;
     }
     if (key === "claudeModel") {
@@ -5406,6 +5432,14 @@ route("POST", "/api/ai-check", async () => {
   const started = Date.now();
   const schema = { type: "object", properties: { ok: { type: "boolean" }, greeting: { type: "string" } }, required: ["ok", "greeting"] };
   const provider = db.settings.aiProvider || "gemini";
+  if (provider === "muse") {
+    // 本体は Muse を呼べない（Muse が本体を呼ぶ側）。確かめられるのは「Muse が最後に tick を呼んだ時刻」だけなので、それで答える。60分以内なら接続できている
+    // 印は Muse が x-threads-caller: muse 付きで tick を呼んだときだけ保存される(画面の接続表示と同じ値を見る)。接続テストでは印を新しくしない
+    const markedAt = db.settings.lastAiCheckProvider === "muse" && db.settings.lastAiCheckAt ? Date.parse(db.settings.lastAiCheckAt) : 0;
+    const at = Number.isFinite(markedAt) ? markedAt : 0;
+    const ok = Boolean(at) && Date.now() - at < 60 * 60 * 1000;
+    return { status: 200, body: { provider, ok, greeting: ok ? "Museから接続あり" : "", ms: 0, command: "", lastTickAt: at ? new Date(at).toISOString() : "", note: ok ? "Muse が最後に定期処理(tick)を呼んだ時刻から60分以内です。" : "Muse からの定期処理(tick)の呼び出しが、まだ無いか、60分以上前です。Muse 側のスケジュールと、本体への接続(ヘッダ x-threads-ops: 1 と x-threads-caller: muse)を確かめてください。" } };
+  }
   const result = await callAiJson(db.settings, "接続テストです。{\"ok\": true, \"greeting\": \"<日本語で10文字以内のあいさつ>\"} の形で返してください。", schema, { maxOutputTokens: 256 });
   await withDb(async (d) => {
     d.settings.lastAiCheckAt = nowIso();
@@ -6372,6 +6406,8 @@ async function dailyDraftsTick(nowMs = Date.now()) {
   dailyDraftsRunning = true;
   try {
     const db = await readDb();
+    // Muse を選んでいる間は、本体は下書きを作らない（Muse が POST /api/posts で渡す）。エラーではなく理由つきの見送り
+    if (museHandsOff(db.settings)) return { ran: false, reason: "Museが文章を作る設定のため、本体では下書きを作りません" };
     // ストック方式: 確認待ちが本数を下回るときだけ、不足分を作る。確認待ちが本数以上なら AI も呼ばない
     // （本数×3 の積み上がり上限は、本数以上で作らないこの判定が包んでいる）
     const reviewing = db.posts.filter((p) => p.status === "review").length;
@@ -6434,6 +6470,7 @@ async function dailyDraftsTick(nowMs = Date.now()) {
 // 期間つき宣伝投稿をまとめて作る。全部「承認待ち」で入れる（自動で承認・予約しない）。予約時刻は期間内の各日にばらす
 route("POST", "/api/campaigns/:id/generate", async ({ params }) => {
   const db = await readDb();
+  if (museHandsOff(db.settings)) throw new HttpError(409, MUSE_NO_GENERATE_MESSAGE); // 断る前に error ログを書かない（Muse では毎回押すたびに増えるため）
   const campaign = (db.settings.campaigns || []).find((c) => c.id === params.id);
   if (!campaign) throw new HttpError(404, "宣伝したいものが見つかりません。先に設定で保存してください。");
   if (campaign.enabled === false) throw new HttpError(409, `「${campaign.title}」は止めてあります。設定で「使う」にしてから作ってください。`);
@@ -6765,7 +6802,7 @@ route("POST", "/api/posts/:id/publish", async ({ params }) => {
 // 外から「1回分の tick」を呼ぶ入口（利用者のAIのスケジュールが見張り役として呼ぶ）。
 // 返すのは実行の有無と件数だけ。トークン・本文・エラー文は返さない。認証は全APIと同じ（アクセスキー設定時は x-threads-key 必須）。
 // 重なった呼び出しは何もせず「実行中」を返す（schedulerTick・dailyDraftsTick の入口の印）
-route("POST", "/api/tick", async () => {
+route("POST", "/api/tick", async ({ headers }) => {
   // 定期処理(60秒の時計)と同じく、動かす直前に錠を確かめ直す。メモリ上の「持っている」は最大60秒古く、奪われた直後に呼ばれると二重に出る(第3周 同種1)
   await touchSchedulerLock();
   // 錠を取る前(2つ目の本体が待ち受けだけ始めた間)に呼ばれても、定期処理は動かさない(二重送信の窓を作らない)
@@ -6773,6 +6810,10 @@ route("POST", "/api/tick", async () => {
   if (!schedulerLockHeld) return { status: 503, body: { ok: false, error: "起動の途中です。少し待ってからもう一度呼んでください。", reason: "starting" } };
   const scheduler = await schedulerTick();
   lastExternalTick = { at: nowIso(), ran: Boolean(scheduler?.ran), published: Number(scheduler?.published) || 0, failed: Number(scheduler?.failed) || 0, blocked: Array.isArray(scheduler?.blocked) ? scheduler.blocked : [] };
+  // Muse を選んでいるときは、Muse が x-threads-caller: muse を付けて呼んだ tick だけを「接続できている」の印にする。
+  // 見張り役(watchdog.js)など他の呼び出しでは印を書かない（Muse が来ていないのに「接続あり」と出ないように）
+  const fromMuse = String(headers?.["x-threads-caller"] || "").trim().toLowerCase() === "muse";
+  if (fromMuse && museHandsOff((await readDb()).settings)) await withDb(async (d) => { d.settings.lastAiCheckAt = nowIso(); d.settings.lastAiCheckProvider = "muse"; });
   let dailyDrafts;
   try {
     const r = await dailyDraftsTick();
@@ -6798,6 +6839,8 @@ route("POST", "/api/fetch-replies", async () => {
 
 // 未対応コメントをまとめてAI判定＋下書き（自動返信OFFでも手で押せる）
 route("POST", "/api/replies/draft-batch", async () => {
+  // Muse のときは、状態(要確認の戻し・試行回数・失敗時刻)を触る前に断る。断る前に触ると、Muse が返信すべきコメントが AI 障害の要確認に積まれる
+  if (museHandsOff((await readDb()).settings)) throw new HttpError(409, MUSE_NO_GENERATE_MESSAGE);
   // AI 障害で要確認になった分は、人がこのボタンを押したときだけ再挑戦の列に戻す
   await withDb(async (d) => {
     const hasNormalPending = d.replies.some((r) => r.status === "unhandled" && !r.responseText && r.text);
@@ -6972,7 +7015,9 @@ route("GET", "/api/pattern-stats", async () => {
 });
 
 route("POST", "/api/suggestions", async () => {
-  const suggestion = await generateSuggestion(await readDb());
+  const db = await readDb();
+  if (museHandsOff(db.settings)) throw new HttpError(409, MUSE_NO_GENERATE_MESSAGE); // 他の生成入口と同じく、Muse のときは前提条件の検査より先に断る
+  const suggestion = await generateSuggestion(db);
   return { status: 200, body: { suggestion } };
 });
 
@@ -7016,7 +7061,7 @@ async function handleApi(req, res, url) {
   if (!matched) return json(res, 404, { error: "APIが見つかりません。", detail: `${req.method} ${url.pathname}` });
   try {
     const body = ["POST", "PUT", "DELETE"].includes(req.method) ? await bodyJson(req) : {};
-    const result = await matched.handler({ params: matched.params, body, url });
+    const result = await matched.handler({ params: matched.params, body, url, headers: req.headers });
     return json(res, result.status || 200, result.body);
   } catch (error) {
     const status = error.status && error.status >= 400 && error.status < 600 ? (error instanceof ExternalApiError ? 502 : error.status) : 500;

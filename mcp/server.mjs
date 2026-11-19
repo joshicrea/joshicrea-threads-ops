@@ -31,7 +31,7 @@ const SETTINGS_PROPS = {
   scheduleTimes: { type: "string", description: "例: 07:00,12:00,20:00（日本時間）" },
   dailyDraftsCount: { type: "integer", description: "確認待ちの下書きを常に何本そろえておくか（0〜12・既定0=作らない）。確認待ちがこの本数を下回ったら、不足分だけ作る。運用代行サロンでは導入のときにお客様ごとに決める。作るのは確認待ちの下書きだけで、承認・予約・自動送信のONはしない" },
   dailyDraftsTime: { type: "string", description: "毎日の下書きを作り始める時刻の目安（日本時間・HH:mm・既定 09:00）。この時刻より前は作らない。過ぎたあとは、確認待ちが本数を下回っているときだけ不足分を作る" },
-  aiProvider: { type: "string", enum: ["claude-code", "codex", "gemini", "claude-api"] }, claudeModel: { type: "string", enum: ["sonnet", "opus", "haiku"] },
+  aiProvider: { type: "string", enum: ["claude-code", "muse", "codex", "gemini"] }, claudeModel: { type: "string", enum: ["sonnet", "opus", "haiku"] },
   autoPublishEnabled: { type: "boolean" }, autoFetchRepliesEnabled: { type: "boolean" }, autoFetchRepliesMinutes: { type: "integer" },
   autoReplyEnabled: { type: "boolean" }, autoReplyIntervalSec: { type: "integer" }, autoReplyDailyCap: { type: "integer" }, autoInsightsEnabled: { type: "boolean" },
   // アカバン防止ガード（出す前の安全確認）。数値は公式上限以外すべて暫定の目安
@@ -122,9 +122,10 @@ function nextStep(s, tokenExpired) {
   if (!st.threadsAccessToken) return "Threads と連携します。threads_auth_url で連携用のページを開き、Threads の画面で許可してください（先に Threads アプリで、届いたテスター招待を承認しておく）。";
   if (tokenExpired) return "Threads の連携が期限切れです。threads_auth_url でもう一度連携してください。";
   if (st.aiProvider === "gemini" && !st.geminiApiKey) return "文章を作る AI が使えない設定です。threads_update_settings で aiProvider を claude-code にしてから、threads_ai_check で確かめてください。";
-  if (!st.lastAiCheckAt) return "文章を作る AI がこの PC で動くか、threads_ai_check で確かめてください（最大3分）。";
+  if (st.aiProvider !== "muse" && !st.lastAiCheckAt) return "文章を作る AI がこの PC で動くか、threads_ai_check で確かめてください（最大3分）。";
   if (!st.brandName || !st.profile) return "発信者情報が空です。初回セットアップ（名前・何をしている人か・文体・最後の一言）を1問ずつ聞いて、threads_update_settings で保存してください。文体は好みを聞く前に、利用者が過去に書いた文章を2〜3本貼ってもらい、そこから決まりごとの下書きを作って本人に確かめてください（手順は threads_guide の「3. はじめて使う人」）。";
   if (review) return `承認待ちの投稿が ${review} 件あります。threads_list_posts（status=review）で本文を見せて、承認するか聞いてください。`;
+  if (st.aiProvider === "muse") return `文章を作るのは Muse です（本体は文章を作りません）。投稿案は Muse が作って、本体の POST http://localhost:${PORT}/api/posts へ渡します(承認待ちで入ります)。本体への送信には、ヘッダ x-threads-ops: 1(アクセスキーを設定している場合は x-threads-key も)が要ります。返信文は threads_set_reply で渡してください。渡した返信文は自動では送られないので、利用者に内容を見せて、指示があってから threads_reply で送ります。threads_generate_posts・threads_draft_replies は使えません(409で断られます)。予約投稿の公開とトークン更新は本体が自分で回します。Muse が POST /api/tick を、ヘッダ x-threads-ops: 1 と x-threads-caller: muse を付けて呼ぶと、その場でも1回動き、画面に「Muse から接続あり」と出ます。`;
   if ((st.themes || []).some((t) => t.enabled !== false)) return "投稿案を作れます。発信テーマが設定済みなので、テーマは聞かずに、目的だけ聞いて threads_generate_posts を topic なしで呼んでください（テーマは設定から自動で割り当てます）。";
   return "投稿案を作れます。目的とテーマを1つずつ聞いてから threads_generate_posts を呼んでください。";
 }

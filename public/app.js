@@ -305,12 +305,14 @@ function renderDashboard() {
 
   // 初めの3手順（AIの確認・Threads連携・最初の投稿案）。全部済むまで今やることの先頭に出す
   const provider = state.settings.aiProvider || "gemini";
+  // Muse は「最後に定期処理(tick)が呼ばれた時刻」から60分以内のときだけ済み(止まったあとも「済み」が残り続けないように)
+  const museFresh = provider === "muse" && Date.now() - (Date.parse(state.settings.lastAiCheckAt || "") || 0) < 60 * 60 * 1000;
   const aiReady = provider === "gemini" ? Boolean(state.settings.geminiApiKey)
-    : provider === "claude-api" ? Boolean(state.settings.anthropicApiKey)
+    : provider === "muse" ? state.settings.lastAiCheckProvider === "muse" && museFresh
       : state.settings.lastAiCheckProvider === provider;
   const threadsReady = Boolean(state.settings.threadsAccessToken) && !threadsTokenExpired();
   const steps = [
-    { done: aiReady, title: "AIが使えるか確かめる", note: aiReady ? "済み" : provider === "gemini" ? "Gemini APIキーを設定する（または AIプロバイダを Claude Code に切り替える）" : provider === "claude-api" ? "Claude APIキーを設定する" : `${provider === "codex" ? "Codex" : "Claude Code"} が使える状態か、設定の「接続テスト」で1回確認する`, goto: "settings" },
+    { done: aiReady, title: "AIが使えるか確かめる", note: aiReady ? "済み" : provider === "gemini" ? "Gemini APIキーを設定する（または AIプロバイダを Claude Code に切り替える）" : provider === "muse" ? "Muse 側で「15分ごとにこのツールへ tick を送る」予定を入れると済みになります（最後に送られてから60分以内）。設定の「接続テスト」でも確かめられます" : `${provider === "codex" ? "Codex" : "Claude Code"} が使える状態か、設定の「接続テスト」で1回確認する`, goto: "settings" },
     { done: threadsReady, title: "Threadsと連携する", note: threadsReady ? "済み" : threadsTokenExpired() ? "Threadsの連携が期限切れです。設定で「Threadsと連携する」をもう一度押す" : "投稿・コメント取得・インサイトに必要です", goto: "settings", focus: "threadsLinkCode" },
     { done: state.posts.length > 0, title: "最初の投稿案を作る", note: state.posts.length ? "済み" : "リサーチで参考投稿を集め、投稿生成で最初の投稿案を作る", goto: "research" }
   ];
@@ -327,6 +329,7 @@ function renderDashboard() {
   // （未設定・期限切れは上の手順の欄に出るので、ここには入れない）
   const todos = [];
   const lic = state.license || {};
+  if (state.settings.providerMigratedFrom) todos.push({ text: "以前の AIプロバイダ（Claude API など）は選べなくなったため、Claude Code に切り替えました。Claude Code がこの PC に入っていない場合は、設定で Muse・Codex CLI・Gemini API から選び直してください", goto: "settings", focus: "aiProvider", tone: "warn" });
   if (lic.enforced && !lic.allowed) todos.push({ text: `${lic.message} 自動の投稿・返信・削除は止まっています`, goto: "settings", focus: "licenseKey", tone: "danger" });
   else if (lic.status === "grace" || lic.status === "no_key_grace") todos.push({ text: lic.message, goto: "settings", focus: "licenseKey", tone: "warn" });
   if (countStatus("error")) todos.push({ count: countStatus("error"), text: `エラーになった投稿が${countStatus("error")}件あります。原因を確認して承認し直す`, goto: "queue", filter: "error", tone: "danger" });
@@ -394,7 +397,10 @@ function aiConnLine() {
   const checked = s.lastAiCheckProvider === provider && s.lastAiCheckAt;
   const checkedNote = checked ? `接続テスト済み（${new Date(s.lastAiCheckAt).toLocaleString("ja-JP")}）` : "未確認（設定の「接続テスト」で確認）";
   if (provider === "claude-code") return connLine("AI: Claude Code", Boolean(checked), `このPCの Claude Code（モデル: ${s.claudeModel || "sonnet"}）・${checkedNote}`, true);
-  if (provider === "claude-api") return connLine("AI: Claude API", Boolean(s.anthropicApiKey), s.anthropicApiKey ? `モデル: ${s.anthropicModel || ""}` : "APIキー未設定", true);
+  if (provider === "muse") {
+    const fresh = Boolean(checked) && Date.now() - Date.parse(s.lastAiCheckAt) < 60 * 60 * 1000;
+    return connLine("AI: Muse", fresh, fresh ? `Muse から接続あり（最後の呼び出し ${new Date(s.lastAiCheckAt).toLocaleString("ja-JP")}）` : "Muse からの接続待ち（最後の呼び出しから60分以上、または未接続。設定の「接続テスト」で確認）", true);
+  }
   if (provider === "codex") return connLine("AI: Codex", Boolean(checked), `このPCの Codex CLI（ChatGPT の契約）${s.codexModel ? `（モデル: ${s.codexModel}）` : ""}・${checkedNote}`, true);
   return connLine("AI: Gemini", Boolean(s.geminiApiKey), s.geminiApiKey ? `モデル: ${s.geminiModel || "自動"}` : "APIキー未設定", true);
 }
@@ -1140,16 +1146,18 @@ function renderSettings() {
   $("#aiProvider").value = s.aiProvider || "gemini";
   $("#claudeModel").value = s.claudeModel || "sonnet";
   $("#codexModel").value = s.codexModel || "";
-  $("#anthropicApiKey").value = s.anthropicApiKey || "";
-  $("#anthropicModel").value = s.anthropicModel || "claude-sonnet-5";
   updateProviderFields();
+  // 読み替えの通知: 選べなくなった設定(Claude API など)から Claude Code に切り替えたことを、確認するまで1つだけ出す
+  const migrated = s.providerMigratedFrom || "";
+  $("#providerMigratedNote").hidden = !migrated;
+  $("#providerMigratedText").textContent = migrated ? `以前の設定（${migrated === "claude-api" ? "Claude API" : "選べない値"}）は、この版から選べなくなりました。AIプロバイダは Claude Code に切り替えました。保存してあった API キーはこの PC に残っていますが、使われません。Claude Code がこの PC に入っていない場合は、Muse・Codex CLI・Gemini API から選び直してください。` : "";
   $("#geminiApiKey").value = s.geminiApiKey || "";
   $("#geminiModel").value = s.geminiModel || "";
   $("#geminiModelAuto").checked = s.geminiModelAuto !== false;
   $("#geminiModel").disabled = $("#geminiModelAuto").checked;
   $("#geminiModel").placeholder = $("#geminiModelAuto").checked ? "自動選択（最初の呼び出し時に決定）" : "例: gemini-2.5-flash-lite";
   $("#geminiStatus").textContent = s.geminiApiKey ? `APIキー設定済み / モデル: ${s.geminiModel || "自動（初回呼び出し時に決定）"}` : "APIキー未設定";
-  $("#researchProviderNote").textContent = (s.aiProvider || "gemini") === "claude-api" ? "Webで集めた参考の検索は Claude API では使えません（Gemini または Claude Code に切り替えてください）。" : "";
+  $("#researchProviderNote").textContent = (s.aiProvider || "gemini") === "muse" ? "Muse を選んでいる間、このツールは Web検索をしません。参考投稿は手動で貼り付けるか、Muse が集めて渡してください。" : "";
   $("#threadsAppId").value = s.threadsAppId || "";
   $("#expectedThreadsUsername").value = s.expectedThreadsUsername || "";
   $("#threadsLinkCode").value = "";
@@ -1339,8 +1347,6 @@ function collectSettings() {
     aiProvider: $("#aiProvider").value,
     claudeModel: $("#claudeModel").value,
     codexModel: $("#codexModel").value,
-    anthropicApiKey: $("#anthropicApiKey").value,
-    anthropicModel: $("#anthropicModel").value,
     geminiApiKey: $("#geminiApiKey").value,
     geminiModel: $("#geminiModel").value,
     geminiModelAuto: $("#geminiModelAuto").checked,
@@ -1731,12 +1737,25 @@ function bindEvents() {
   });
   $("#toast").addEventListener("click", (e) => { if (e.target.closest(".toast-close")) $("#toast").hidden = true; });
   window.addEventListener("beforeunload", (e) => { if (settingsDirty) { e.preventDefault(); e.returnValue = ""; } });
+  $("#providerMigratedAckBtn").addEventListener("click", async (e) => {
+    await busy(e.currentTarget, "保存中", async () => {
+      await api("/api/settings", { method: "POST", body: { providerMigratedFrom: "" } });
+      $("#providerMigratedNote").hidden = true; // loadState({ keepSettingsForm }) は設定画面を描き直さないので、ここで直接隠す
+      await loadState({ keepSettingsForm: true });
+    });
+  });
   $("#aiCheckBtn").addEventListener("click", async (e) => {
     const button = e.currentTarget;
     if (!(await saveSettings(button))) return;
     await busy(button, "テスト中（最大3分）", async () => {
       const result = await api("/api/ai-check", { method: "POST" });
-      toast(`${{ gemini: "Gemini", "claude-code": "Claude Code", "claude-api": "Claude API", codex: "Codex" }[result.provider] || result.provider} に接続できました（${(result.ms / 1000).toFixed(1)}秒・応答「${result.greeting}」）。`, "ok", 6000, result.command ? `使ったコマンド: ${result.command}` : "");
+      if (result.provider === "muse") {
+        // 本体から Muse は呼べない。Muse が最後に定期処理(tick)を呼んだ時刻で答える
+        toast(result.ok ? `Muse から接続があります（最後の呼び出し: ${new Date(result.lastTickAt).toLocaleString("ja-JP")}）。` : result.note, result.ok ? "ok" : "error", 8000);
+        await loadState({ keepSettingsForm: true });
+        return;
+      }
+      toast(`${{ gemini: "Gemini", "claude-code": "Claude Code", codex: "Codex" }[result.provider] || result.provider} に接続できました（${(result.ms / 1000).toFixed(1)}秒・応答「${result.greeting}」）。`, "ok", 6000, result.command ? `使ったコマンド: ${result.command}` : "");
       await loadState({ keepSettingsForm: true });
     });
   });
