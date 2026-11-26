@@ -1,7 +1,7 @@
 {
   "name": "joshicrea-threads-ops",
-  "version": "0.4.11",
-  "description": "Threads運用アシスタント。リサーチ→投稿生成→承認→投稿→分析→改善を承認制で回し、コメント返信はAIが判定して自動で返します。ローカルで常駐し、Claude Code のチャットからも操作できます。",
+  "version": "0.4.12",
+  "description": "Threads運用アシスタント。リサーチ→投稿生成→承認→投稿→分析→改善を承認制で回し、コメント返信は、Claude Code・Codex CLI・Gemini API を選んだときはAIが判定して自動で返し、Muse を選んだときは Muse が返信文を作って利用者の指示で送ります。ローカルで常駐し、Claude Code・Codex・Muse から操作できます。",
   "author": {
     "name": "joshicrea",
     "email": "info@joshicrea.com"

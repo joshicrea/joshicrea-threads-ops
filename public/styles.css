@@ -85,6 +85,7 @@ summary .sub-note { padding-left: 1.1em; }
   background: transparent; color: var(--text); text-align: left; font-size: 15px; line-height: 1.4;
   white-space: nowrap; cursor: pointer;
 }
+.nav-link { text-decoration: none; }
 .nav-item:hover { background: var(--hover); color: var(--ink); }
 .nav-item.active { background: var(--accent-tint); color: var(--accent); font-weight: 700; }
 .nav-badge {
@@ -330,6 +331,9 @@ p.more-note { padding-top: 12px; }
 .reply-input { margin-top: 10px; }
 .reply-card .row-actions { margin-top: 10px; }
 .reply-card .notice.inline { display: block; margin-top: 10px; color: var(--warn); }
+/* Muse からの供給が止まっているときの警告。設定画面の長い説明文に埋もれないよう、赤い枠と地色で目立たせる */
+.notice.supply-warning { color: var(--danger); background: var(--danger-bg); border: 1px solid var(--danger); border-radius: 8px; padding: 10px 12px; font-weight: 600; }
+.notice.supply-warning[hidden] { display: none; }
 .responded { margin-top: 10px; padding: 2px 0 2px 10px; border-left: 2px solid var(--ok); color: var(--text); font-size: 15px; line-height: 1.65; }
 /* 期限切れで読めない添付画像の代わりに出す小さい文字リンク（枠線なし） */
 .reply-media-expired { display: inline-block; margin: 6px 0; color: var(--muted); font-size: 12px; text-decoration: underline; text-underline-offset: 2px; }

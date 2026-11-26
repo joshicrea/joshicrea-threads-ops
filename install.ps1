@@ -261,7 +261,7 @@ if ($nodeExe -and (Test-Path $codexDir)) {
         $mcpScript = ([IO.Path]::Combine($InstallPath, "mcp", "server.mjs")) -replace '\\', '/'
         $nodeFwd = $nodeExe -replace '\\', '/'
         $dataFwd = $DataDir -replace '\\', '/'
-        $codexBlock = "[mcp_servers.threads-ops]`ncommand = `"$nodeFwd`"`nargs = [`"$mcpScript`"]`n`n[mcp_servers.threads-ops.env]`nTHREADS_DATA_DIR = `"$dataFwd`"`n"
+        $codexBlock = "[mcp_servers.threads-ops]`ncommand = `"$nodeFwd`"`nargs = [`"$mcpScript`"]`n`n[mcp_servers.threads-ops.env]`nTHREADS_DATA_DIR = `"$dataFwd`"`nPORT = `"$Port`"`n"
         $codexClean = [regex]::Replace($codexOld, '(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|^#|\z)', '')
         $codexNew = if ($codexClean.Trim()) { $codexClean.TrimEnd() + "`n`n" + $codexBlock } else { $codexBlock }
         Write-Utf8NoBom -Path $codexToml -Content $codexNew
@@ -272,7 +272,7 @@ if ($nodeExe -and (Test-Path $codexDir)) {
 }
 
 # --- 5. 本体を安定した場所へ配置。データは別フォルダに置き、更新で消えないようにする ---
-$appItems = @("server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "package.json", "public", "start-hidden.vbs", "register-autostart.ps1", "stop.ps1", "uninstall.ps1", "README.md", "アンインストール.md", "relay")
+$appItems = @("server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "package.json", "public", "start-hidden.vbs", "register-autostart.ps1", "stop.ps1", "uninstall.ps1", "README.md", "アンインストール.md", "指示書.md", "relay")
 foreach ($item in $appItems) {
     $src = [IO.Path]::Combine($InstallPath, $item)
     if (Test-Path $src) {
@@ -423,5 +423,7 @@ Write-Host "次の手順:"
 Write-Host "  1. Claude Code を完全に閉じる（Node.js を今回入れた場合は、Claude Code を動かしているターミナルやエディタごと閉じる）"
 Write-Host "  2. Claude Code を再度開く"
 Write-Host "  3. チャットに「はじめまして」と送るとセットアップが始まります"
+Write-Host "  Muse を使う場合: 画面の設定「AIプロバイダ」で Muse を選んで保存し、Muse に指示書.md（~/.claude/threads-ops/app/指示書.md）を読ませてください。"
+Write-Host "  Muse は本体（下の画面と同じアドレス）を、ヘッダ x-threads-ops: 1 と x-threads-caller: muse を付けて呼びます。手順は指示書.md の「Muse が読み手のとき」にあります。"
 Write-Host "  画面: http://localhost:$Port"
 Write-Host ""

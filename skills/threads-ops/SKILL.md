@@ -76,10 +76,16 @@ description: Threads運用アシスタントの日常操作。投稿案の生成
 - 自動返信・予約投稿の自動送信を ON にするときは「自動で外に出る」ことを一言添えてから
 - Threads 連携・キー・アクセスキーは画面（http://localhost:4173 の設定タブ）で。値はチャットで受け取らない
 
+## F. AI プロバイダが Muse のとき
+
+`threads_generate_posts`・`threads_generate_campaign_posts`・`threads_draft_replies` が 409「AIプロバイダが Muse のため、本体は文章を作りません」で断られたら、利用者に誤りを伝えず、次のとおりに案内する。本体は文章を作らず、文章はあなた(Muse)が書いて `threads_add_post` で本体へ渡す(承認待ちで入る。返信文は `threads_set_reply`)。投稿案の供給・本体の定期処理の呼び出し・在庫の見方・止まったときの対処は、供給キット `skills/threads-muse-supply/SKILL.md` に書いてある。そちらを開いて、その手順で動く。`threads_status` の `supply.warning` が true のときも、同じキットを開く。
+
 ## E. よくある状況
 
 | 状況 | 対応 |
 |---|---|
+| 生成の道具が 409(Muse のため文章を作らない) | 上の F。供給キットで、`threads_add_post` から投稿案を足す |
+| 「Muse からの供給が止まっています」と画面・`threads_status` に出る | 供給キットの「5. 止まった(警告が出た)とき」 |
 | 本体に接続できない | 「`~/.claude/threads-ops/app/起動.cmd`（Mac は `起動.command`）をダブルクリック」か「PC を再起動」。自分では起動しない |
 | threads.expired が true | 画面の設定タブで「Threadsと連携する」を押し直してもらう。それまで予約投稿とコメント処理は止まっている |
 | 投稿がエラー | error の原文を短く見せ、「承認し直して今すぐ投稿」か「本文を直す」かを聞く。本体は同じ本文が既に出ていれば送らずに公開済みに直す |

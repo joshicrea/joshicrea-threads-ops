@@ -173,6 +173,8 @@ const defaultSettings = {
   accessKey: "",
   lastAiCheckAt: "",
   lastAiCheckProvider: "",
+  museWatchSince: "", // Muse を選んでいると本体が最初に気づいた時刻(tick が60分来ないかの起点)。Muse 以外では空
+  museStockLowSince: "", // 在庫(承認待ち+予約済み)が下限を割った状態になった時刻(24時間続いたかの起点)。割っていなければ空
   brandName: "",
   profile: "",
   writingRules: "断言しすぎない。体験談を起点にする。最後はコメントしやすい問いで終える。",
@@ -3130,7 +3132,7 @@ function applyTransition(post, action, options = {}) {
 // 承認のあと、自動送信がONで予約日時が未来なら、そのまま予約まで進める（2026-11-16 林さん決定「承認だけで予約まで進める」）。
 // 人の承認は必ず先に要る（review→approved は人の操作で、ここは承認の後ろだけ）。予約に進めない理由（日時が過去・安全確認・案件ルール）があれば、
 // 承認済みのまま残して理由を記録する（承認自体は取り消さない）。自動送信がOFFなら何もしない。
-function autoScheduleAfterApprove(d, post) {
+function autoScheduleAfterApprove(d, post, out = {}) {
   if (post.status !== "approved" || !d.settings.autoPublishEnabled) return false;
   const at = Date.parse(post.scheduledAt || "");
   if (!Number.isFinite(at) || at < Date.now() - 60_000) return false;
@@ -3138,6 +3140,7 @@ function autoScheduleAfterApprove(d, post) {
     applyTransition(post, "schedule", { safetyContext: { settings: d.settings, posts: d.posts } });
     return true;
   } catch (error) {
+    out.error = error; // 呼び出し側が、止めた実際の理由を返せるように
     if (error.safety) noteSafetyBlock(d, post, error.safety, "承認後の自動予約", { postId: post.id });
     else log(d, "info", `承認しましたが、自動の予約はできませんでした: ${error.message}`, { postId: post.id });
     return false;
@@ -4804,7 +4807,8 @@ async function schedulerTick() {
   const tickResult = { ran: true, published: 0, failed: 0 };
   try {
     await licenseTick().catch((error) => appendErrorLog(error));
-    const snapshot = await readDb();
+    const snapshot = await readDb(); // 毎分の読みはこの1回だけ(Muse の印の更新もこの内容を使う。印の更新で二重に読まない)
+    await updateMuseMarkers(snapshot).catch((error) => appendErrorLog(error));
     const licenseAllowed = licenseDecisionOf(snapshot).allowed;
     const tokenExpiry = Date.parse(snapshot.settings.threadsTokenExpiresAt || "");
     const tokenExpired = Boolean(snapshot.settings.threadsAccessToken) && Boolean(tokenExpiry) && tokenExpiry < Date.now();
@@ -5136,10 +5140,11 @@ function sanitizeSettings(current, rawInput) {
   for (const key of SETTINGS_KEYS) {
     if (!(key in input)) continue;
     const value = input[key];
+    if (key === "museWatchSince" || key === "museStockLowSince") continue; // Muse の供給が止まったかを数える印は、本体の定期処理だけが書く
     if (key === "lastAiCheckAt" || key === "lastAiCheckProvider") continue; // 接続確認の印は、接続テストと Muse の tick だけが書く(画面や外部から書いて「接続あり」を偽らせない)
     if (key === "aiProvider") {
       if (!AI_PROVIDER_CHOICES.includes(value)) throw new HttpError(400, `AIプロバイダの値が不正です: ${value}`);
-      if (value !== current.aiProvider) { next.providerMigratedFrom = ""; if (current.lastAiCheckProvider === "muse") { next.lastAiCheckProvider = ""; next.lastAiCheckAt = ""; } } // 利用者が選び直したので、読み替えの通知は終わり（画面は保存のたびに同じ値を送るので、変わったときだけ）。前に Muse で付いた「接続あり」の印は、切り替えで消す
+      if (value !== current.aiProvider) { next.museWatchSince = ""; next.museStockLowSince = ""; /* 往復で切り替えたとき、Muse に戻した時点からの60分で数え直す */ next.providerMigratedFrom = ""; if (current.lastAiCheckProvider === "muse") { next.lastAiCheckProvider = ""; next.lastAiCheckAt = ""; } } // 利用者が選び直したので、読み替えの通知は終わり（画面は保存のたびに同じ値を送るので、変わったときだけ）。前に Muse で付いた「接続あり」の印は、切り替えで消す
       next.aiProvider = value;
       continue;
     }
@@ -5376,12 +5381,65 @@ function statePayload(db, derived = {}) {
   };
 }
 
+// Muse からの供給が止まっていないかを見る(aiProvider=muse の間だけ)。画面の「今やること」・設定画面・MCP の threads_status が同じ答えを使う。
+// (i) Muse が x-threads-caller: muse を付けた tick の印が60分を超えて無い、(ii) 在庫(承認待ち+予約済み)が下限(1日の投稿数)を割った状態が24時間続いた。
+// どちらも「Muse に切り替えてから60分」「下限を割ってから24時間」を数える印(museWatchSince・museStockLowSince)を使う。印は schedulerTick が毎分更新する。
+// 提供元からお客様の環境へ常時つながる経路は無いので、検出はこの本体の画面と AI の状態照会が担う(提供元側の検出は対象外)。
+const MUSE_TICK_STALE_MS = 60 * 60 * 1000;
+const MUSE_STOCK_LOW_MS = 24 * 60 * 60 * 1000;
+function museStockInfo(db) {
+  const s = db.settings;
+  // 在庫: 承認待ち+予約済み。承認待ちのうち、予約時刻をとうに過ぎたもの(承認されないまま古くなった投稿)は、出せる在庫として数えない
+  const now = Date.now();
+  const stock = db.posts.filter((p) => !p.replyToId && (p.status === "scheduled" || (p.status === "review" && !(Date.parse(p.scheduledAt || "") < now - 60_000)))).length;
+  const planned = Number(s.postsPerDay) >= 1 ? Math.floor(Number(s.postsPerDay)) : (Array.isArray(s.scheduleTimes) ? s.scheduleTimes : []).filter((t) => /^\d{2}:\d{2}$/.test(t)).length;
+  // 下限は1日の投稿数。ただし安全確認がONなら、1日の投稿の上限(safetyDailyPostLimit)を超えて足す必要は無いので、上限で止める
+  const cap = s.safetyGuardEnabled === false ? Infinity : safetySetting(s, "safetyDailyPostLimit");
+  const lowerBound = Math.max(1, Math.min(planned, cap));
+  return { stock, lowerBound, low: stock < lowerBound };
+}
+// お客様のパソコンでの供給キットの置き場(このツールのフォルダの中の実パス)。警告文と、Muse を選ぶときの確認に出す
+const museKitPath = () => join(ROOT, "skills", "threads-muse-supply", "SKILL.md");
+function museSupplyStatus(db, nowMs = Date.now()) {
+  const s = db.settings;
+  if (!museHandsOff(s)) return { active: false };
+  const lastTickAt = s.lastAiCheckProvider === "muse" ? String(s.lastAiCheckAt || "") : "";
+  const tickMs = Date.parse(lastTickAt);
+  const watchMs = Date.parse(s.museWatchSince || "");
+  const noTick = !(Number.isFinite(tickMs) && nowMs - tickMs <= MUSE_TICK_STALE_MS);
+  const tickStale = noTick && Number.isFinite(watchMs) && nowMs - watchMs >= MUSE_TICK_STALE_MS;
+  const { stock, lowerBound, low } = museStockInfo(db);
+  const lowMs = Date.parse(s.museStockLowSince || "");
+  const stockStale = low && Number.isFinite(lowMs) && nowMs - lowMs >= MUSE_STOCK_LOW_MS;
+  const reasons = [
+    ...(tickStale ? ["Muse(あなたの AI)からの定期の連絡が60分以上ありません"] : []),
+    ...(stockStale ? [`投稿の在庫(承認待ち+予約済み)が下限${lowerBound}本を下回ったまま24時間たっています(今${stock}本)`] : [])
+  ];
+  return {
+    active: true, lastTickAt, tickStale, stock, lowerBound, stockLowSince: low ? String(s.museStockLowSince || "") : "", stockStale, warning: reasons.length > 0, reasons,
+    message: reasons.length ? `Muse からの供給が止まっています(${reasons.join("・")})。あなたの AI に、供給キット(このパソコンの ${museKitPath()})をもう一度実行してもらうか、設定の AI プロバイダを Claude Code・Codex CLI・Gemini API のどれかに切り替えてください。` : ""
+  };
+}
+// 印の更新。変わったときだけ保存する(毎分の書き込みを増やさない)
+async function updateMuseMarkers(snap) {
+  const s = snap.settings;
+  const muse = museHandsOff(s);
+  const nowAt = nowIso();
+  const watch = muse ? (s.museWatchSince || nowAt) : "";
+  const low = muse && museStockInfo(snap).low ? (s.museStockLowSince || nowAt) : "";
+  if ((s.museWatchSince || "") === watch && (s.museStockLowSince || "") === low) return;
+  await withDb(async (d) => {
+    d.settings.museWatchSince = watch;
+    d.settings.museStockLowSince = low;
+  });
+}
+
 const routes = [];
 function route(method, pattern, handler) {
   routes.push({ method, pattern, handler });
 }
 
-route("GET", "/api/state", async () => readDbForState().then((entry) => ({ status: 200, body: { ...statePayload(entry.db, entry), lastTick: lastExternalTick, schedulerLock: schedulerLockHeld ? "held" : (schedulerLockLost ? "lost" : "starting") } })));
+route("GET", "/api/state", async () => readDbForState().then((entry) => ({ status: 200, body: { ...statePayload(entry.db, entry), lastTick: lastExternalTick, museSupply: museSupplyStatus(entry.db), museKitPath: museKitPath(), schedulerLock: schedulerLockHeld ? "held" : (schedulerLockLost ? "lost" : "starting") } })));
 
 route("GET", "/api/monitoring/status", async () => {
   const db = await readDb();
@@ -5438,7 +5496,7 @@ route("POST", "/api/ai-check", async () => {
     const markedAt = db.settings.lastAiCheckProvider === "muse" && db.settings.lastAiCheckAt ? Date.parse(db.settings.lastAiCheckAt) : 0;
     const at = Number.isFinite(markedAt) ? markedAt : 0;
     const ok = Boolean(at) && Date.now() - at < 60 * 60 * 1000;
-    return { status: 200, body: { provider, ok, greeting: ok ? "Museから接続あり" : "", ms: 0, command: "", lastTickAt: at ? new Date(at).toISOString() : "", note: ok ? "Muse が最後に定期処理(tick)を呼んだ時刻から60分以内です。" : "Muse からの定期処理(tick)の呼び出しが、まだ無いか、60分以上前です。Muse 側のスケジュールと、本体への接続(ヘッダ x-threads-ops: 1 と x-threads-caller: muse)を確かめてください。" } };
+    return { status: 200, body: { provider, ok, greeting: ok ? "Museから接続あり" : "", ms: 0, command: "", lastTickAt: at ? new Date(at).toISOString() : "", note: ok ? "Muse(あなたの AI)からの最後の定期の連絡が、60分以内に届いています。" : "Muse(あなたの AI)からの定期の連絡が、まだ届いていないか、60分以上前です。Muse 側のスケジュールと、このツールへの接続(ヘッダ x-threads-ops: 1 と x-threads-caller: muse を付けた連絡)を確かめてください。" } };
   }
   const result = await callAiJson(db.settings, "接続テストです。{\"ok\": true, \"greeting\": \"<日本語で10文字以内のあいさつ>\"} の形で返してください。", schema, { maxOutputTokens: 256 });
   await withDb(async (d) => {
@@ -6536,20 +6594,148 @@ function pickContent(body) {
   return patch;
 }
 
-route("POST", "/api/posts", async ({ body }) => {
-  const post = await withDb(async (d) => {
-    const created = normalizePost({ ...pickContent(body), status: "review", origin: "manual" });
-    if (!created.text.trim()) throw new HttpError(400, "本文を入力してください。");
-    created.copyOverlapWarning = checkCopyOverlap(d, created.text);
-    created.safety = evaluateSafety(created, { settings: d.settings, posts: d.posts, stage: "generate" });
-    d.posts.unshift(created);
-    log(d, "info", "投稿を手動追加しました。", { postId: created.id });
-    if (created.copyOverlapWarning) {
-      log(d, "error", `参考投稿との一致率が高いため確認してください（${created.copyOverlapWarning.ratio}%一致）。`, { postId: created.id });
+// 投稿を1件、承認待ちで足す検証と登録。画面の手動追加(POST /api/posts)と、Muse が MCP の threads_add_post で呼ぶ
+// 供給の経路(POST /api/supply/post)の両方がこの1つを呼ぶ(検証を2か所に書かない)。
+// opts.supply=true は供給の経路だけ: 同じ本文の重複を断る・文字数と案件ルールを足す時点で見る・安全確認で止まる内容を断る・
+// 予約時刻つきで、自動送信がONなら予約済みまで進める。opts なしの動きは従来の手動追加と同じ。
+function addManualPost(d, body, opts = {}) {
+  const created = normalizePost({ ...pickContent(body), status: "review", origin: opts.supply ? "muse" : "manual" });
+  let autoSlot = false; // 時刻を付けなかったので本体が枠を入れた(この投稿は、呼んだ側が予約を求めたものではない)
+  let slotFullNote = ""; // 1日の本数に空きが無く、枠を入れられなかった理由
+  let dayFullLimit = 0; // 呼んだ側が付けた予約時刻の日が、すでに1日の本数に達している(その本数)
+  let calLimit = Infinity; // 1日(JST暦日)の本数。G2 の目安の時刻が、満杯の日に当たらないよう見るために使う
+  if (!created.text.trim()) throw new HttpError(400, "本文を入力してください。");
+  if (opts.supply) {
+    // 予約時刻は ISO 8601(時差つき)だけ受ける。"Nov 30 2026" のような読み方が処理系で変わる書き方は断る
+    const rawAt = String(body.scheduledAt || "").trim();
+    const isoParts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-](\d{2}):?(\d{2}))$/.exec(rawAt);
+    // 日付と時刻が実在するか(2027-02-30 が3/2に、T24:00 が翌日0時に読み替えられるのを断る)
+    const realDate = (() => {
+      if (!isoParts) return false;
+      const [y, mo, da, hh, mi, ss, oh, om] = isoParts.slice(1).map((v) => (v === undefined ? 0 : Number(v)));
+      const probe = new Date(Date.UTC(y, mo - 1, da));
+      return probe.getUTCFullYear() === y && probe.getUTCMonth() === mo - 1 && probe.getUTCDate() === da && hh <= 23 && mi <= 59 && ss <= 59 && oh <= 23 && om <= 59;
+    })();
+    if (rawAt && (!realDate || !created.scheduledAt)) throw new HttpError(400, "予約時刻を読めません。ISO 8601(例: 2026-11-22T09:00:00+09:00)で、実在する日付と時刻を渡してください。");
+    if (created.scheduledAt && Date.parse(created.scheduledAt) < Date.now() - 60_000) throw new HttpError(400, "予約時刻が過去です。");
+    assertTextWithinLimit(created);
+    const bad = profileViolations(created.text);
+    if (bad.length) throw new HttpError(409, `案件ルール違反が${bad.length}件あります: ${bad.slice(0, 3).join(" / ")}${bad.length > 3 ? ` ほか${bad.length - 3}件` : ""}。本文を直してください。`);
+    // 同じ本文の判定: 全角半角・大文字小文字・空白・見えない文字(ゼロ幅)の違いを無視する。却下した本文・エラーの本文も同じ本文として断る(同じものを何度も供給しない)
+    // 見えない文字(ソフトハイフン・ゼロ幅・向き指定・異体字セレクタ)は消す。空白は、英数字どうしの間だけ1つ残す(the rapist と therapist を同じにしない)。末尾の句読点・記号は無視する
+    const key = (t) => String(t || "").normalize("NFKC").toLowerCase()
+      .replace(/[­ᅟᅠ᠎​-‏‪-‮⁠-⁩ㅤ︎️﻿]/g, "")
+      .replace(/(?<=[a-z0-9])\s+(?=[a-z0-9])/g, "\u0001").replace(/\s+/g, "").replace(/\u0001/g, " ")
+      .replace(/[。．.!！?？、,，…」』）)”’"'】〕］\]]+$/u, "");
+    const same = d.posts.find((p) => !p.replyToId && key(p.text) === key(created.text));
+    if (same) throw new HttpError(409, `同じ本文の投稿がすでにあります(${statusLabel(same.status)}・${same.id})。別の本文で追加してください。`);
+    // 予約時刻を付けなかった投稿には、自動生成の投稿と同じに、次の空いている枠を入れておく(承認待ちのまま)。
+    // 時刻が無いと、承認しても自動送信ONでも予約まで進まず、公開されないため。人が承認したとき、自動送信がONなら予約される
+    // 1日(JST)の本数は、1日の投稿数と、安全確認がONなら1日の上限のうち小さい方を超えない。空きが無ければ時刻なしの承認待ちのまま理由を返す
+    // 時刻つきの供給も同じ1日の本数に入れる。その日がすでに上限なら、予約せず承認待ちのまま理由を返す(自動送信ONでも承認なしで予約まで進めない)。
+    // なお、ここの「1日」はJSTの暦日で、安全確認 G2 の「直近24時間」とは別の数え方。G2 に止められたときは、止めた実際の理由を返す(下の予約段)
+    // エラーになった予約・却下した投稿は、その日の枠を塞がない(出ないものを1日の本数に数えない)
+    const live = d.posts.filter((p) => p.scheduledAt && p.status !== "rejected" && p.status !== "error" && !p.replyToId);
+    const dayCount = new Map();
+    for (const p of live) { const k = jstYmd(Date.parse(p.scheduledAt)); dayCount.set(k, (dayCount.get(k) || 0) + 1); }
+    const s = d.settings;
+    const perDay = Number(s.postsPerDay) >= 1 ? Math.floor(Number(s.postsPerDay)) : (Array.isArray(s.scheduleTimes) ? s.scheduleTimes : []).filter((t) => /^\d{2}:\d{2}$/.test(t)).length;
+    const cap = s.safetyGuardEnabled === false ? Infinity : safetySetting(s, "safetyDailyPostLimit");
+    const dayLimit = Math.max(1, Math.min(perDay || 1, cap));
+    calLimit = dayLimit;
+    if (created.scheduledAt &&(dayCount.get(jstYmd(Date.parse(created.scheduledAt))) || 0) >= dayLimit) dayFullLimit = dayLimit;
+    if (!created.scheduledAt) {
+      const taken = live.filter((p) => p.status !== "published").map((p) => Date.parse(p.scheduledAt));
+      // 揺らぎの割り当て(1日を本数ぶんの時間帯に等分する)のときは、同じ日の同じ時間帯に2本入れない。朝に固まらず、7〜21時に散らす
+      const jittered = Number(s.postsPerDay) >= 1;
+      const jPer = Math.max(1, Math.floor(Number(s.postsPerDay)) || 1);
+      const fromH = Number.isFinite(Number(s.scheduleFromHour)) ? Number(s.scheduleFromHour) : 7;
+      const toH = Number.isFinite(Number(s.scheduleToHour)) ? Number(s.scheduleToHour) : 21;
+      const width = Math.max(1, (toH - fromH) * 60 / jPer);
+      const winOf = (ms) => { const j = new Date(ms + 9 * 3600_000); return Math.min(jPer - 1, Math.max(0, Math.floor((j.getUTCHours() * 60 + j.getUTCMinutes() - fromH * 60) / width))); };
+      const winTaken = new Map();
+      for (const p of live) { const k = jstYmd(Date.parse(p.scheduledAt)); if (!winTaken.has(k)) winTaken.set(k, new Set()); winTaken.get(k).add(winOf(Date.parse(p.scheduledAt))); }
+      const eligible = assignSchedule(s, undefined, live.length + 60).filter((iso) => {
+        const ms = Date.parse(iso); const k = jstYmd(ms);
+        return (dayCount.get(k) || 0) < dayLimit && taken.every((t) => Math.abs(t - ms) >= 10 * 60_000) && !(jittered && winTaken.get(k)?.has(winOf(ms)));
+      });
+      // 最も早い空き日の、空いている時間帯の中からランダムに1つ(いつも先頭の時間帯にならない)
+      const sameDay = eligible.length ? eligible.filter((iso) => jstYmd(Date.parse(iso)) === jstYmd(Date.parse(eligible[0]))) : [];
+      const slot = sameDay.length ? sameDay[Math.floor(Math.random() * sameDay.length)] : "";
+      if (slot) { created.scheduledAt = slot; autoSlot = true; } else slotFullNote = `1日の本数(${dayLimit}本)に空きが無いため、予約時刻なしの承認待ちに入れました。承認する前に、利用者が日時を入れてください。`;
     }
-    return { value: created };
-  });
+  }
+  created.copyOverlapWarning = checkCopyOverlap(d, created.text);
+  created.safety = evaluateSafety(created, { settings: d.settings, posts: d.posts, stage: "generate" });
+  if (opts.supply) {
+    const contentBlocked = created.safety.reasons.filter((r) => r.level === "blocked" && !SAFETY_RATE_RULES.has(r.rule));
+    if (contentBlocked.length) throw new HttpError(409, `安全確認で止まる内容です(${contentBlocked.map((r) => r.rule).join("・")})。本文を直してください。`);
+  }
+  d.posts.unshift(created);
+  log(d, "info", opts.supply ? "Muse から投稿を追加しました。" : "投稿を手動追加しました。", { postId: created.id });
+  if (created.copyOverlapWarning) {
+    log(d, "error", `参考投稿との一致率が高いため確認してください（${created.copyOverlapWarning.ratio}%一致）。`, { postId: created.id });
+  }
+  let scheduleNote = "";
+  // 安全確認 G2(直近24時間の上限)に収まるか、収まらないなら入る目安の時刻。本体の枠(JSTの暦日)とは別の数え方なので、ここで別に見る
+  const g2Cap = d.settings.safetyGuardEnabled === false ? Infinity : safetySetting(d.settings, "safetyDailyPostLimit");
+  const g2List = opts.supply ? safetyPostTimes(d.posts, created.id, true) : [];
+  // 承認待ちで時刻が付いている供給の投稿は、承認されれば直近24時間に入る。時刻なしで追加したときの警告は、これも数える(本体の枠は承認待ちの分を満杯の日として避けるため、承認待ちどうしが同じ24時間に重なりうる)
+  const g2Pending = opts.supply ? d.posts.filter((p) => p.id !== created.id && p.status === "review" && p.scheduledAt && !p.replyToId).map((p) => Date.parse(p.scheduledAt)).filter(Number.isFinite) : [];
+  const g2CountIn = (list, t) => list.reduce((n, x) => (x > t - SAFETY_DAY_MS && x <= t ? n + 1 : n), 0);
+  const g2FitsIn = (list, ms) => !Number.isFinite(g2Cap) || (g2CountIn(list, ms) + 1 <= g2Cap && !list.some((t) => t > ms && t < ms + SAFETY_DAY_MS && g2CountIn(list, t) + 1 > g2Cap));
+  const g2Fits = (ms) => g2FitsIn(g2List, ms);
+  // その日(JST暦日)の本数。この投稿自身・却下・エラー・返信は数えない(本体の枠の数え方と同じ)
+  const calCount = (ms) => d.posts.filter((p) => p.id !== created.id && p.scheduledAt && p.status !== "rejected" && p.status !== "error" && !p.replyToId && jstYmd(Date.parse(p.scheduledAt)) === jstYmd(ms)).length;
+  // 目安の時刻は、24時間の上限に収まる最初の時刻のうち、その日の本数(1日の上限)が満杯でない日のものにする(目安どおりに送り直しても断られない)
+  const g2EarliestIn = (list, fromMs) => { for (let t = fromMs; t < fromMs + 5 * SAFETY_DAY_MS; t += 10 * 60_000) if (g2FitsIn(list, t) && calCount(t) < calLimit) return t; return NaN; };
+  const jstLabel = (ms) => new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hourCycle: "h23" }).format(new Date(ms));
+  const g2HintIn = (list) => { const at = g2EarliestIn(list, Date.parse(created.scheduledAt)); return Number.isFinite(at) ? `目安として ${jstLabel(at)} 以降なら入ります。` : "目安の時刻を出せませんでした。1日の上限の設定を見直してください。"; };
+  const g2Hint = () => g2HintIn(g2List);
+  // 予約まで進めなかった実際の理由(一般的な文にしない): G2 なら G2 と分かる文と目安の時刻、それ以外の安全確認はその理由
+  const stopNote = (err) => {
+    const blocked = (err?.safety?.reasons || []).filter((r) => r.level === "blocked");
+    if (blocked.some((r) => r.rule === "G2")) return `直近24時間の投稿の上限(G2: ${g2Cap}本)に達するため、予約せず承認待ちに入れました。${g2Hint()}`;
+    if (err?.safety) return `安全確認で止まったため、予約せず承認待ちに入れました: ${err.message}`;
+    if (err) return `予約せず承認待ちに入れました: ${err.message}`;
+    return "予約できる状態ではなかったため、承認待ちに入れました(予約時刻が過去になっていないか、安全確認を確かめてください)。";
+  };
+  if (opts.supply && slotFullNote) scheduleNote = slotFullNote;
+  else if (opts.supply && autoSlot) scheduleNote = g2FitsIn([...g2List, ...g2Pending], Date.parse(created.scheduledAt))
+    ? "予約時刻を付けなかったので、次の空いている枠の日時を入れて承認待ちに置きました。利用者が承認すると、自動送信がONなら予約されます。"
+    : `予約時刻を付けなかったので、次の空いている枠の日時を入れて承認待ちに置きました。ただし、直近24時間の投稿の上限(G2: ${g2Cap}本)にかかる場所のため(承認待ちの投稿も、承認されれば数えます)、承認しても予約されない可能性があります。${g2HintIn([...g2List, ...g2Pending])}`;
+  else if (opts.supply && created.scheduledAt) {
+    // 呼んだ側が予約時刻を付けた。承認と予約まで進めるのは、自動送信がONで、承認・予約と同じ確認(案件ルール・文字数・安全確認)を通ったときだけ。
+    // 途中で止まったら、承認前の状態(承認待ち)に戻す(人が一度も見ていない投稿を「承認済み」で残さない)
+    if (dayFullLimit) scheduleNote = `その日は1日の本数(${dayFullLimit}本)にすでに達しているため、予約せず承認待ちに入れました。利用者がこのまま承認すると、その日の本数(${dayFullLimit}本)を超えます。別の日を選ぶか、承認のときに日時を調整してください。`;
+    else if (!d.settings.autoPublishEnabled) scheduleNote = "自動送信がOFFのため、予約せず承認待ちに入れました。承認して予約するには、利用者が自動送信をONにします。";
+    else if (created.copyOverlapWarning) scheduleNote = "参考投稿との一致率が高いため、予約せず承認待ちに入れました。";
+    else {
+      try {
+        applyTransition(created, "approve", { safetyContext: { settings: d.settings, posts: d.posts } });
+        const why = {};
+        if (autoScheduleAfterApprove(d, created, why)) log(d, "info", "Muse が予約時刻つきで追加したため、承認と予約まで進めました。", { postId: created.id });
+        else { created.status = "review"; scheduleNote = stopNote(why.error); log(d, "info", "Muse が追加した投稿は予約に進めなかったため、承認待ちに戻しました。直前の「承認」「予約できなかった」の記録は、追加の直後に本体が自動で試した処理で、人が承認したものではありません。", { postId: created.id }); }
+      } catch (error) {
+        created.status = "review";
+        if (error.safety) noteSafetyBlock(d, created, error.safety, "Muse が追加した投稿の予約", { postId: created.id }); // 画面からの承認が止まったときと同じに、ログへ残す
+        log(d, "info", "Muse が追加した投稿は予約に進めなかったため、承認待ちに戻しました。直前の「承認」「予約できなかった」の記録は、追加の直後に本体が自動で試した処理で、人が承認したものではありません。", { postId: created.id });
+        scheduleNote = stopNote(error);
+      }
+    }
+  }
+  return { post: created, scheduleNote };
+}
+
+route("POST", "/api/posts", async ({ body }) => {
+  const { post } = await withDb(async (d) => ({ value: addManualPost(d, body) }));
   return { status: 200, body: { post } };
+});
+
+// Muse(お客様ご自身の AI)が MCP の threads_add_post から投稿を足す経路。検証は addManualPost の1つを、供給の指定で呼ぶ。
+route("POST", "/api/supply/post", async ({ body }) => {
+  const { post, scheduleNote } = await withDb(async (d) => ({ value: addManualPost(d, body || {}, { supply: true }) }));
+  return { status: 200, body: { post, scheduled: post.status === "scheduled", ...(scheduleNote ? { note: scheduleNote } : {}) } };
 });
 
 // 内容の編集。公開済みは編集不可。承認済み・予約済みの本文を変えたら承認待ちに戻す（承認した内容と別物になるため）。
@@ -6823,7 +7009,15 @@ route("POST", "/api/tick", async ({ headers }) => {
   }
   return { status: 200, body: { ok: true, scheduler, dailyDrafts } };
 });
-route("POST", "/api/refresh-insights", async () => {
+route("POST", "/api/refresh-insights", async ({ headers, remoteAddress }) => {
+  // 呼び出し元の記録(2026-11-20): 誰が叩いているか後から分かるようにする。キー類のヘッダは読まない。成功・失敗にかかわらず先に残す
+  await withDb(async (d) => {
+    log(d, "info", "インサイト取得が呼ばれました。", {
+      caller: String(headers?.["x-threads-caller"] || "").slice(0, 60),
+      userAgent: String(headers?.["user-agent"] || "").slice(0, 200),
+      remote: String(remoteAddress || "").slice(0, 60)
+    });
+  });
   const snapshot = await readDb();
   if (!snapshot.posts.some((post) => post.status === "published" && post.threadsId)) throw new HttpError(400, "公開済みの投稿がまだありません。");
   const { fetched, failed, failures } = await collectInsights(snapshot);
@@ -7047,7 +7241,8 @@ async function handleApi(req, res, url) {
   if (req.method !== "GET") {
     const origin = req.headers.origin;
     if (req.headers[API_HEADER_NAME] !== API_HEADER_VALUE || (origin && !allowedOrigins().includes(origin))) {
-      return json(res, 403, { error: "この操作は運用アシスタントの画面からのみ実行できます。", detail: `origin=${origin || "-"}` });
+      const headerOk = req.headers[API_HEADER_NAME] === API_HEADER_VALUE;
+      return json(res, 403, { error: "この操作は運用アシスタントの画面からのみ実行できます。" + (headerOk ? "" : "呼び出しに x-threads-ops: 1 のヘッダが付いていません(画面と MCP の道具は自動で付けます。curl で呼ぶときは -H \"x-threads-ops: 1\" を付けてください)。"), detail: `${headerOk ? "origin-not-allowed" : "header-missing"} origin=${origin || "-"}` });
     }
   }
   if (isExposed() && !accessKeyCache) {
@@ -7061,7 +7256,7 @@ async function handleApi(req, res, url) {
   if (!matched) return json(res, 404, { error: "APIが見つかりません。", detail: `${req.method} ${url.pathname}` });
   try {
     const body = ["POST", "PUT", "DELETE"].includes(req.method) ? await bodyJson(req) : {};
-    const result = await matched.handler({ params: matched.params, body, url, headers: req.headers });
+    const result = await matched.handler({ params: matched.params, body, url, headers: req.headers, remoteAddress: req.socket?.remoteAddress || "" });
     return json(res, result.status || 200, result.body);
   } catch (error) {
     const status = error.status && error.status >= 400 && error.status < 600 ? (error instanceof ExternalApiError ? 502 : error.status) : 500;

@@ -26,6 +26,9 @@ PLUGINS_DIR = CLAUDE_DIR / "plugins"
 CACHE_DIR = PLUGINS_DIR / "cache" / "joshicrea" / "joshicrea-threads-ops"
 BASE_DIR = CLAUDE_DIR / "threads-ops"
 APP_DIR = BASE_DIR / "app"
+# 検証用: THREADS_PORT で本体のポートを変える（install.ps1 と同じ）。Codex の登録ブロックにも同じ値を入れる
+_p = os.environ.get("THREADS_PORT", "")
+PORT = _p if (_p.isascii() and _p.isdigit() and 2 <= len(_p) <= 5) else "4173"
 DATA_DIR = BASE_DIR / "data"
 for d in (CACHE_DIR, APP_DIR, DATA_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -494,7 +497,7 @@ def register_codex(home, node_exe, mcp_script, data_dir):
     old = toml.read_text(encoding="utf-8") if toml.exists() else ""
     if toml.exists():
         shutil.copy2(toml, str(toml) + ".bak-threads-ops")
-    block = f'[mcp_servers.threads-ops]\ncommand = "{Path(node_exe).as_posix()}"\nargs = ["{Path(mcp_script).as_posix()}"]\n\n[mcp_servers.threads-ops.env]\nTHREADS_DATA_DIR = "{Path(data_dir).as_posix()}"\n'
+    block = f'[mcp_servers.threads-ops]\ncommand = "{Path(node_exe).as_posix()}"\nargs = ["{Path(mcp_script).as_posix()}"]\n\n[mcp_servers.threads-ops.env]\nTHREADS_DATA_DIR = "{Path(data_dir).as_posix()}"\nPORT = "{PORT}"\n'
     clean = _re.sub(r"(?ms)^\[mcp_servers\.threads-ops(\.env)?\][^\r\n]*\r?\n.*?(?=^\[|^#|\Z)", "", old)
     toml.write_text((clean.rstrip() + "\n\n" + block) if clean.strip() else block, encoding="utf-8")
     print(f"Codex にも登録しました: {toml}（Codex を開き直すと使えます）")
@@ -506,7 +509,7 @@ except Exception as e:
     print(f"注意: Codex への登録に失敗しました（Claude Code の方は使えます）: {e}")
 
 # --- 5. 本体を安定した場所へ配置。データは別フォルダ ---
-for name in ["server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "watchdog.js", "package.json", "public", "README.md", "relay", "uninstall.py", "アンインストール.md"]:
+for name in ["server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "watchdog.js", "package.json", "public", "README.md", "relay", "uninstall.py", "アンインストール.md", "指示書.md"]:
     src = install_path / name
     if not src.exists():
         continue
@@ -661,5 +664,7 @@ print("次の手順:")
 print("  1. Claude Code を完全に閉じる（Node.js を今回入れた場合は、Claude Code を動かしているターミナルやエディタごと閉じる）")
 print("  2. Claude Code を再度開く")
 print("  3. チャットに「はじめまして」と送るとセットアップが始まります")
+print("  Muse を使う場合: 画面の設定「AIプロバイダ」で Muse を選んで保存し、Muse に指示書.md（~/.claude/threads-ops/app/指示書.md）を読ませてください。")
+print("  Muse は本体（下の画面と同じアドレス）を、ヘッダ x-threads-ops: 1 と x-threads-caller: muse を付けて呼びます。手順は指示書.md の「Muse が読み手のとき」にあります。")
 print("  画面: http://localhost:4173")
 print()

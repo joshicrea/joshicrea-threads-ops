@@ -312,7 +312,7 @@ function renderDashboard() {
       : state.settings.lastAiCheckProvider === provider;
   const threadsReady = Boolean(state.settings.threadsAccessToken) && !threadsTokenExpired();
   const steps = [
-    { done: aiReady, title: "AIが使えるか確かめる", note: aiReady ? "済み" : provider === "gemini" ? "Gemini APIキーを設定する（または AIプロバイダを Claude Code に切り替える）" : provider === "muse" ? "Muse 側で「15分ごとにこのツールへ tick を送る」予定を入れると済みになります（最後に送られてから60分以内）。設定の「接続テスト」でも確かめられます" : `${provider === "codex" ? "Codex" : "Claude Code"} が使える状態か、設定の「接続テスト」で1回確認する`, goto: "settings" },
+    { done: aiReady, title: "AIが使えるか確かめる", note: aiReady ? "済み" : provider === "gemini" ? "Gemini APIキーを設定する（または AIプロバイダを Claude Code に切り替える）" : provider === "muse" ? "Muse 側で「15分ごとに、このツールへ定期の連絡を送る」予定を入れると済みになります（最後の連絡から60分以内）。設定の「接続テスト」でも確かめられます" : `${provider === "codex" ? "Codex" : "Claude Code"} が使える状態か、設定の「接続テスト」で1回確認する`, goto: "settings" },
     { done: threadsReady, title: "Threadsと連携する", note: threadsReady ? "済み" : threadsTokenExpired() ? "Threadsの連携が期限切れです。設定で「Threadsと連携する」をもう一度押す" : "投稿・コメント取得・インサイトに必要です", goto: "settings", focus: "threadsLinkCode" },
     { done: state.posts.length > 0, title: "最初の投稿案を作る", note: state.posts.length ? "済み" : "リサーチで参考投稿を集め、投稿生成で最初の投稿案を作る", goto: "research" }
   ];
@@ -330,6 +330,7 @@ function renderDashboard() {
   const todos = [];
   const lic = state.license || {};
   if (state.settings.providerMigratedFrom) todos.push({ text: "以前の AIプロバイダ（Claude API など）は選べなくなったため、Claude Code に切り替えました。Claude Code がこの PC に入っていない場合は、設定で Muse・Codex CLI・Gemini API から選び直してください", goto: "settings", focus: "aiProvider", tone: "warn" });
+  if (state.museSupply?.warning) todos.push({ text: state.museSupply.message, goto: "settings", focus: "aiProvider", tone: "danger" });
   if (lic.enforced && !lic.allowed) todos.push({ text: `${lic.message} 自動の投稿・返信・削除は止まっています`, goto: "settings", focus: "licenseKey", tone: "danger" });
   else if (lic.status === "grace" || lic.status === "no_key_grace") todos.push({ text: lic.message, goto: "settings", focus: "licenseKey", tone: "warn" });
   if (countStatus("error")) todos.push({ count: countStatus("error"), text: `エラーになった投稿が${countStatus("error")}件あります。原因を確認して承認し直す`, goto: "queue", filter: "error", tone: "danger" });
@@ -1151,6 +1152,10 @@ function renderSettings() {
   const migrated = s.providerMigratedFrom || "";
   $("#providerMigratedNote").hidden = !migrated;
   $("#providerMigratedText").textContent = migrated ? `以前の設定（${migrated === "claude-api" ? "Claude API" : "選べない値"}）は、この版から選べなくなりました。AIプロバイダは Claude Code に切り替えました。保存してあった API キーはこの PC に残っていますが、使われません。Claude Code がこの PC に入っていない場合は、Muse・Codex CLI・Gemini API から選び直してください。` : "";
+  // Muse からの供給が止まっているとき(tick が60分来ない・在庫が下限を割って24時間)の通知。止まりが直れば消える
+  const supplyWarn = state.museSupply?.warning ? state.museSupply.message : "";
+  $("#museSupplyNote").hidden = !supplyWarn;
+  $("#museSupplyText").textContent = supplyWarn;
   $("#geminiApiKey").value = s.geminiApiKey || "";
   $("#geminiModel").value = s.geminiModel || "";
   $("#geminiModelAuto").checked = s.geminiModelAuto !== false;
@@ -1406,6 +1411,8 @@ function collectSettings() {
   };
 }
 
+const museSelectWarning = () => `このツールは文章を作らなくなります。あなたの AI が投稿の下書きを足し続ける設定(供給キット)が必要です。\n\n供給キットは、このパソコンの ${state.museKitPath || "このツールのフォルダの skills/threads-muse-supply/SKILL.md"} にあります。あなたの AI にこのファイルを読ませてください。保存したあと、Muse からの接続が「接続あり」になるまで、設定の接続表示で確かめてください。\n\nMuse を選んで保存しますか。`;
+
 async function saveSettings(button) {
   const enteredKey = $("#accessKey").value.trim();
   const wasOn = Boolean(state.settings.autoPublishEnabled);
@@ -1414,6 +1421,10 @@ async function saveSettings(button) {
       $("#autoPublishEnabled").checked = false;
       return false;
     }
+  }
+  // Muse を新しく選んで保存するときは、確認を1回出す(表示だけ。「続ける」を選んだときは、選んだ値のまま保存する)
+  if ($("#aiProvider").value === "muse" && state.settings.aiProvider !== "muse") {
+    if (!confirm(museSelectWarning())) return false;
   }
   const result = await busy(button, "保存中", async () => {
     await api("/api/settings", { method: "POST", body: collectSettings() });

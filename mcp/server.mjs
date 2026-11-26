@@ -81,8 +81,8 @@ function readAccessKey() {
   return "";
 }
 
-async function api(path, { method = "GET", body } = {}) {
-  const headers = { "content-type": "application/json", "x-threads-ops": "1", origin: `http://localhost:${PORT}` };
+async function api(path, { method = "GET", body, headers: extraHeaders } = {}) {
+  const headers = { "content-type": "application/json", "x-threads-ops": "1", origin: `http://localhost:${PORT}`, ...(extraHeaders || {}) };
   const key = readAccessKey();
   if (key) headers["x-threads-key"] = key;
   let res;
@@ -124,8 +124,9 @@ function nextStep(s, tokenExpired) {
   if (st.aiProvider === "gemini" && !st.geminiApiKey) return "文章を作る AI が使えない設定です。threads_update_settings で aiProvider を claude-code にしてから、threads_ai_check で確かめてください。";
   if (st.aiProvider !== "muse" && !st.lastAiCheckAt) return "文章を作る AI がこの PC で動くか、threads_ai_check で確かめてください（最大3分）。";
   if (!st.brandName || !st.profile) return "発信者情報が空です。初回セットアップ（名前・何をしている人か・文体・最後の一言）を1問ずつ聞いて、threads_update_settings で保存してください。文体は好みを聞く前に、利用者が過去に書いた文章を2〜3本貼ってもらい、そこから決まりごとの下書きを作って本人に確かめてください（手順は threads_guide の「3. はじめて使う人」）。";
+  if (st.aiProvider === "muse" && s.museSupply?.warning) return `${s.museSupply.message} 供給キットの手順は skills/threads-muse-supply/SKILL.md です。`;
   if (review) return `承認待ちの投稿が ${review} 件あります。threads_list_posts（status=review）で本文を見せて、承認するか聞いてください。`;
-  if (st.aiProvider === "muse") return `文章を作るのは Muse です（本体は文章を作りません）。投稿案は Muse が作って、本体の POST http://localhost:${PORT}/api/posts へ渡します(承認待ちで入ります)。本体への送信には、ヘッダ x-threads-ops: 1(アクセスキーを設定している場合は x-threads-key も)が要ります。返信文は threads_set_reply で渡してください。渡した返信文は自動では送られないので、利用者に内容を見せて、指示があってから threads_reply で送ります。threads_generate_posts・threads_draft_replies は使えません(409で断られます)。予約投稿の公開とトークン更新は本体が自分で回します。Muse が POST /api/tick を、ヘッダ x-threads-ops: 1 と x-threads-caller: muse を付けて呼ぶと、その場でも1回動き、画面に「Muse から接続あり」と出ます。`;
+  if (st.aiProvider === "muse") return `文章を作るのは Muse です（本体は文章を作りません）。投稿案は Muse が作って、threads_add_post で本体へ渡します(承認待ちで入ります。手順は skills/threads-muse-supply/SKILL.md)。返信文は threads_set_reply で渡してください。渡した返信文は自動では送られないので、利用者に内容を見せて、指示があってから threads_reply で送ります。threads_generate_posts・threads_draft_replies は使えません(409で断られます)。予約投稿の公開とトークン更新は本体が自分で回します。Muse が POST /api/tick を、ヘッダ x-threads-ops: 1 と x-threads-caller: muse を付けて呼ぶと、その場でも1回動き、画面に「Muse から接続あり」と出ます。`;
   if ((st.themes || []).some((t) => t.enabled !== false)) return "投稿案を作れます。発信テーマが設定済みなので、テーマは聞かずに、目的だけ聞いて threads_generate_posts を topic なしで呼んでください（テーマは設定から自動で割り当てます）。";
   return "投稿案を作れます。目的とテーマを1つずつ聞いてから threads_generate_posts を呼んでください。";
 }
@@ -155,6 +156,7 @@ const tools = [
         version: s.version,
         threads: { connected: Boolean(settings.threadsAccessToken) && !tokenExpired, username: settings.threadsUsername || "", tokenExpiresAt: settings.threadsTokenExpiresAt || "", expired: Boolean(tokenExpired) },
         ai: { provider: settings.aiProvider, lastCheckAt: settings.lastAiCheckAt || "" },
+        ...(s.museSupply?.active ? { supply: { lastTickAt: s.museSupply.lastTickAt, stock: s.museSupply.stock, lowerBound: s.museSupply.lowerBound, warning: s.museSupply.warning, ...(s.museSupply.warning ? { message: s.museSupply.message } : {}) } } : {}),
         automation: { autoPublish: Boolean(settings.autoPublishEnabled), autoFetchReplies: Boolean(settings.autoFetchRepliesEnabled), autoReply: Boolean(settings.autoReplyEnabled), autoReplyPausedUntil: settings.autoReplyPausedUntil || "", scheduleTimes: settings.scheduleTimes || "" },
         sender: { brandName: settings.brandName || "", profileFilled: Boolean(settings.profile), writingRulesFilled: Boolean(settings.writingRules) },
         posts: count(s.posts, (p) => STATUS_LABEL[p.status] || p.status),
@@ -183,6 +185,22 @@ const tools = [
       const r = await api("/api/generate-posts", { method: "POST", body: args });
       return { created: (r.posts || []).map(briefPost), ...(r.themePlan ? { themes: r.themePlan } : {}) };
     }
+  },
+  {
+    name: "threads_add_post",
+    description: "投稿を1件、承認待ちで足す(外部には出ない)。AI プロバイダが Muse のとき、Muse(あなたの AI)が書いた投稿案を本体へ渡す道具。text=本文(500字まで)、category=カテゴリ(省略可)、topicTag=トピックタグ(省略可・#なし)、theme=発信テーマ名(省略可。threads_get_settings の themes の name)、scheduledAt=予約時刻(省略可・ISO 8601)。scheduledAt を付けて自動送信がONなら、承認と予約まで進めて「予約済み」で登録する(OFF・安全確認や案件ルールで予約できないときは承認待ちのまま入り、note に理由が返る)。scheduledAt は、利用者が「承認なしで予約まで進めてよい」と明確に言っているときだけ付ける。付けなければ、次の空いている枠の日時が入って承認待ちに置かれ、利用者が承認すると(自動送信がONなら)予約される。同じ本文がすでにある・本文が空・文字数超過・案件ルール違反・安全確認で止まる内容・読めない/過去の予約時刻は、登録せず断る。返信文の供給はこの道具ではなく threads_set_reply で足りる(コメントの下書きを差し替える。送信は利用者の指示があってから threads_reply)。返り値の id で threads_list_posts から確かめられる。",
+    inputSchema: { type: "object", properties: { text: { type: "string" }, category: { type: "string" }, topicTag: { type: "string" }, theme: { type: "string" }, scheduledAt: { type: "string" } }, required: ["text"], additionalProperties: false },
+    run: async ({ text, category, topicTag, theme, scheduledAt }) => {
+      const body = { text, ...(category ? { category } : {}), ...(topicTag ? { topicTag } : {}), ...(theme ? { theme } : {}), ...(scheduledAt ? { scheduledAt } : {}) };
+      const r = await api("/api/supply/post", { method: "POST", body });
+      return { id: r.post.id, post: briefPost(r.post), scheduled: Boolean(r.scheduled), ...(r.note ? { note: r.note } : {}) };
+    }
+  },
+  {
+    name: "threads_tick",
+    description: "本体の定期処理(予約投稿の公開・トークン更新)を、いま1回動かす。AI プロバイダが Muse のとき、これを呼ぶと本体が「Muse から接続あり」と数える(最後の呼び出しから60分あくと、画面と threads_status に「Muse からの供給が止まっています」が出るので、15分ごとに呼ぶ)。Muse 以外のプロバイダでは「接続あり」の印は付かない(定期処理が1回動くだけ)。HTTP が使えない AI は、curl の代わりにこの道具で呼べる。供給の手順は skills/threads-muse-supply/SKILL.md。",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    run: async () => api("/api/tick", { method: "POST", headers: { "x-threads-caller": "muse" } })
   },
   {
     name: "threads_generate_campaign_posts",
@@ -309,7 +327,7 @@ const tools = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     run: async () => {
       const s = (await api("/api/state")).settings;
-      const pick = ["expectedThreadsUsername", "threadsOAuthExchangeUrl", "aiProvider", "claudeModel", "brandName", "profile", "writingRules", "defaultCta", "scheduleTimes", "dailyDraftsCount", "dailyDraftsTime", "dailyDraftsLastDate", "autoPublishEnabled", "autoFetchRepliesEnabled", "autoFetchRepliesMinutes", "autoReplyEnabled", "autoReplyIntervalSec", "autoReplyDailyCap", "autoInsightsEnabled", "threadsUsername", "threadsTokenExpiresAt", "threadsRedirectUri"];
+      const pick = ["expectedThreadsUsername", "threadsOAuthExchangeUrl", "aiProvider", "claudeModel", "brandName", "profile", "writingRules", "defaultCta", "scheduleTimes", "dailyDraftsCount", "dailyDraftsTime", "dailyDraftsLastDate", "autoPublishEnabled", "autoFetchRepliesEnabled", "autoFetchRepliesMinutes", "autoReplyEnabled", "autoReplyIntervalSec", "autoReplyDailyCap", "autoInsightsEnabled", "themes", "postsPerDay", "materials", "replyStyle", "campaigns", "safetyDailyPostLimit", "threadsUsername", "threadsTokenExpiresAt", "threadsRedirectUri"];
       return Object.fromEntries(pick.map((k) => [k, s[k]]));
     }
   },
