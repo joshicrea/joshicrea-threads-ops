@@ -509,7 +509,7 @@ except Exception as e:
     print(f"注意: Codex への登録に失敗しました（Claude Code の方は使えます）: {e}")
 
 # --- 5. 本体を安定した場所へ配置。データは別フォルダ ---
-for name in ["server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "watchdog.js", "package.json", "public", "README.md", "relay", "uninstall.py", "アンインストール.md", "指示書.md"]:
+for name in ["server.js", "research.js", "license.js", "license_public.pem", "patterns", "start.js", "watchdog.js", "package.json", "public", "README.md", "relay", "uninstall.py", "アンインストール.md", "指示書.md", "skills"]:
     src = install_path / name
     if not src.exists():
         continue

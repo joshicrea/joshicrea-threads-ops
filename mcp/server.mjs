@@ -363,7 +363,8 @@ const tools = [
     run: async () => {
       const p = join(here, "..", "指示書.md");
       if (!existsSync(p)) throw new Error("指示書が見つかりません。インストールをもう一度実行してください（提供元に連絡してもよい）。");
-      return readFileSync(p, "utf8");
+      // 指示書の画面の場所は、この利用者が使っているポートに合わせる(別ポートで導入すると 4173 の案内では開けない)
+      return readFileSync(p, "utf8").replaceAll("localhost:4173", `localhost:${PORT}`);
     }
   }
 ];
